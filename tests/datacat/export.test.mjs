@@ -95,6 +95,18 @@ test('an explicit empty lorebook remains authoritative even during a metadata ou
     assert.equal(calls.includes('scripts'), false);
 });
 
+test('partly hydrated lorebooks cannot propose removal of the unavailable entries', async () => {
+    const { acquire } = await acquisition({
+        hasUnfetchedLorebook: () => true,
+        buildV2FromDownload: download => ({ ...structuredClone(download), data: {
+            ...download.data, character_book: { entries: [{ content: 'Available entry' }] },
+        } }),
+    });
+    const result = await acquire(id);
+    assert.equal(result.card.data.character_book.entries.length, 1);
+    assert.equal(result.card._lorebookUnavailable, true);
+});
+
 test('an export for another character is refused before normalization', async () => {
     const { acquire, calls } = await acquisition({ fetchDatacatDownload: async () => ({ ...rawExport('Source'), data: { name: 'Wrong', extensions: { datacat: { id: otherId } } } }) });
     await assert.rejects(acquire(id), { code: 'invalid_response' });

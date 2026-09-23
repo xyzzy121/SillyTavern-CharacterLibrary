@@ -20862,17 +20862,19 @@ async function linkToProviderUrl(url) {
     try {
         let resultId = null;
         let pageName = null;
+        let sourceKind = null;
         
         // Fetch metadata to get the project/numeric ID
         if (matchedProvider.fetchMetadata) {
-            const metadata = await matchedProvider.fetchMetadata(parsedPath);
+            const metadata = await matchedProvider.fetchMetadata(parsedPath, { sourceUrl: url });
             if (metadata) {
                 resultId = metadata.id;
                 pageName = matchedProvider.getListingName(metadata);
+                sourceKind = metadata.sourceKind || null;
             }
         }
         
-        await saveProviderLink(activeChar, matchedProvider, { id: resultId, fullPath: parsedPath, pageName });
+        await saveProviderLink(activeChar, matchedProvider, { id: resultId, fullPath: parsedPath, pageName, sourceKind, sourceUrl: url });
         
         showToast(`Linked to ${parsedPath} (${matchedProvider.name})`, 'success');
         

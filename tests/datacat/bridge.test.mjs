@@ -210,6 +210,23 @@ test('native denial is returned as an error with no reconstructed card', async (
     assert.equal(harness.sent.some(item => item.data.type === 'card'), false);
 });
 
+test('closing Datacat verification is returned as cancellation, not a failed export', async () => {
+    const harness = companionHarness({ nativeExport: () => { throw new Error('Download verification cancelled.'); } });
+    harness.send();
+    await harness.button().events.click({ isTrusted: true });
+    assert.equal(harness.sent.at(-1).data.type, 'cancelled');
+    assert.equal(harness.sent.some(item => item.data.type === 'card'), false);
+});
+
+test('Datacat creator redirects retain their restriction classification', async () => {
+    const harness = companionHarness({ nativeExport: () => { throw Object.assign(new Error('Creator redirect opened.'), { creatorRedirectHandled: true }); } });
+    harness.send();
+    await harness.button().events.click({ isTrusted: true });
+    assert.equal(harness.sent.at(-1).data.type, 'error');
+    assert.equal(harness.sent.at(-1).data.code, 'creator_restricted');
+    assert.match(harness.sent.at(-1).data.message, /creator/i);
+});
+
 test('cancellation prevents a late native export result from being delivered', async () => {
     let finish;
     const harness = companionHarness({ nativeExport: () => new Promise(resolve => { finish = resolve; }) });
@@ -281,6 +298,25 @@ test('parent decodes the PNG, ignores a mismatched result and cleans up after su
     assert.equal(harness.root(), undefined);
 });
 
+test('HTTP LAN origins can create and reload a cryptographically random handshake', async () => {
+    const harness = panelHarness();
+    let sequence = 0;
+    harness.context.window.location.origin = 'http://192.168.1.25:8000';
+    // randomUUID is secure-context-only; getRandomValues remains available on HTTP.
+    harness.context.crypto = { getRandomValues(bytes) { bytes.fill(++sequence); return bytes; } };
+    const pending = harness.api.requestDatacatBrowserExport(request);
+    const rejected = assert.rejects(pending, { name: 'AbortError' });
+    const first = harness.init();
+    assert.match(first.nonce, /^[a-f0-9]{32}$/);
+    assert.notEqual(first.nonce, first.requestId);
+    harness.root().querySelector('.dc-export-reload').events.get('click')();
+    const reloaded = harness.init();
+    assert.notEqual(reloaded.nonce, first.nonce);
+    assert.equal(new URL(harness.frame().src).searchParams.get('cl_datacat_parent'), 'http://192.168.1.25:8000');
+    harness.api.closeDatacatExportPanel();
+    await rejected;
+});
+
 test('a serial bulk session reuses one panel and rejects old request messages', async () => {
     const harness = panelHarness();
     const first = harness.api.requestDatacatBrowserExport({ ...request, reusePanel: true });
@@ -299,6 +335,55 @@ test('a serial bulk session reuses one panel and rejects old request messages', 
     assert.equal((await second).definitionSource, 'reimagination');
     harness.api.closeDatacatExportPanel();
     assert.equal(harness.root(), undefined);
+});
+
+test('reloading abandons the old handshake and ignores its late result', async () => {
+    const harness = panelHarness();
+    const pending = harness.api.requestDatacatBrowserExport(request);
+    const first = harness.init();
+    await harness.deliver({ ...first, type: 'ready' });
+    harness.root().querySelector('.dc-export-reload').events.get('click')();
+    const reloaded = harness.init();
+    assert.notEqual(reloaded.nonce, first.nonce);
+    assert.notEqual(reloaded.requestId, first.requestId);
+    assert.equal(new URL(harness.frame().src).searchParams.get('cl_datacat_nonce'), reloaded.nonce);
+    await harness.deliver({ ...first, type: 'card', png: pngFixture() });
+    assert.equal(harness.handlers.size, 1);
+    await harness.deliver({ ...reloaded, type: 'card', png: pngFixture() });
+    assert.equal((await pending).definitionSource, 'source');
+});
+
+test('a companion lost during reload receives a fresh diagnostic timeout', async () => {
+    const harness = panelHarness();
+    const pending = harness.api.requestDatacatBrowserExport(request);
+    const rejected = assert.rejects(pending, { name: 'AbortError' });
+    const first = harness.init();
+    await harness.deliver({ ...first, type: 'ready' });
+    assert.equal(harness.timers.size, 2, 'ready clears only the diagnostic timeout');
+    harness.root().querySelector('.dc-export-reload').events.get('click')();
+    assert.equal(harness.timers.size, 3, 'reload must rearm companion diagnostics');
+    harness.api.closeDatacatExportPanel();
+    await rejected;
+});
+
+test('malformed or non-V2 PNG metadata is rejected before an export is accepted', async () => {
+    for (const card of [{ data: { name: 'Missing format' } }, { spec: 'chara_card_v2', data: { name: 123 } }, { spec: 'chara_card_v3', data: { name: 'Wrong format' } }]) {
+        const harness = panelHarness();
+        harness.context.decodeCard = () => card;
+        const pending = harness.api.requestDatacatBrowserExport(request);
+        const rejection = assert.rejects(pending, { code: 'DATACAT_BRIDGE_INVALID_CARD' });
+        await harness.deliver({ ...harness.init(), type: 'card', png: pngFixture() });
+        await rejection;
+        assert.equal(harness.root(), undefined);
+    }
+});
+
+test('creator restrictions remain distinct through the parent export error', async () => {
+    const harness = panelHarness();
+    const pending = harness.api.requestDatacatBrowserExport(request);
+    const rejection = assert.rejects(pending, { code: 'creator_restricted' });
+    await harness.deliver({ ...harness.init(), type: 'error', code: 'creator_restricted', message: 'The creator restricts this export.' });
+    await rejection;
 });
 
 test('per-character cancellation and overlay close reject without dangling listeners', async () => {

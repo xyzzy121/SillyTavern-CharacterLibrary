@@ -242,9 +242,10 @@ export class ProviderBase {
     /**
      * Fetch full remote metadata for a linked character.
      * @param {string} fullPath - provider-specific canonical path
+     * @param {{sourceUrl?: string, sourceKind?: string, signal?: AbortSignal}} [options] - Optional original URL/source hints
      * @returns {Promise<Object|null>} provider-specific metadata blob
      */
-    async fetchMetadata(fullPath) { return null; }
+    async fetchMetadata(fullPath, options = {}) { return null; }
 
     /**
      * Fetch the remote V2 card JSON for a character (for update comparison).

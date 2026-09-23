@@ -406,7 +406,15 @@ function updateLoadMore() {
 
 async function loadCharacters(append = false) {
     if (append && datacatIsLoading) return;
-    if (!append) { datacatAutoTopUps = 0; datacatTopUpVisible = 0; }
+    if (!append) {
+        datacatAutoTopUps = 0;
+        datacatTopUpVisible = 0;
+        // Clearing a search or tag filter can return to Fresh without going through
+        // the sort handler. Every replacement load must start at the first page.
+        datacatCurrentOffset = 0;
+        datacatFreshOffset24 = 0;
+        datacatFreshOffsetWeek = 0;
+    }
     const thisToken = ++datacatLoadToken;
     datacatIsLoading = true;
     let visibleNew = Infinity; // error paths must never trigger the top-up chain
@@ -447,8 +455,8 @@ async function loadCharacters(append = false) {
                     total = full.length;
                 } else {
                     list = (_saucepanCreatorFullList || []).slice(
-                        datacatCharacters.length,
-                        datacatCharacters.length + PAGE_SIZE,
+                        datacatCurrentOffset,
+                        datacatCurrentOffset + PAGE_SIZE,
                     );
                     total = (_saucepanCreatorFullList || []).length;
                 }
@@ -1130,9 +1138,28 @@ function sortCreatorResults(list, mode) {
 // CREATOR BROWSING
 // ========================================
 
+function parseDatacatCreatorReference(value) {
+    try {
+        const url = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
+        if (!/^(www\.)?datacat\.run$/i.test(url.hostname)) return null;
+        const owner = url.pathname.match(/^\/(?:profiles\/users|users)\/([a-f0-9-]{36})(?:\/|$)/i);
+        if (owner) return { id: owner[1], source: 'direct_upload' };
+        const creator = url.pathname.match(/^\/creators?\/([^/]+)(?:\/|$)/i);
+        if (creator) return { id: decodeURIComponent(creator[1]), source: 'datacat' };
+    } catch { /* Not a Datacat creator URL. */ }
+    return null;
+}
+
+function getCreatorCatalogSource(creatorId, source) {
+    // Source-qualified creator IDs belong to Datacat's catalog. Saucepan's
+    // separate handle-based API cannot resolve these IDs or display names.
+    if (/^saucepan:/i.test(String(creatorId))) return 'datacat';
+    return ['saucepan', 'direct_upload'].includes(source) ? source : 'datacat';
+}
+
 async function browseCreator(creatorId, opts = {}) {
     if (!creatorId) return;
-    const source = ['saucepan', 'direct_upload'].includes(opts.source) ? opts.source : 'datacat';
+    const source = getCreatorCatalogSource(creatorId, opts.source);
     datacatBrowseMode = 'creator';
     datacatCreatorId = creatorId;
     datacatCreatorSource = source;
@@ -1263,11 +1290,9 @@ function doSearch() {
                 fetchCharacterAndOpenPreview(charMatch.id, charMatch.sourceKind);
                 return;
             }
-            const creatorMatch = url.pathname.match(/^\/creators?\/([^/]+)/i);
-            const ownerMatch = url.pathname.match(/^\/(?:profiles\/users|users)\/([a-f0-9-]{36})/i);
-            if (ownerMatch) { browseCreator(ownerMatch[1], { source: 'direct_upload' }); return; }
-            if (creatorMatch) {
-                browseCreator(decodeURIComponent(creatorMatch[1]));
+            const creator = parseDatacatCreatorReference(url.href);
+            if (creator) {
+                browseCreator(creator.id, { source: creator.source });
                 return;
             }
         }
@@ -1342,11 +1367,9 @@ async function performDatacatCreatorSearch() {
     try {
         const u = new URL(query.startsWith('http') ? query : `https://${query}`);
         if (/^(www\.)?datacat\.run$/i.test(u.hostname)) {
-            const creatorMatch = u.pathname.match(/^\/creators?\/([^/]+)/i);
-            const ownerMatch = u.pathname.match(/^\/(?:profiles\/users|users)\/([a-f0-9-]{36})/i);
-            if (ownerMatch) { browseCreator(ownerMatch[1], { source: 'direct_upload' }); return; }
-            if (creatorMatch) {
-                browseCreator(decodeURIComponent(creatorMatch[1]));
+            const creator = parseDatacatCreatorReference(u.href);
+            if (creator) {
+                browseCreator(creator.id, { source: creator.source });
                 return;
             }
         }
@@ -1954,7 +1977,7 @@ async function loadFollowingCharacters(forceRefresh = false) {
             const promises = batch.map(async (creator) => {
                 try {
                     const allChars = [];
-                    const source = creator.source || 'datacat';
+                    const source = getCreatorCatalogSource(creator.id, creator.source);
 
                     if (source === 'saucepan') {
                         const handle = creator.name; // saucepan handle is stored as name
@@ -2192,8 +2215,10 @@ function renderFollowing(append = false) {
 let datacatDetailFetchToken = 0;
 let datacatDetailFetchPromise = null;
 let datacatLastCreatorNotes = '';
+let datacatImportController = null;
 
 function openPreviewModal(hit) {
+    datacatImportController?.abort();
     clearExtractionState();
     datacatSelectedChar = hit;
     hit.definitionSource = normalizeDefinitionSource(hit.definitionSource);
@@ -2422,6 +2447,7 @@ async function fetchAndPopulateDetails(hit, token) {
         if (!character) {
             if (hitSource === 'direct_upload') throw new Error('This Datacat upload is not available.');
             const saucepanDetail = await saucepanDetailPromise;
+            if (token !== datacatDetailFetchToken) return;
             showExtractionCTA('This character has not been retrieved to Datacat yet.', {
                 locked: isSaucepanHit && saucepanDetail?.open_definition === false,
             });
@@ -2739,6 +2765,7 @@ function cleanupDatacatCharModal() {
 }
 
 function closePreviewModal() {
+    datacatImportController?.abort();
     datacatDetailFetchToken++;
     datacatDetailFetchPromise = null;
     cleanupDatacatCharModal();
@@ -2756,6 +2783,16 @@ async function importCharacter(charData) {
     const charId = getCharId(charData);
     if (!charId) return;
 
+    datacatImportController?.abort();
+    const controller = new AbortController();
+    datacatImportController = controller;
+    const { signal } = controller;
+    const previewToken = datacatDetailFetchToken;
+    const isCurrentPreview = () => previewToken === datacatDetailFetchToken;
+    const checkCancelled = () => {
+        if (signal.aborted) throw Object.assign(new Error('Import cancelled'), { name: 'AbortError' });
+    };
+
     const importBtn = document.getElementById('datacatImportBtn');
     if (importBtn) {
         importBtn.disabled = true;
@@ -2771,16 +2808,20 @@ async function importCharacter(charData) {
         if (datacatDetailFetchPromise) {
             try { await datacatDetailFetchPromise; } catch { /* ignore */ }
         }
+        checkCancelled();
 
         const selected = normalizeDefinitionSource(charData.definitionSource);
+        const variantId = charData.variantId;
+        const sourceKind = getSourceKind(charData);
         const cached = charData._acquiredExport;
         const acquiredExport = cached && cached.definitionSource === selected
-            && String(cached.variantId || '') === String(charData.variantId || '') ? cached
+            && String(cached.variantId || '') === String(variantId || '') ? cached
             : await acquireDatacatExport(charId, {
-                sourceKind: getSourceKind(charData), definitionSource: selected,
-                variantId: charData.variantId, character: charData._fullCharacter,
-                interactive: true, onStatus: message => { if (importBtn) importBtn.textContent = message; },
+                sourceKind, definitionSource: selected,
+                variantId, character: charData._fullCharacter, signal,
+                interactive: true, onStatus: message => { if (importBtn && !signal.aborted && isCurrentPreview()) importBtn.textContent = message; },
             });
+        checkCancelled();
         charData._acquiredExport = acquiredExport;
         const character = acquiredExport.character || charData._fullCharacter || charData;
         const cardData = acquiredExport.card.data;
@@ -2795,6 +2836,7 @@ async function importCharacter(charData) {
             first_mes: cardData.first_mes || '',
             scenario: cardData.scenario || ''
         });
+        checkCancelled();
 
         if (duplicateMatches && duplicateMatches.length > 0) {
             if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Duplicate found...';
@@ -2806,6 +2848,7 @@ async function importCharacter(charData) {
                 fullPath: String(charId),
                 avatarUrl
             }, duplicateMatches);
+            checkCancelled();
 
             if (result.choice === 'skip') {
                 showToast('Import cancelled', 'info');
@@ -2820,6 +2863,9 @@ async function importCharacter(charData) {
                 const toReplace = duplicateMatches[0].char;
                 inheritedGalleryId = getCharacterGalleryId(toReplace);
                 if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Replacing...';
+                // The validated export is ready. Once replacement starts, finish the
+                // local write even if its preview closes while deletion is in flight.
+                if (datacatImportController === controller) datacatImportController = null;
                 const deleteSuccess = await deleteCharacter(toReplace, false);
                 if (!deleteSuccess) {
                     console.warn('[DatacatBrowse] Could not delete existing character, proceeding with import anyway');
@@ -2827,9 +2873,9 @@ async function importCharacter(charData) {
             }
         }
 
-        if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Importing...';
+        if (importBtn && isCurrentPreview()) importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Importing...';
 
-        const result = await provider.importCharacter(charId, character, { inheritedGalleryId, acquiredExport, definitionSource: selected, variantId: charData.variantId });
+        const result = await provider.importCharacter(charId, character, { inheritedGalleryId, acquiredExport, definitionSource: selected, variantId, sourceKind, signal });
         if (!result.success) throw new Error(result.error || 'Import failed');
 
         const mediaUrls = result.embeddedMediaUrls || [];
@@ -2864,8 +2910,8 @@ async function importCharacter(charData) {
             view,
             summaryArgs,
             showSummary,
-            closePreview: closePreviewModal,
-            importBtn,
+            closePreview: () => { if (isCurrentPreview()) closePreviewModal(); },
+            importBtn: isCurrentPreview() ? importBtn : null,
             characterName: result.characterName,
             avatarFileName: result.fileName,
             markImported: () => markCardAsImported(charId),
@@ -2874,10 +2920,12 @@ async function importCharacter(charData) {
     } catch (err) {
         console.error('[DatacatBrowse] Import failed:', err);
         showToast(err.name === 'AbortError' ? 'Import cancelled' : `Import failed: ${err.message}`, err.name === 'AbortError' ? 'info' : 'error');
-        if (importBtn) {
+        if (importBtn && !signal.aborted && isCurrentPreview()) {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
         }
+    } finally {
+        if (datacatImportController === controller) datacatImportController = null;
     }
 }
 
@@ -3419,23 +3467,21 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             }
         }
 
-        let creatorId = raw;
+        const reference = parseDatacatCreatorReference(raw);
+        const creatorId = reference?.id || raw;
+        const catalogSource = reference?.source || 'datacat';
 
-        // Extract UUID from DataCat creator URL
-        const urlMatch = creatorId.match(/creators?\/([0-9a-f-]{36})/i);
-        if (urlMatch) creatorId = urlMatch[1];
-
-        if (isCreatorFollowed(creatorId, 'datacat')) {
+        if (isCreatorFollowed(creatorId, catalogSource)) {
             showToast('Already following this creator', 'info');
             return null;
         }
 
-        // UUID format: try API lookup
-        if (/^[0-9a-f-]{36}$/i.test(creatorId)) {
-            const creator = await fetchDatacatCreator(creatorId);
+        // Owner catalogs and encoded Saucepan creators use the same URL forms as search.
+        if (/^(?:saucepan:)?[0-9a-f-]{36}$/i.test(creatorId)) {
+            const creator = await fetchDatacatCreator(creatorId, { sourceKind: catalogSource === 'direct_upload' ? catalogSource : undefined });
             if (creator) {
-                const name = creator.userName || creatorId;
-                followCreator(creatorId, name, 'datacat');
+                const name = creator.name || creator.userName || creator.username || creatorId;
+                followCreator(creatorId, name, catalogSource);
                 return { id: creatorId, name };
             }
         }
@@ -3444,8 +3490,8 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         const lowerQ = raw.toLowerCase();
         const sources = [
             ...datacatFollowedCreators.map(c => ({ id: c.id, name: c.name, source: c.source || 'datacat' })),
-            ...datacatCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getSourceKind(c) === 'janitor' ? 'datacat' : getSourceKind(c) })),
-            ...datacatFollowingCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getSourceKind(c) === 'janitor' ? 'datacat' : getSourceKind(c) })),
+            ...datacatCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getCreatorCatalogSource(getCreatorId(c), getSourceKind(c)) })),
+            ...datacatFollowingCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getCreatorCatalogSource(getCreatorId(c), getSourceKind(c)) })),
         ];
         const exact = sources.find(c => c.name?.toLowerCase() === lowerQ);
         const match = exact || sources.find(c => c.name?.toLowerCase().includes(lowerQ));
@@ -3461,7 +3507,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             const id = getCreatorId(feedHit);
             if (id) {
                 const name = getCreatorName(feedHit);
-                const source = getSourceKind(feedHit) === 'janitor' ? 'datacat' : getSourceKind(feedHit);
+                const source = getCreatorCatalogSource(id, getSourceKind(feedHit));
                 if (isCreatorFollowed(id, source)) {
                     showToast('Already following this creator', 'info');
                     return null;

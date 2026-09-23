@@ -44,6 +44,7 @@ function harness(overrides = {}) {
     }, { get: (target, name) => target[name] || noop });
     class BrowseView {
         constructor() { this._lookup = { byProviderId: new Set(), byNameAndCreator: new Set() }; }
+        static closeAvatarViewer() {}
         isCharPossibleMatch() { return false; }
         updateLoadMoreVisibility() {}
         _setScrollIndicator() {}
@@ -67,7 +68,12 @@ function harness(overrides = {}) {
     vm.runInContext(source + `
         globalThis.testApi = {
             preview: fetchAndPopulateDetails, import: importCharacter, selector: renderDatacatDefinitionSelector,
+            close: closePreviewModal,
+            follow: query => view.followCreator(query),
+            creatorReference: parseDatacatCreatorReference, creatorCatalogSource: getCreatorCatalogSource,
+            followed: () => datacatFollowedCreators,
             setPreviewToken(value) { datacatDetailFetchToken = value; },
+            previewToken: () => datacatDetailFetchToken,
             load: loadCharacters, advance: advanceDatacatPage,
             configure(options = {}) {
                 delegatesInitialized = true; datacatViewMode = 'following';
@@ -116,6 +122,70 @@ test('verification and cancellation cannot delete an existing local card', async
     }
 });
 
+test('closing a preview while its export is pending prevents replacement', async () => {
+    let resolveExport;
+    let exportSignal;
+    const h = harness({ dependencies: { acquireDatacatExport: (_id, options) => {
+        exportSignal = options.signal;
+        return new Promise(resolve => { resolveExport = resolve; });
+    } } });
+    const importing = h.api.import({ ...full, _fullCharacter: full });
+    h.api.close();
+    assert.equal(exportSignal.aborted, true);
+    // Even if a dependency finishes successfully after cancellation, the local
+    // replacement must not start.
+    resolveExport(acquired());
+    await importing;
+    assert.equal(h.calls.some(call => call[0] === 'delete' || call[0] === 'import'), false);
+});
+
+test('closing a preview while duplicate confirmation is pending prevents replacement', async () => {
+    let resolveConfirmation;
+    const h = harness({ core: { showPreImportDuplicateWarning: () => new Promise(resolve => { resolveConfirmation = resolve; }) } });
+    const importing = h.api.import({ ...full, _fullCharacter: full, _acquiredExport: acquired() });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    h.api.close();
+    resolveConfirmation({ choice: 'replace' });
+    await importing;
+    assert.equal(h.calls.some(call => call[0] === 'delete' || call[0] === 'import'), false);
+});
+
+test('a replacement already being written finishes without closing or repainting a newer preview', async () => {
+    let resolveDelete;
+    let completion;
+    const h = harness({
+        core: { deleteCharacter: () => new Promise(resolve => { resolveDelete = resolve; }) },
+        dependencies: { finishBrowseImport: async options => { completion = options; options.closePreview(); } },
+    });
+    const importing = h.api.import({ ...full, _fullCharacter: full, _acquiredExport: acquired() });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    h.api.close();
+    h.api.setPreviewToken(2);
+    h.elements.get('datacatImportBtn').innerHTML = 'New preview import';
+    resolveDelete(true);
+    await importing;
+    assert.equal(h.calls.filter(call => call[0] === 'import').length, 1);
+    assert.equal(h.calls.find(call => call[0] === 'import')[1].signal.aborted, false);
+    assert.equal(completion.importBtn, null);
+    assert.equal(h.api.previewToken(), 2);
+    assert.equal(h.elements.get('datacatImportBtn').innerHTML, 'New preview import');
+});
+
+test('a late Saucepan detail response cannot overwrite a newer preview', async () => {
+    let resolveSaucepan;
+    const h = harness({ dependencies: {
+        fetchDatacatCharacter: async () => null,
+        fetchSaucepanCompanion: () => new Promise(resolve => { resolveSaucepan = resolve; }),
+    } });
+    const previewing = h.api.preview({ ...full, primary_content_source_kind: 'saucepan' }, 0);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    h.api.setPreviewToken(1);
+    resolveSaucepan({ open_definition: false });
+    await previewing;
+    assert.equal(h.elements.get('datacatImportBtn').dataset.extractId, undefined);
+    assert.equal(h.elements.get('datacatCharDescription').innerHTML, '');
+});
+
 test('only missing detail records offer retrieval, and verification leaves import available', async () => {
     for (const [code, extraction] of [['not_found', true], ['creator_restricted', false], ['service_unavailable', false]]) {
         const h = harness({ dependencies: { fetchDatacatCharacter: async () => { throw Object.assign(new Error(code), { code }); } } });
@@ -145,6 +215,28 @@ test('Fresh windows use independent offsets and de-duplicate display rows', asyn
     assert.equal(requests.at(-1).offsetWeek, 0); assert.equal(h.api.state().offsetWeek, 7);
 });
 
+test('replacement loads reset Fresh and recent offsets after clearing search or tags', async () => {
+    const requests = [];
+    const h = harness({ dependencies: {
+        fetchFreshCharacters: async options => {
+            requests.push(['fresh', options.offset24]);
+            return { last24h: [full], pagination24: { nextOffset: options.offset24 + 1, hasMore: true } };
+        },
+        fetchRecentPublic: async options => {
+            requests.push(['recent', options.offset]);
+            return { characters: [full], nextOffset: options.offset + 1, hasMore: true };
+        },
+    } });
+    h.api.configure({ sort: 'fresh_24h' });
+    await h.api.load(false); await h.api.advance();
+    h.api.configure({ sort: 'fresh_24h', search: 'Creator' });
+    await h.api.load(false); await h.api.advance();
+    h.api.configure({ sort: 'fresh_24h' });
+    await h.api.load(false);
+    h.api.configure(); await h.api.load(false); await h.api.advance(); await h.api.load(false);
+    assert.deepEqual(requests, [['fresh', 0], ['fresh', 1], ['recent', 0], ['recent', 1], ['fresh', 0], ['recent', 0], ['recent', 1], ['recent', 0]]);
+});
+
 test('creator and recent pages advance clamped raw rows without requiring totals', async () => {
     const requests = [];
     const fetchPage = async options => {
@@ -155,6 +247,17 @@ test('creator and recent pages advance clamped raw rows without requiring totals
     h.api.configure({ creator: id, source: 'direct_upload' });
     await h.api.load(false); assert.equal(h.api.state().offset, 2); assert.equal(h.api.state().hasMore, true);
     await h.api.advance(); assert.equal(requests.at(-1).offset, 2); assert.equal(requests[0].sourceKind, 'direct_upload');
+    assert.equal(h.api.state().hasMore, false);
+});
+
+test('the separate Saucepan creator list paginates raw rows after de-duplication', async () => {
+    const h = harness({ dependencies: { fetchSaucepanCompanionsOfUser: async () => ({ characters: [
+        ...Array.from({ length: 80 }, () => full), { ...full, character_id: id2 },
+    ] }) } });
+    h.api.configure({ creator: id, source: 'saucepan' });
+    await h.api.load(false); await h.api.advance();
+    assert.equal(h.api.state().ids.length, 2);
+    assert.equal(h.api.state().offset, 81);
     assert.equal(h.api.state().hasMore, false);
 });
 
@@ -218,4 +321,20 @@ test('recent browse passes the sort option consumed by the API adapter', async (
     assert.equal(requests[0].sortBy, 'fresh');
     h.api.configure({ sort: 'score_week', search: 'Creator' }); await h.api.load(false);
     assert.equal(requests[1].sortBy, 'score');
+});
+
+test('Following Manager resolves native-owner and encoded Saucepan Datacat URLs', async () => {
+    const requests = [];
+    const h = harness({ dependencies: { fetchDatacatCreator: async (creatorId, options) => {
+        requests.push({ creatorId, ...options });
+        return { name: 'Creator' };
+    } } });
+    await h.api.follow('https://datacat.run/profiles/users/' + id);
+    await h.api.follow('https://datacat.run/creators/saucepan%3A' + id2);
+    assert.deepEqual(requests, [{ creatorId: id, sourceKind: 'direct_upload' }, { creatorId: 'saucepan:' + id2, sourceKind: undefined }]);
+    assert.equal(h.api.followed()[0].source, 'direct_upload');
+    assert.equal(h.api.followed()[1].source, 'datacat');
+    assert.equal(h.api.creatorCatalogSource('saucepan:' + id, 'saucepan'), 'datacat');
+    assert.equal(h.api.creatorCatalogSource(id, 'saucepan'), 'saucepan');
+    assert.equal(h.api.creatorReference('https://example.com/creators/' + id), null);
 });

@@ -704,13 +704,15 @@ CharacterTavern requires a session cookie for NSFW content. To set it up:
 
 1. Install or update the bundled **cl-helper to 1.13.0**, then **restart SillyTavern**. Updating the extension alone does not reload a running server plugin. Settings > Info shows the helper's running version and update controls.
 2. Enable DataCat in Settings > Online > Providers. Its browsing session initializes automatically.
-3. For downloads that request verification, install [the Datacat Export Companion](extras/cl-datacat-bridge.user.js) in Tampermonkey or Violentmonkey on the browser where you use CharacterLibrary. Allow it on datacat.run, including frames. It needs page-context execution to call Datacat's export tools.
+3. For downloads that request verification, install or update [the Datacat Export Companion to 1.0.1](extras/cl-datacat-bridge.user.js) in Tampermonkey or Violentmonkey on the browser where you use CharacterLibrary. Allow it on datacat.run, including frames. It needs page-context execution to call Datacat's export tools.
 4. Click Import or check a single linked card for updates. When the Datacat panel opens, click **Export to Character Library** inside it and complete Datacat's verification. The companion passes your selected Source/Reimagination choice to Datacat's own export function and returns the PNG card. Datacat account credentials stay on Datacat.
 5. If the panel reports that the companion is missing, install/enable it and click **Reload**. Close or Cancel stops the pending export without replacing a local card. Browsers that block embedded Datacat or do not support userscripts cannot complete this optional verified-export flow.
 
 User-started bulk imports reuse one panel and export characters serially. Batch update scans never open verification panels: a gated card is labeled **Verification required** and skipped; use a single-card update check to complete verification and compare it.
 
 The helper session and the embedded Datacat browser session are separate. Verifying an export in the browser does not unlock the helper's downloads or share a login token with CharacterLibrary. Creator download restrictions and redirects are reported instead of falling back to a reconstructed card.
+
+CharacterLibrary **7.3.1** fixes the export panel on HTTP local-network addresses, panel reload isolation, native verification cancellation, and creator restriction reporting. It also corrects current Reimagination detection and native artwork, feed and creator pagination, cancelled preview imports, URL linking, and incomplete-lorebook update comparisons. The helper requirement remains **1.13.0**. See the [validation record](tests/datacat/README.md) for automated coverage and live-test limitations.
 
 #### Retrieval
 

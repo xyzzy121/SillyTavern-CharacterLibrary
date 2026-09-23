@@ -131,3 +131,41 @@ test('cancelling during session validation prevents a retrieval submission', asy
     assert.equal(calls.some(call => call[0] === 'retrieve'), false);
     assert.equal(statuses.some(text => text.includes('Submitting')), false);
 });
+
+test('preview metadata failure retains the linked source, definition and variant', async () => {
+    const { provider } = await loadProvider({ fetchDatacatCharacter: async () => { throw new Error('temporary outage'); } });
+    const link = { id, sourceKind: 'saucepan', definitionSource: 'reimagination', variantId: 'saucepan_core' };
+    const preview = await provider.buildPreviewObject({ name: 'Local card', data: { extensions: { datacat: link } } }, link);
+    assert.equal(preview.id, id);
+    assert.equal(preview.primary_content_source_kind, 'saucepan');
+    assert.equal(preview.definitionSource, 'reimagination');
+    assert.equal(preview.variantId, 'saucepan_core');
+});
+
+test('manual URL metadata lookup forwards the source hint', async () => {
+    const requests = [];
+    const { provider } = await loadProvider({ fetchDatacatCharacter: async (...args) => {
+        requests.push(args);
+        return { character_id: id, sourceKind: 'direct_upload', name: 'Native card' };
+    } });
+    await provider.fetchMetadata(id, { sourceUrl: `https://datacat.run/characters/recent/direct/${id}` });
+    assert.equal(requests[0][0], id);
+    assert.equal(requests[0][1], 'direct_upload');
+});
+
+test('manual URL linking retains a known UUID and source when metadata is missing', async () => {
+    const { provider } = await loadProvider();
+    const char = { data: { extensions: { custom: { retained: true } } } };
+    provider.setLinkInfo(char, { id: null, fullPath: id, sourceUrl: `https://datacat.run/characters/recent/direct/${id}` });
+    assert.equal(provider.getLinkInfo(char)?.id, id);
+    assert.equal(provider.getLinkInfo(char)?.sourceKind, 'direct_upload');
+    assert.deepEqual(char.data.extensions.custom, { retained: true });
+});
+
+test('invalid replacement links cannot erase a valid link', async () => {
+    const { provider } = await loadProvider();
+    const char = { data: { extensions: { datacat: { id, definitionSource: 'reimagination' } } } };
+    assert.throws(() => provider.setLinkInfo(char, { id: 456, fullPath: 'not-a-uuid' }), /valid.*ID/i);
+    assert.equal(provider.getLinkInfo(char)?.id, id);
+    assert.equal(provider.getLinkInfo(char)?.definitionSource, 'reimagination');
+});

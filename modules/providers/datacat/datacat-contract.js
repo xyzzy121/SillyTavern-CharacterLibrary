@@ -39,13 +39,25 @@ export function normalizeDefinitionSource(value) {
 }
 
 export function getDatacatDefinitionOptions(character) {
-    const reimag = objectValue(character?.datacat_reimagination || character?.datacatReimagination);
+    const hasReimagination = record => {
+        const reimag = objectValue(record?.datacat_reimagination || record?.datacatReimagination);
+        return record?.has_datacat_reimagination === true || record?.hasDatacatReimagination === true
+            || String(record?.recovery_badge_text || record?.recoveryBadgeText || '').trim().toUpperCase() === 'REIMAGINED'
+            || !!(reimag?.outputText || reimag?.output_text || reimag?.interpretation
+                || reimag?.contentHash || reimag?.content_hash || reimag?.generatedAt || reimag?.generated_at
+                || reimag?.modelUsed || reimag?.model_used);
+    };
+    // Current Datacat attaches Reimagination to source variants such as janitor_core.
+    // Its existence cannot be inferred from the variant's source name alone.
     const variants = (Array.isArray(character?.content_variants) ? character.content_variants : [])
-        .filter(variant => variant && !variant.isRecoveryPlaceholder && /reimagin/i.test(String(variant.sourceKind || variant.source_kind || variant.kind || variant.type || variant.id || '')))
-        .map(variant => ({ ...variant, id: variant.id || variant.variantId, name: variant.name || variant.label || 'Reimagination' }));
+        .filter(variant => variant && !variant.isRecoveryPlaceholder && !variant.is_recovery_placeholder
+            && (hasReimagination(variant) || hasReimagination(objectValue(variant.content))
+                || /reimagin/i.test(String(variant.sourceKind || variant.source_kind || variant.kind || variant.type || variant.id || ''))))
+        .map(variant => ({ ...variant, id: variant.id || variant.variantId,
+            name: variant.name || variant.label || variant.sourceLabel || variant.source_label || 'Reimagination' }));
     return { source: character?.has_source_definition !== false && character?.sourceDefinitionAvailable !== false,
         reimagination: getDatacatSourceKind(character, null) !== 'direct_upload'
-            && !!(character?.has_datacat_reimagination || character?.hasDatacatReimagination || reimag?.outputText || reimag?.output_text || variants.length),
+            && !!(hasReimagination(character) || variants.length),
         variants };
 }
 
@@ -94,13 +106,22 @@ export function normalizeDatacatCharacter(row) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
     const id = getDatacatCharacterId(row);
     const sourceKind = getDatacatSourceKind(row);
-    let variants = row.avatarVariantUrls || row.avatar_variant_urls;
+    let variants = row.avatarVariantUrls || row.avatar_variant_urls || row.imageVariantUrls || row.image_variant_urls;
     if (typeof variants === 'string') { try { variants = JSON.parse(variants); } catch { variants = {}; } }
-    const asset = Array.isArray(row.media_assets) ? row.media_assets.find(item => item?.role === 'avatar') : null;
+    const intercepted = objectValue(row.intercepted_chat_data || row.interceptedChatData);
+    const directUpload = objectValue(intercepted?.direct_upload || intercepted?.directUpload || row.direct_upload || row.directUpload);
+    const mediaAssets = row.directUploadMediaAssets || row.direct_upload_media_assets
+        || directUpload?.mediaAssets || directUpload?.media_assets || row.media_assets || [];
+    const assets = Array.isArray(mediaAssets) ? mediaAssets.filter(asset => asset && typeof asset === 'object') : [];
+    const asset = assets.find(item => String(item.role || '').toLowerCase() === 'avatar') || assets[0];
+    const assetUrl = asset?.mediaViewUrl || asset?.media_view_url || asset?.url || asset?.originalUrl || asset?.original_url;
     const owner = row.ownerUuid || row.owner_uuid || row.ownerUserUuid || row.owner_user_uuid
         || row.liberatorUserOwnerUuid || row.liberator_user_owner_uuid || row.owner_user_id || row.ownerUserId;
-    const avatar = row.avatarDisplayUrl || row.avatar_display_url || row.avatarSelfArchiveUrl || row.avatar_self_archive_url
-        || variants?.card || variants?.hero || row.avatar || asset?.mediaViewUrl || asset?.url || asset?.originalUrl;
+    const displayUrl = row.avatarDisplayUrl || row.avatar_display_url || row.imageDisplayUrl || row.image_display_url;
+    const archiveUrl = row.avatarSelfArchiveUrl || row.avatar_self_archive_url || row.imageSelfArchiveUrl
+        || row.image_self_archive_url || row.selfArchiveUrl || row.self_archive_url;
+    const avatar = displayUrl || archiveUrl || variants?.card || variants?.hero
+        || (sourceKind === 'direct_upload' ? assetUrl : null) || row.avatar || assetUrl;
     return {
         ...row,
         ...(id ? { character_id: id, characterId: id } : {}),
@@ -119,6 +140,8 @@ export function normalizeDatacatCharacter(row) {
         chara_card_v2_json: objectValue(row.chara_card_v2_json || row.charaCardV2Json) || row.chara_card_v2_json || row.charaCardV2Json,
         avatar: normalizeDatacatAvatar(avatar, sourceKind),
         avatar_variant_urls: variants || {},
+        avatar_self_archive_url: archiveUrl || null,
+        media_assets: assets,
     };
 }
 
@@ -171,7 +194,7 @@ export function normalizeDatacatPage(payload, { offset = 0, limit = 24, listKey 
     return { characters: rows, list: rows, totalCount: total, total, ...pagination };
 }
 
-const failureStates = new Set(['failed', 'failure', 'error', 'cancelled', 'canceled', 'timeout', 'timed_out', 'timedout', 'expired']);
+const failureStates = new Set(['failed', 'failure', 'error', 'cancelled', 'canceled', 'abandoned', 'timeout', 'timed_out', 'timedout', 'expired']);
 const terminalStates = new Set(['complete', 'completed', 'success', 'succeeded', 'terminal', ...failureStates]);
 const activeStates = new Set(['pending', 'queued', 'running', 'processing', 'in_progress', 'opening_page', 'preparing', 'initiating', 'pulling', 'post_extract']);
 const statusOf = entry => String(entry?.terminalStatus || entry?.status || entry?.state || entry?.phase || entry?.lifecycle || '').toLowerCase().replace(/-/g, '_');

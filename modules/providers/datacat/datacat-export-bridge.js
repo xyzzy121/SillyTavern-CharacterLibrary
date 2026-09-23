@@ -16,6 +16,13 @@ function bridgeError(code, message) {
     return Object.assign(new Error(message), { code });
 }
 
+function createHandshakeId() {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    // SillyTavern may be served over HTTP on a local network. randomUUID is
+    // secure-context-only, but getRandomValues still supplies a secure nonce.
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 export function normalizeDatacatExportRequest(options = {}) {
     const characterId = String(options.characterId || '').trim().toLowerCase();
     if (!UUID.test(characterId)) throw bridgeError('DATACAT_BRIDGE_INVALID_REQUEST', 'A valid Datacat character ID is required.');
@@ -151,9 +158,9 @@ export async function requestDatacatBrowserExport(options) {
     const request = normalizeDatacatExportRequest(options);
     if (options.signal?.aborted) throw abortError();
     if (activeRequest) throw bridgeError('DATACAT_BRIDGE_BUSY', 'Another Datacat export is already open.');
-    const nonce = crypto.randomUUID();
-    const requestId = crypto.randomUUID();
-    const url = buildDatacatExportUrl(request, nonce, window.location.origin);
+    let nonce = createHandshakeId();
+    let requestId = createHandshakeId();
+    let url = buildDatacatExportUrl(request, nonce, window.location.origin);
     const currentPanel = ensurePanel();
     const browserUrl = new URL(url);
     browserUrl.search = '';
@@ -174,6 +181,12 @@ export async function requestDatacatBrowserExport(options) {
         const post = type => currentPanel.frame.contentWindow?.postMessage({
             protocol: DATACAT_EXPORT_PROTOCOL, type, nonce, requestId, metadata: request,
         }, DATACAT_EXPORT_ORIGIN);
+        const armDiagnostic = () => {
+            clearTimeout(diagnostic);
+            diagnostic = setTimeout(() => {
+                if (!ready) report('Companion not detected. Install extras/cl-datacat-bridge.user.js and allow it on Datacat. If the frame is blocked, open Datacat using the link above and complete its site checks, then click Reload.');
+            }, 15000);
+        };
         const finish = (error, result, panelClosed = false) => {
             if (settled) return;
             settled = true;
@@ -191,8 +204,10 @@ export async function requestDatacatBrowserExport(options) {
         };
         const onAbort = () => finish(abortError(), null);
         const onLoad = () => {
+            if (settled) return;
             ready = false;
             expected.frameWindow = currentPanel.frame.contentWindow;
+            armDiagnostic();
             post('init');
         };
         const onMessage = async event => {
@@ -207,15 +222,17 @@ export async function requestDatacatBrowserExport(options) {
             } else if (data.type === 'cancelled') {
                 finish(abortError(), null);
             } else if (data.type === 'error') {
-                finish(bridgeError('DATACAT_BRIDGE_EXPORT_FAILED', String(data.message || 'Datacat could not export this card.').slice(0, 500)));
+                const code = data.code === 'creator_restricted' ? data.code : 'DATACAT_BRIDGE_EXPORT_FAILED';
+                finish(bridgeError(code, String(data.message || 'Datacat could not export this card.').slice(0, 500)));
             } else if (data.type === 'card' && !decoding) {
                 decoding = true;
                 try {
                     const imageBuffer = validateDatacatExportPng(data.png);
                     const { default: CoreAPI } = await import('../../core-api.js');
                     const card = CoreAPI.extractCharacterDataFromPng(imageBuffer);
-                    if (!card?.data || typeof card.data !== 'object' || Array.isArray(card.data)) {
-                        throw bridgeError('DATACAT_BRIDGE_INVALID_CARD', 'The Datacat PNG contains no readable character card.');
+                    if (card?.spec !== 'chara_card_v2' || !card.data || typeof card.data !== 'object'
+                        || Array.isArray(card.data) || typeof card.data.name !== 'string') {
+                        throw bridgeError('DATACAT_BRIDGE_INVALID_CARD', 'The Datacat PNG contains no readable V2 character card.');
                     }
                     // Use the PNG's canonical card rather than trusting a separate JSON envelope.
                     finish(null, { card, imageBuffer, definitionSource: request.definitionSource });
@@ -226,7 +243,16 @@ export async function requestDatacatBrowserExport(options) {
             cancel: panelClosed => finish(abortError(panelClosed), null, panelClosed),
             reload: () => {
                 if (decoding || settled) return;
+                post('cancel');
+                // A reload abandons the old page's export, including replies
+                // already queued by an unfinished verification or PNG build.
+                nonce = createHandshakeId();
+                requestId = createHandshakeId();
+                url = buildDatacatExportUrl(request, nonce, window.location.origin);
+                expected.nonce = nonce;
+                expected.requestId = requestId;
                 ready = false;
+                armDiagnostic();
                 report('Reloading Datacat. Waiting for the companion userscript…');
                 currentPanel.frame.src = url;
             },
@@ -235,9 +261,7 @@ export async function requestDatacatBrowserExport(options) {
         currentPanel.frame.addEventListener('load', onLoad);
         options.signal?.addEventListener('abort', onAbort, { once: true });
         heartbeat = setInterval(() => { if (!ready) post('init'); }, 1500);
-        diagnostic = setTimeout(() => {
-            if (!ready) report('Companion not detected. Install extras/cl-datacat-bridge.user.js and allow it on Datacat. If the frame is blocked, open Datacat using the link above and complete its site checks, then click Reload.');
-        }, 15000);
+        armDiagnostic();
         timeout = setTimeout(() => finish(bridgeError('DATACAT_BRIDGE_TIMEOUT', 'Datacat export timed out. Reopen the export to try again.')), 10 * 60 * 1000);
         report('Opening Datacat. Waiting for the companion userscript…');
         currentPanel.frame.src = url;

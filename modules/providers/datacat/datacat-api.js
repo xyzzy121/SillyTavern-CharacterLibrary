@@ -60,12 +60,13 @@ export function resolveDatacatAvatarUrl(hit, opts = {}) {
     // carry none of the extra fields and fall through to hit.avatar, ie. todays behavior.
     const absOnly = (c) => (typeof c === 'string' && /^https?:\/\//i.test(c) ? c : null);
     const normalized = normalizeDatacatCharacter(hit);
-    const asset = hit?.media_assets?.find?.(item => item?.role === 'avatar');
+    const asset = normalized?.media_assets?.find?.(item => String(item?.role || '').toLowerCase() === 'avatar') || normalized?.media_assets?.[0];
     const candidates = opts.preferOriginal
         ? [
-            hit?.avatarSelfArchiveUrl || hit?.avatar_self_archive_url,
-            asset?.originalUrl || asset?.mediaViewUrl || asset?.url,
-            absOnly(hit?.chara_card_v2_json?.data?.avatar),
+            normalized?.avatar_self_archive_url,
+            asset?.originalUrl || asset?.original_url || asset?.mediaViewUrl || asset?.media_view_url || asset?.url,
+            normalized?.avatar_variant_urls?.original,
+            absOnly(normalized?.chara_card_v2_json?.data?.avatar),
             absOnly(hit?.content_variants?.[0]?.content?.chara_card_v2_json?.data?.avatar),
             normalized?.avatar_variant_urls?.hero,
             normalized?.avatar,

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Character Library - Datacat Export Companion
 // @namespace    https://github.com/Sillyanonymous/SillyTavern-CharacterLibrary
-// @version      1.0.0
+// @version      1.0.1
 // @description  Export a selected Datacat character to Character Library after your click and Datacat's normal verification. No account credentials are shared.
 // @author       Sillyanonymous
 // @match        https://datacat.run/*
@@ -146,7 +146,18 @@
                 dismiss();
             } catch (error) {
                 if (request.cancelled || current !== request) return;
-                send(request, 'error', { message: String(error?.message || 'Datacat could not export this character.').slice(0, 500) });
+                // Datacat signals its native verification dialog's Cancel with
+                // this message rather than an AbortError.
+                if (error?.name === 'AbortError' || /download verification cancelled/i.test(String(error?.message || ''))) {
+                    send(request, 'cancelled');
+                } else if (error?.creatorRedirectHandled === true) {
+                    send(request, 'error', {
+                        code: 'creator_restricted',
+                        message: 'This creator restricts downloads. Open the character on Datacat and follow its creator link.',
+                    });
+                } else {
+                    send(request, 'error', { message: String(error?.message || 'Datacat could not export this character.').slice(0, 500) });
+                }
                 request.cancelled = true;
                 dismiss();
             }

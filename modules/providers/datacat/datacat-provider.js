@@ -120,10 +120,13 @@ class DatacatProvider extends ProviderBase {
 
         if (linkInfo) {
             const existing = char.data.extensions.datacat || {};
+            const parsed = parseDatacatUrl(linkInfo.sourceUrl || linkInfo.fullPath || '');
+            const id = getDatacatCharacterId(linkInfo.id) || parsed?.id || getDatacatCharacterId(linkInfo.fullPath);
+            if (!id) throw new Error('A valid Datacat character ID is required');
             char.data.extensions.datacat = {
                 ...existing,
-                id: linkInfo.id,
-                sourceKind: normalizeDatacatSourceKind(linkInfo.sourceKind || existing.sourceKind),
+                id,
+                sourceKind: normalizeDatacatSourceKind(linkInfo.sourceKind || parsed?.sourceKind || existing.sourceKind),
                 definitionSource: normalizeDefinitionSource(linkInfo.definitionSource ?? existing.definitionSource),
                 variantId: linkInfo.variantId ?? existing.variantId ?? '',
                 linkedAt: linkInfo.linkedAt || existing.linkedAt || new Date().toISOString(),
@@ -156,8 +159,12 @@ class DatacatProvider extends ProviderBase {
 
     // ── Remote Data ─────────────────────────────────────────
 
-    async fetchMetadata(characterId) {
-        const char = await fetchDatacatCharacter(characterId);
+    async fetchMetadata(characterId, options = {}) {
+        const parsed = parseDatacatUrl(options.sourceUrl || String(characterId));
+        const id = parsed?.id || getDatacatCharacterId(characterId);
+        if (!id) return null;
+        const sourceKind = normalizeDatacatSourceKind(options.sourceKind || parsed?.sourceKind);
+        const char = await fetchDatacatCharacter(id, sourceKind, { signal: options.signal });
         if (!char) return null;
         // Normalize: library.js reads metadata.id as the link identifier.
         // DataCat API returns numeric auto-increment as `id` and UUID as `character_id`.
@@ -370,7 +377,10 @@ class DatacatProvider extends ProviderBase {
             avatar: dcData.avatar || '',
             tags: [],
             is_nsfw: false,
-            creator_name: char?.data?.creator || ''
+            creator_name: char?.data?.creator || '',
+            primary_content_source_kind: normalizeDatacatSourceKind(linkInfo.sourceKind || dcData.sourceKind),
+            definitionSource: normalizeDefinitionSource(linkInfo.definitionSource ?? dcData.definitionSource),
+            variantId: linkInfo.variantId ?? dcData.variantId ?? '',
         };
     }
 

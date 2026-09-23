@@ -115,3 +115,37 @@ test('definition choice defaults to Source and recognizes published reimaginatio
     assert.equal(c.getDatacatDefinitionOptions({ sourceDefinitionAvailable: false }).source, false);
     assert.equal(c.getDatacatDefinitionOptions({ sourceKind: 'direct_upload', hasDatacatReimagination: true }).reimagination, false);
 });
+
+test('Reimagination attached to an ordinary source variant remains selectable', () => {
+    const character = { content_variants: [
+        { id: 'janitor_core', sourceKind: 'janitor_core', sourceLabel: 'Original', content: { datacat_reimagination: { output_text: 'Reimagined definition' } } },
+        { id: 'jannyai', sourceKind: 'jannyai', sourceLabel: 'Recovery', hasDatacatReimagination: true },
+        { id: 'unavailable', sourceKind: 'janitor_core', isRecoveryPlaceholder: true, hasDatacatReimagination: true },
+    ] };
+    const options = c.getDatacatDefinitionOptions(character);
+    assert.equal(options.reimagination, true);
+    assert.deepEqual(options.variants.map(variant => [variant.id, variant.name]), [['janitor_core', 'Original'], ['jannyai', 'Recovery']]);
+    assert.equal(c.getDatacatDefinitionOptions({ recoveryBadgeText: 'REIMAGINED' }).reimagination, true);
+    assert.equal(c.getDatacatDefinitionOptions({ datacatReimagination: { interpretation: 'Definition' } }).reimagination, true);
+});
+
+test('native artwork resolves current nested media assets before stale source artwork', () => {
+    const artwork = { role: 'avatar', media_view_url: '/media/direct_upload/image.webp', original_url: '/media/direct_upload/original.png' };
+    for (const fields of [
+        { directUploadMediaAssets: [artwork] },
+        { direct_upload_media_assets: [artwork] },
+        { intercepted_chat_data: JSON.stringify({ direct_upload: { mediaAssets: [artwork] } }) },
+        { interceptedChatData: { directUpload: { media_assets: [artwork] } } },
+    ]) {
+        const normalized = c.normalizeDatacatCharacter({ characterId: id, sourceKind: 'direct_upload', avatar: 'old-janitor.webp', ...fields });
+        assert.equal(normalized.avatar, 'https://datacat.run/media/direct_upload/image.webp');
+        assert.equal(normalized.media_assets[0].original_url, artwork.original_url);
+    }
+    assert.equal(c.normalizeDatacatCharacter({ characterId: id, imageDisplayUrl: '/media/card.webp' }).avatar, 'https://datacat.run/media/card.webp');
+});
+
+test('abandoned retrievals are failures even when the terminal job omits an error', () => {
+    const result = c.matchRetrievalStatus({ latestTerminalJob: { requestId: 'abandoned-request', lifecycle: 'terminal', terminalStatus: 'abandoned' } }, { requestId: 'abandoned-request' });
+    assert.equal(result.success, false);
+    assert.equal(c.matchRetrievalStatus({ history: [{ requestId: 'abandoned-request', status: 'abandoned' }] }, { requestId: 'abandoned-request' }).success, false);
+});

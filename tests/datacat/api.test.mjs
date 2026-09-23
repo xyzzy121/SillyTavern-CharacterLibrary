@@ -87,3 +87,14 @@ test('browse sorts, native creators and clamped pages follow current API', async
     assert.match(paths[2], /saucepan%3A/);
     assert.match(paths[2], /sortBy=creation_date/);
 });
+
+test('original artwork uses native media aliases and original variants during import', () => {
+    const native = { characterId: id, sourceKind: 'direct_upload', avatar: 'stale-avatar.webp',
+        intercepted_chat_data: JSON.stringify({ direct_upload: { media_assets: [
+            { role: 'avatar', media_view_url: '/media/direct_upload/card.webp', original_url: '/media/direct_upload/original.png' },
+        ] } }) };
+    assert.equal(api.resolveDatacatAvatarUrl(native), 'https://datacat.run/media/direct_upload/card.webp');
+    assert.equal(api.resolveDatacatAvatarUrl(native, { preferOriginal: true }), 'https://datacat.run/media/direct_upload/original.png');
+    assert.equal(api.resolveDatacatAvatarUrl({ imageVariantUrls: { card: '/media/card.webp', original: '/media/original.png' } }, { preferOriginal: true }), 'https://datacat.run/media/original.png');
+    assert.equal(api.resolveDatacatAvatarUrl({ charaCardV2Json: JSON.stringify({ data: { avatar: 'https://example.test/original.png' } }) }, { preferOriginal: true }), 'https://example.test/original.png');
+});

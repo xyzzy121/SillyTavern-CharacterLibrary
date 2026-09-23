@@ -10,6 +10,20 @@ These use Node's built-in test runner, with no build system or package installat
 
 Coverage includes current helper routes and visibility fields, explicit export parameters, source and UUID normalization, source-qualified links, native media, nested pagination metadata, clamped and duplicate pages, retrieval correlation and terminal failures, structured errors, authoritative exports, definition persistence, cancellation, and the companion message/PNG contract. Browser and provider tests exercise the actual source modules with their external dependencies replaced.
 
+## 7.3.1 regression pass — 2026-09-23
+
+The follow-up bug test added regression coverage for current nested Reimagination variants, native artwork aliases, abandoned retrieval jobs, pagination resets, encoded Saucepan creator catalogs, cancellation before replacement, late preview results, source-qualified and legacy URL linking, definition preservation after metadata failures, and partial lorebooks. Companion coverage now includes HTTP LAN nonce generation, stale replies after Reload, repeated readiness diagnostics, native verification cancellation, creator restrictions, and canonical V2 card validation.
+
+The complete Node suite passes **99 tests**. Syntax checks pass for all **73 non-vendor JavaScript files**, and `git diff --check` passes.
+
+| Browser regression scenario | Result |
+| --- | --- |
+| Full application at desktop 1280×900 and mobile 390×844 | Passed using unmodified production HTML/modules and a local HTTP server with API fixtures. All nine providers initialized. The actual Online grid, secure-iframe Source/Reimagination preview, desktop Import and mobile quick-import controls, PNG generation, import POST, preview close, and library refresh ran successfully. The fixture server parsed the uploaded V2 PNG and confirmed the selected definition, variant, greetings, UUID, creator, and link timestamp. No JavaScript page errors occurred. |
+| Companion on localhost and an insecure HTTP LAN-style origin | Passed with a simulated cross-origin Datacat frame, including the environment where `crypto.randomUUID` is unavailable. Trusted export clicks, Source/Reimagination, serial panel reuse, Reload, parent/iframe Escape, mobile Back, verification cancellation, and creator restrictions passed without JavaScript page errors. |
+| Browse and preview cancellation at desktop and mobile sizes | Passed with simulated upstream responses. Closing or replacing a preview cancels its pending import before replacement; late completion does not close or repaint a newer preview. |
+
+These browser runs used external API fixtures and did not write to a live SillyTavern or Datacat service. They supplement the live-test record below; they do not verify human challenges or physical mobile userscript installation.
+
 ## Smoke-test record — 2026-09-23
 
 | Scenario | Result |
@@ -26,4 +40,4 @@ Coverage includes current helper routes and visibility fields, explicit export p
 | Live retrieval execution and visibility effects | Not performed: no retrieval jobs were submitted during validation. Endpoint, payload, queue/status, cancellation, and timeout handling were checked with fixtures. |
 | Physical mobile browser and userscript manager installation | Not performed. Chromium mobile emulation does not verify every mobile browser or userscript manager. |
 
-The repository update does not install the extension or helper into a running SillyTavern instance. For deployment, update cl-helper to 1.13.0 and restart SillyTavern. The optional Datacat Export Companion 1.0.0 is needed only for exports that require browser verification. Setup and troubleshooting instructions are in the root README.
+The repository update does not install the extension or helper into a running SillyTavern instance. For deployment, update cl-helper to 1.13.0 and restart SillyTavern. Install or update the optional Datacat Export Companion to 1.0.1 for exports that require browser verification. Setup and troubleshooting instructions are in the root README.

@@ -100,7 +100,8 @@ export async function acquireDatacatExport(characterId, options = {}) {
     };
     card._listingName = character?.name || existing.pageName || null;
     // Unknown lorebook data must not be compared as a deletion.
-    if (!hasExportedLorebook && !card.data.character_book && (metadataUnavailable || !character || hasUnfetchedLorebook(character))) {
+    if (!hasExportedLorebook && (hasUnfetchedLorebook(character)
+        || (!card.data.character_book && (metadataUnavailable || !character)))) {
         card._lorebookUnavailable = true;
     }
     return { card, imageBuffer, definitionSource, sourceKind: card.data.extensions.datacat.sourceKind, variantId: String(variantId || ''), character };
