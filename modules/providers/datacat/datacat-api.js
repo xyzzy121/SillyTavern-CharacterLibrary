@@ -6,6 +6,10 @@ import CoreAPI from '../../core-api.js';
 import { CL_HELPER_PLUGIN_BASE, slugify, stripHtml, readJsonClassified, classifyErrorPage } from '../provider-utils.js';
 import { meiliMultiSearch, TAG_MAP as JANNY_TAG_MAP } from '../janny/janny-api.js';
 import { isJanitorBridgeAvailable, janitorBridgeFetch } from '../janitor-bridge.js';
+import { DatacatError, classifyDatacatError, normalizeDatacatCharacter, normalizeDatacatPage,
+    normalizeDatacatSourceKind, getDatacatSourceKind, getDatacatCharacterId,
+    normalizeDatacatAvatar, normalizeDefinitionSource, normalizeRetrievalStatus } from './datacat-contract.js';
+export * from './datacat-contract.js';
 
 export { slugify, stripHtml, JANNY_TAG_MAP };
 
@@ -55,17 +59,22 @@ export function resolveDatacatAvatarUrl(hit, opts = {}) {
     // guard on the v2 candidates skips ST's 'none' convention and bare filenames. Listing rows
     // carry none of the extra fields and fall through to hit.avatar, ie. todays behavior.
     const absOnly = (c) => (typeof c === 'string' && /^https?:\/\//i.test(c) ? c : null);
+    const normalized = normalizeDatacatCharacter(hit);
+    const asset = hit?.media_assets?.find?.(item => item?.role === 'avatar');
     const candidates = opts.preferOriginal
         ? [
+            hit?.avatarSelfArchiveUrl || hit?.avatar_self_archive_url,
+            asset?.originalUrl || asset?.mediaViewUrl || asset?.url,
             absOnly(hit?.chara_card_v2_json?.data?.avatar),
             absOnly(hit?.content_variants?.[0]?.content?.chara_card_v2_json?.data?.avatar),
-            hit?.avatar_variant_urls?.hero || hit?.avatarVariantUrls?.hero,
-            hit?.avatar,
+            normalized?.avatar_variant_urls?.hero,
+            normalized?.avatar,
         ]
-        : [hit?.avatar];
+        : [normalized?.avatar];
     for (const avatar of candidates) {
         if (!avatar || typeof avatar !== 'string') continue;
-        let url = /^https?:\/\//i.test(avatar) ? avatar : `${DATACAT_JANITOR_IMAGE_BASE}${avatar}`;
+        let url = normalizeDatacatAvatar(avatar, getDatacatSourceKind(hit));
+        if (!url) continue;
         const safety = CoreAPI.isUrlSafeForDownload(url);
         if (!safety.ok) continue;
         // Grid cards pass a width to pull a thumbnail: janitorai's raw bot-avatars are full-size
@@ -129,16 +138,17 @@ async function tryBootstrapSession() {
 
 /**
  * Fetch a DataCat API path through the cl-helper plugin proxy.
- * On 401/403, attempts to bootstrap a session once and retries.
+ * On 401, attempts to bootstrap a session once and retries.
  * @param {string} apiPath - Path relative to datacat.run (e.g. /api/characters/recent-public?...)
  * @returns {Promise<Response>}
  */
-async function dcFetch(apiPath) {
+async function dcFetch(apiPath, options = {}) {
     if (!_apiRequest) throw new Error('DataCat: apiRequest not bound (cl-helper required)');
-    let resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`);
-    if (resp.status === 401 || resp.status === 403) {
+    let resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal: options.signal });
+    // A browser verification or creator-policy 403 cannot be repaired by replacing a session.
+    if (resp.status === 401) {
         if (await tryBootstrapSession()) {
-            resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`);
+            resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal: options.signal });
         }
     }
     if (!resp.ok) {
@@ -147,6 +157,27 @@ async function dcFetch(apiPath) {
         console.warn(`[DataCat] dcFetch ${resp.status} for ${apiPath}`, body.slice(0, 500));
     }
     return resp;
+}
+
+async function readDcJson(response, { allow404 = false } = {}) {
+    let data;
+    try { data = await response.json(); }
+    catch {
+        if (allow404 && response.status === 404) return null;
+        if (!response.ok) throw classifyDatacatError(response.status, null);
+        throw new DatacatError('DataCat returned an invalid JSON response', { code: 'invalid_response', status: response.status });
+    }
+    if (!response.ok) {
+        const error = classifyDatacatError(response.status, data);
+        if (allow404 && error.code === 'not_found') return null;
+        throw error;
+    }
+    if (data?.success === false || data?.error) throw classifyDatacatError(response.status, data);
+    return data;
+}
+
+export async function fetchDatacatFeatures(options = {}) {
+    return readDcJson(await dcFetch('/api/features', options));
 }
 
 /**
@@ -372,18 +403,20 @@ export async function janitoraiVerifyToken(accessToken) {
  * @param {'janitor'|'saucepan'|null} [sourceKind] - upstream source hint; required for freshly-extracted chars
  * @returns {Promise<Object|null>} character object or null
  */
-export async function fetchDatacatCharacter(characterId, sourceKind = null) {
+export async function fetchDatacatCharacter(characterId, sourceKind = null, options = {}) {
     if (!characterId) return null;
-    try {
-        const qs = sourceKind ? `?sourceKind=${encodeURIComponent(sourceKind)}` : '';
-        const response = await dcFetch(`/api/characters/${characterId}${qs}`);
-        if (!response.ok) return null;
-        const data = await response.json();
-        return data?.character || null;
-    } catch (e) {
-        console.error('[DataCat] fetchDatacatCharacter failed:', characterId, e);
-        return null;
+    const id = encodeURIComponent(characterId);
+    const source = normalizeDatacatSourceKind(sourceKind);
+    const paths = source ? [`/api/characters/${id}?sourceKind=${source}`, `/api/characters/${id}`] : [`/api/characters/${id}`];
+    paths.push(`/api/characters/recent-public/${id}`);
+    for (const path of paths) {
+        const data = await readDcJson(await dcFetch(path, options), { allow404: true });
+        if (data === null) continue;
+        const character = normalizeDatacatCharacter(data.character || (getDatacatCharacterId(data) ? data : null));
+        if (!character) throw new DatacatError('DataCat returned invalid character metadata', { code: 'invalid_response' });
+        return character;
     }
+    return null;
 }
 
 /**
@@ -392,18 +425,17 @@ export async function fetchDatacatCharacter(characterId, sourceKind = null) {
  * @param {'janitor'|'saucepan'|null} [sourceKind] - upstream source hint
  * @returns {Promise<Object|null>} { data: { name, tags, avatar, ... } }
  */
-export async function fetchDatacatDownload(characterId, sourceKind = null) {
+export async function fetchDatacatDownload(characterId, sourceKind = null, options = {}) {
     if (!characterId) return null;
-    try {
-        const params = new URLSearchParams({ t: String(Date.now()) });
-        if (sourceKind) params.set('sourceKind', sourceKind);
-        const response = await dcFetch(`/api/characters/${characterId}/download?${params.toString()}`);
-        if (!response.ok) return null;
-        return response.json();
-    } catch (e) {
-        console.error('[DataCat] fetchDatacatDownload failed:', characterId, e);
-        return null;
+    const params = new URLSearchParams({ t: String(Date.now()), downloadFormat: 'json', definitionSource: normalizeDefinitionSource(options.definitionSource) });
+    const source = normalizeDatacatSourceKind(sourceKind);
+    if (source) params.set('sourceKind', source);
+    if (options.variantId) params.set('variant', options.variantId);
+    const data = await readDcJson(await dcFetch(`/api/characters/${encodeURIComponent(characterId)}/download?${params}`, options), { allow404: true });
+    if (data !== null && (!data?.data || typeof data.data !== 'object' || Array.isArray(data.data) || typeof data.data.name !== 'string')) {
+        throw new DatacatError('DataCat returned an invalid exported card', { code: 'invalid_response' });
     }
+    return data;
 }
 
 /**
@@ -411,17 +443,18 @@ export async function fetchDatacatDownload(characterId, sourceKind = null) {
  * @param {string} creatorId - UUID
  * @returns {Promise<Object|null>}
  */
-export async function fetchDatacatCreator(creatorId) {
+export async function fetchDatacatCreator(creatorId, opts = {}) {
     if (!creatorId) return null;
-    try {
-        const response = await dcFetch(`/api/creators/${creatorId}`);
-        if (!response.ok) return null;
-        const data = await response.json();
-        return data?.creator || null;
-    } catch (e) {
-        console.error('[DataCat] fetchDatacatCreator failed:', creatorId, e);
-        return null;
-    }
+    const source = normalizeDatacatSourceKind(opts.sourceKind);
+    const path = source === 'direct_upload' ? `/api/profiles/users/${encodeURIComponent(creatorId)}` : `/api/creators/${encodeURIComponent(creatorId)}`;
+    const data = await readDcJson(await dcFetch(path, opts), { allow404: true });
+    if (data === null) return null;
+    const creator = data.creator || data.user || data.profile || data;
+    return { ...creator,
+        id: creator.id || creator.uuid || creatorId,
+        name: creator.name || creator.displayName || creator.display_name || creator.username || '',
+        avatar: creator.avatar || creator.avatarUrl || creator.avatar_url || null,
+    };
 }
 
 /**
@@ -436,9 +469,15 @@ export async function fetchDatacatCreator(creatorId) {
 export async function fetchDatacatCreatorCharacters(creatorId, opts = {}) {
     if (!creatorId) return null;
     const { limit = 24, offset = 0, sortBy = 'chat_count' } = opts;
-    const response = await dcFetch(`/api/creators/${creatorId}/characters?limit=${limit}&offset=${offset}&sortBy=${sortBy}`);
-    const data = await readJsonClassified(response);
-    return { total: data.total || 0, list: data.list || [] };
+    const direct = normalizeDatacatSourceKind(opts.sourceKind) === 'direct_upload';
+    const sort = ['fresh', 'created_at', 'createdAt', 'newest', 'latest', 'creation_date'].includes(sortBy) ? (direct ? 'latest' : 'creation_date') : sortBy;
+    const params = new URLSearchParams({ limit, offset });
+    if (direct) params.set('sort', sort);
+    else { params.set('order', sort); params.set('sortBy', sort); params.set('sortDir', 'desc'); }
+    const path = direct ? `/api/profiles/users/${encodeURIComponent(creatorId)}/bots` : `/api/creators/${encodeURIComponent(creatorId)}/characters`;
+    const data = await readDcJson(await dcFetch(`${path}?${params}`, opts));
+    const page = normalizeDatacatPage(data, { limit, offset, listKey: 'list' });
+    return { ...page, pagination: { total: page.total, hasMore: page.hasMore, nextOffset: page.nextOffset } };
 }
 
 // ========================================
@@ -452,7 +491,7 @@ export async function fetchDatacatCreatorCharacters(creatorId, opts = {}) {
  * @param {number} [opts.offset=0]
  * @param {number[]} [opts.tagIds] - Active tag ID filters
  * @param {string} [opts.search] - Full text search (matches character AND creator names)
- * @param {string} [opts.sortBy] - Result order; the endpoint honors only 'score' (verified live)
+ * @param {string} [opts.sortBy] - fresh, score, chat_count, messages_per_chat, first_published
  * @param {number} [opts.minTotalTokens=MIN_TOTAL_TOKENS]
  * @returns {Promise<{totalCount: number, characters: Object[]}>} failures throw classified errors
  */
@@ -461,10 +500,11 @@ export async function fetchRecentPublic(opts = {}) {
     let path = `/api/characters/recent-public?limit=${limit}&offset=${offset}&summary=1&minTotalTokens=${minTotalTokens}`;
     if (tagIds.length > 0) path += `&tagIds=${tagIds.join(',')}`;
     if (search) path += `&search=${encodeURIComponent(search)}`;
-    if (sortBy) path += `&sortBy=${encodeURIComponent(sortBy)}`;
-    const response = await dcFetch(path);
-    const data = await readJsonClassified(response);
-    return { totalCount: data.totalCount || 0, characters: data.characters || [] };
+    if (sortBy) path += `&sort=${encodeURIComponent(sortBy)}`;
+    const response = await dcFetch(path, opts);
+    const data = await readDcJson(response);
+    const page = normalizeDatacatPage(data, { limit, offset });
+    return { ...page, pagination: { total: page.total, hasMore: page.hasMore, nextOffset: page.nextOffset } };
 }
 
 /**
@@ -477,15 +517,19 @@ export async function fetchRecentPublic(opts = {}) {
  * @returns {Promise<{sortBy: string, last24h: Object[], thisWeek: Object[]}>} failures throw classified errors
  */
 export async function fetchFreshCharacters(opts = {}) {
-    const { sortBy = 'score', limit24 = 80, limitWeek = 20 } = opts;
-    const path = `/api/characters/fresh?summary=1&sortBy=${sortBy}&limit24=${limit24}&limitWeek=${limitWeek}`;
-    const response = await dcFetch(path);
-    const data = await readJsonClassified(response);
+    const { sortBy = 'score', limit24 = 80, limitWeek = 20, offset24 = 0, offsetWeek = 0 } = opts;
+    const params = new URLSearchParams({ summary: 1, sortBy, limit24, limitWeek, offset24, offsetWeek });
+    const response = await dcFetch(`/api/characters/fresh?${params}`, opts);
+    const data = await readDcJson(response);
     const w = data.windows || {};
+    const day = normalizeDatacatPage(w.last24h || { characters: [], hasMore: false }, { limit: limit24, offset: offset24 });
+    const week = normalizeDatacatPage(w.thisWeek || { characters: [], hasMore: false }, { limit: limitWeek, offset: offsetWeek });
     return {
         sortBy: data.sortBy || sortBy,
-        last24h: w.last24h?.characters || [],
-        thisWeek: w.thisWeek?.characters || [],
+        last24h: day.characters,
+        thisWeek: week.characters,
+        pagination24: { total: day.total, nextOffset: day.nextOffset, hasMore: day.hasMore },
+        paginationWeek: { total: week.total, nextOffset: week.nextOffset, hasMore: week.hasMore },
     };
 }
 
@@ -498,17 +542,11 @@ export async function fetchFreshCharacters(opts = {}) {
  */
 export async function fetchFacetedTags(opts = {}) {
     const { activeTagIds = [], minTotalTokens = MIN_TOTAL_TOKENS } = opts;
-    try {
-        let path = `/api/tags/faceted?mode=recent&minTotalTokens=${minTotalTokens}`;
-        if (activeTagIds.length > 0) path += `&activeTagIds=${activeTagIds.join(',')}`;
-        const response = await dcFetch(path);
-        if (!response.ok) return null;
-        const data = await response.json();
-        return { groups: data.groups || [], tags: data.tags || [] };
-    } catch (e) {
-        console.error('[DataCat] fetchFacetedTags failed:', e);
-        return null;
-    }
+    let path = `/api/tags/faceted?mode=recent&minTotalTokens=${minTotalTokens}`;
+    if (activeTagIds.length > 0) path += `&activeTagIds=${activeTagIds.join(',')}`;
+    const response = await dcFetch(path, opts);
+    const data = await readDcJson(response);
+    return { groups: data.groups || [], tags: data.tags || [] };
 }
 
 // ========================================
@@ -770,76 +808,61 @@ export function buildV2FromDatacat(character) {
 
 /**
  * Build a V2 character card from the /download endpoint response.
- * The download format is already close to V2 but needs wrapping.
- *
- * For Saucepan-with-hidden-definition cards, /download returns empty body
- * fields. When a `character` object is supplied and contains an active
- * recovery variant (`content_variants[primary].content`), we fall back to it
- * for description, scenario, and first_mes. This keeps imports and update
- * checks working for repaired Saucepan cards.
+ * Current exports are authoritative for the chosen definition, including
+ * intentionally empty fields. Metadata only enriches identity and missing
+ * lorebooks; it never replaces a selected export's body with another variant.
  *
  * @param {Object} downloadData - Response from /api/characters/:id/download
  * @param {Object} [character] - Optional character metadata for enrichment
  * @returns {Object|null}
  */
-export function buildV2FromDownload(downloadData, character) {
+export function buildV2FromDownload(downloadData, character, context = {}) {
     const d = downloadData?.data;
-    if (!d) return null;
+    if (!d || typeof d !== 'object' || Array.isArray(d) || typeof d.name !== 'string') {
+        throw new DatacatError('DataCat returned an invalid exported card', { code: 'invalid_response' });
+    }
 
-    const recovered = character ? pickRecoveryVariant(character) : null;
-    const isSaucepan = character?.primary_content_source_kind === 'saucepan';
-    const v2Data = character?.chara_card_v2_json?.data || null;
-    // Old downloads carry the janitor body in personality, new ones are proper V2 (personality empty), so the || order covers both shapes, dont reorder.
-    const description = d.personality || d.description
-        || (isSaucepan
-            ? (recovered?.description || recovered?.personality || v2Data?.description || character?.description || '')
-            : (character?.personality || recovered?.personality || stripDatacatMarkers(v2Data?.description) || ''));
-    const scenario = d.scenario || recovered?.scenario || '';
-    const firstMes = d.first_mes || recovered?.first_message || '';
-    const creatorNotes = isSaucepan
-        ? (character?.companion_snapshot?.full_description
-            || character?.intercepted_chat_data?.companion_snapshot?.full_description
-            || v2Data?.creator_notes
-            || d.creator_notes
-            || '')
-        : (d.creator_notes || character?.description || '');
-    // New downloads ship URLs in creator/character_version; the real creator name lives in download metadata.
-    const isUrl = (s) => typeof s === 'string' && /^https?:\/\//i.test(s);
-    const creatorName = character?.creator_name || character?.creatorName
-        || downloadData?.metadata?.janitor_creator_name
-        || (isUrl(d.creator) ? '' : (d.creator || ''));
-    const cardVersion = (d.character_version && !isUrl(d.character_version)) ? d.character_version : '1.0';
+    const existing = d.extensions?.datacat || {};
+    // Current exports are canonical V2, including intentional empty values. Only a legacy,
+    // unversioned download uses Janitor's personality-as-definition convention.
+    const legacy = !downloadData.spec && !downloadData.spec_version;
+    const description = legacy && d.personality ? d.personality : (d.description ?? '');
+    const id = getDatacatCharacterId(character) || getDatacatCharacterId(context.id || '') || getDatacatCharacterId(existing.id || '');
 
     return {
         spec: 'chara_card_v2',
         spec_version: '2.0',
         data: {
+            ...d,
             name: d.name || character?.chat_name || character?.chatName || character?.name || 'Unknown',
             description,
-            personality: '',
-            scenario,
-            first_mes: firstMes,
+            personality: legacy ? '' : (d.personality ?? ''),
+            scenario: d.scenario ?? '',
+            first_mes: d.first_mes ?? '',
             mes_example: d.mes_example || '',
             system_prompt: d.system_prompt || '',
             post_history_instructions: d.post_history_instructions || '',
-            creator_notes: creatorNotes,
-            creator: creatorName,
-            character_version: cardVersion,
+            creator_notes: d.creator_notes ?? '',
+            creator: d.creator ?? character?.creator_name ?? downloadData?.metadata?.janitor_creator_name ?? '',
+            character_version: d.character_version ?? '1.0',
             tags: d.tags || [],
             alternate_greetings: d.alternate_greetings || [],
             extensions: {
                 ...(d.extensions || {}),
                 datacat: {
-                    id: character?.character_id || character?.characterId || null,
-                    sourceKind: character?.primary_content_source_kind || null,
-                    creatorId: character?.creator_id || character?.creatorId || null,
-                    creatorName: character?.creator_name || character?.creatorName || null
+                    ...existing,
+                    id: id || null,
+                    sourceKind: normalizeDatacatSourceKind(context.sourceKind) || getDatacatSourceKind(character, existing.sourceKind),
+                    definitionSource: normalizeDefinitionSource(context.definitionSource ?? existing.definitionSource),
+                    ...(context.variantId ? { variantId: context.variantId } : {}),
+                    creatorId: character?.creator_id || character?.creatorId || existing.creatorId || null,
+                    creatorName: character?.creator_name || character?.creatorName || existing.creatorName || null
                 }
             },
-            // Download's character_book is often present-but-empty; fall through to scripts.
-            character_book: (d.character_book?.entries?.length ? d.character_book : null)
-                || extractCharacterBookFromScripts(character)
-                || undefined
+            // Missing is different from an explicitly empty book in a selected export.
+            ...(Object.hasOwn(d, 'character_book') ? { character_book: d.character_book }
+                : normalizeDefinitionSource(context.definitionSource) === 'source'
+                    ? { character_book: extractCharacterBookFromScripts(character) || undefined } : {}),
         }
     };
 }
@@ -856,39 +879,20 @@ export function buildV2FromDownload(downloadData, character) {
  * @param {boolean} [opts.alwaysReextract=false] - force re-extraction even if DataCat already has the character
  * @returns {Promise<{success: boolean, queued?: boolean, started?: boolean, queuePosition?: number, requestId?: string, error?: string, errorCode?: string}>}
  */
-export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysReextract = false } = {}) {
+export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysReextract = false, signal } = {}) {
     if (!_apiRequest) throw new Error('DataCat: apiRequest not bound');
-    try {
-        const resp = await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract });
-        if (!resp.ok) {
-            const errText = await resp.text();
-            console.error('[DataCat] dc-extract error:', resp.status, errText.substring(0, 200));
-            return { success: false, error: `Server returned ${resp.status}: ${errText.substring(0, 100)}` };
-        }
-        try {
-            return await resp.json();
-        } catch {
-            return { success: false, error: 'Invalid JSON response from cl-helper' };
-        }
-    } catch (e) {
-        console.error('[DataCat] submitExtraction failed:', e);
-        return { success: false, error: e.message };
-    }
+    const resp = await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract }, { signal });
+    return readDcJson(resp);
 }
 
 /**
  * Poll extraction status from DataCat.
  * @returns {Promise<{inProgress: Object|null, queueLength: number, queue: Array, history: Array}|null>}
  */
-export async function fetchExtractionStatus() {
-    try {
-        const resp = await dcFetch('/api/extraction/status-projection');
-        if (!resp.ok) return null;
-        return await resp.json();
-    } catch (e) {
-        console.error('[DataCat] fetchExtractionStatus failed:', e);
-        return null;
-    }
+export async function fetchExtractionStatus(options = {}) {
+    let resp = await dcFetch('/api/retrieval/status-projection', options);
+    if (resp.status === 404) resp = await dcFetch('/api/retrieval/status', options);
+    return normalizeRetrievalStatus(await readDcJson(resp));
 }
 
 // ========================================

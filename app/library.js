@@ -19805,10 +19805,18 @@ startImportBtn?.addEventListener('click', async () => {
         // Execute the import based on item shape (provider URL vs local/direct file)
         const result = item.provider
             ? await item.provider.importCharacter(item.identifier, null, {
+                sourceUrl: item.url, interactive: true,
+                signal: importAbortState.controller.signal, reusePanel: true,
                 // Slow imports (eg. janitorai hidden-definition recovery) narrate their phases
                 onProgress: (msg) => updateLogEntry(logEntry, `${displayName}: ${msg}`, 'pending'),
             })
             : await importLocalCharacter(item.file);
+
+        if (result.panelClosed) {
+            updateLogEntry(logEntry, `${displayName}: import cancelled`, 'warning');
+            wasCancelled = true;
+            break;
+        }
         
         // Check abort AFTER import completes (import itself is atomic — card was already uploaded)
         if (shouldStop()) {
@@ -19956,6 +19964,8 @@ startImportBtn?.addEventListener('click', async () => {
                     break;
                 }
             }
+        } else if (result.cancelled) {
+            updateLogEntry(logEntry, `${displayName}: skipped by user`, 'warning');
         } else {
             errorCount++;
             updateStats();
@@ -19969,6 +19979,9 @@ startImportBtn?.addEventListener('click', async () => {
     }
     
     // ==================== FINALIZE ====================
+    for (const provider of new Set(importItems.map(item => item.provider).filter(Boolean))) {
+        provider.finishImportBatch?.();
+    }
     
     // Log cancellation
     if (wasCancelled) {

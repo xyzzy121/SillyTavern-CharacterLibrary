@@ -7,6 +7,8 @@ import { BOTBOORU_BASE, fetchBotbooruUser } from './botbooru/botbooru-api.js';
 import { fetchCharactersByOwner, getCharacterPageUrl } from './pygmalion/pygmalion-api.js';
 import { WYVERN_API_BASE, WYVERN_SITE_BASE, getWyvernHeaders, getWyvernCharName } from './wyvern/wyvern-api.js';
 import { fetchDatacatCreatorCharacters, fetchDatacatCharacter, submitExtraction, fetchExtractionStatus } from './datacat/datacat-api.js';
+import { getDatacatCharacterId, getDatacatSourceKind, getDatacatPageState, buildDatacatUrl, normalizeRetrievalStatus, matchRetrievalStatus, isRetrievalShortcut } from './datacat/datacat-contract.js';
+import { closeDatacatExportPanel } from './datacat/datacat-export-bridge.js';
 import { fetchSaucepanCompanionsOfUser } from './saucepan/saucepan-api.js';
 import { fetchJanitoraiCharacters } from './janitorai/janitorai-api.js';
 import { meiliMultiSearch } from './janny/janny-api.js';
@@ -122,50 +124,46 @@ function cdHasMedia(result) {
 
 let _cdActiveView = null;
 
-const cdCharId = (hit) => hit?.characterId || hit?.character_id || hit?.id || '';
-const cdSourceKind = (hit) => hit?.primary_content_source_kind === 'saucepan' ? 'saucepan' : 'janitor';
+const cdCharId = getDatacatCharacterId;
+const cdSourceKind = getDatacatSourceKind;
 
 async function cdDatacatExtract(view, charId, sourceKind) {
+    if (sourceKind === 'direct_upload' || view._cdCancelled) return null;
+    const signal = view._cdAbortController?.signal;
     const urlBase = sourceKind === 'saucepan' ? 'https://saucepan.ai/companion/' : 'https://janitorai.com/characters/';
-    const url = `${urlBase}${charId}`;
-    const publicFeed = CoreAPI.getSetting('datacatPublicFeed') === true;
-    // anon sessions cap at 3 jobs and timed-out jobs stay alive server-side (no cancel API), so wait for a slot
-    let sub = null;
-    const slotDeadline = Date.now() + 120000;
-    for (;;) {
-        sub = await submitExtraction(url, { publicFeed }).catch(() => null);
-        const errText = String(sub?.error || sub?.message || '');
-        const capped = /Server returned 429/.test(errText) || /already have \d+ jobs/i.test(errText);
-        if (!capped) break;
-        if (view._cdCancelled || Date.now() >= slotDeadline) {
-            view._dcJammed = true;
-            return null;
-        }
-        await new Promise(r => setTimeout(r, 12000));
+    const submittedAt = Date.now();
+    let submission;
+    try {
+        submission = await submitExtraction(urlBase + charId, { publicFeed: CoreAPI.getSetting('datacatPublicFeed') === true, signal });
+    } catch (error) {
+        if (error.code === 'rate_limited') view._dcJammed = true;
+        throw error;
     }
-    if (!sub || sub.error || sub.success === false) return null;
-    const targetId = String(charId).trim();
-    const deadline = Date.now() + 120000;
-    while (Date.now() < deadline) {
+    const requestId = submission.requestId || submission.request_id || submission.job?.requestId || submission.task?.requestId;
+    if (submission.error || submission.success === false) throw new Error(submission.message || submission.error || 'Retrieval failed');
+    const fetchResult = async () => {
         if (view._cdCancelled) return null;
-        await new Promise(r => setTimeout(r, 3000));
-        const status = await fetchExtractionStatus().catch(() => null);
-        if (!status) continue;
-        const entry = status.history?.find(h => String(h.characterId || '').trim() === targetId);
-        if (!entry) continue;
-        if (entry.success === false || entry.status === 'error') {
-            CoreAPI.debugLog?.('[Browse] extraction failed:', charId, entry.error || entry.message);
-            return null;
-        }
-        await new Promise(r => setTimeout(r, 1000));
-        let character = await fetchDatacatCharacter(charId, sourceKind).catch(() => null);
+        let character = await fetchDatacatCharacter(charId, sourceKind, { signal });
         if (!character) {
-            await new Promise(r => setTimeout(r, 2000));
-            character = await fetchDatacatCharacter(charId, sourceKind).catch(() => null);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            if (view._cdCancelled) return null;
+            character = await fetchDatacatCharacter(charId, sourceKind, { signal });
         }
         return character;
+    };
+    if (isRetrievalShortcut(submission)) return fetchResult();
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+        if (view._cdCancelled) return null;
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        if (view._cdCancelled) return null;
+        const status = normalizeRetrievalStatus(await fetchExtractionStatus({ signal }));
+        const entry = matchRetrievalStatus(status, { requestId, characterId: charId, submittedAt });
+        if (!entry) continue;
+        if (entry.success === false) throw new Error(entry.error || entry.message || 'Retrieval ' + entry.status);
+        return fetchResult();
     }
-    return null;
+    throw new Error('Retrieval timed out; the remote job may still finish.');
 }
 
 const CD_ADAPTERS = {
@@ -376,19 +374,19 @@ const CD_ADAPTERS = {
                 for (const hit of (data?.characters || [])) push(hit);
             } else {
                 const PAGE = 80;
-                for (let offset = 0; ; offset += PAGE) {
+                for (let offset = 0, pageNumber = 0; pageNumber < 200; pageNumber++) {
                     // Tolerant on purpose: a mid-pagination failure keeps the partial list (only
                     // a first-page failure aborts below); the fetcher itself throws classified now
-                    const data = await fetchDatacatCreatorCharacters(ref.creatorId, { limit: PAGE, offset, sortBy: 'chat_count' }).catch(() => null);
+                    const data = await fetchDatacatCreatorCharacters(ref.creatorId, { limit: PAGE, offset, sortBy: 'chat_count', sourceKind: ref.source === 'direct_upload' ? 'direct_upload' : undefined }).catch(() => null);
                     if (!data) {
                         if (offset === 0) throw new Error('DataCat creator fetch failed');
                         break;
                     }
                     const list = data?.list || [];
-                    const before = results.length;
                     for (const hit of list) push(hit);
-                    const total = data?.total || 0;
-                    if (results.length === before || list.length < PAGE || (total > 0 && results.length >= total)) break;
+                    const page = getDatacatPageState(data.pagination || data, offset, list.length, data.total);
+                    if (!page.hasMore) break;
+                    offset = page.nextOffset;
                 }
             }
             return results;
@@ -396,26 +394,40 @@ const CD_ADAPTERS = {
         async importOne(view, card) {
             const provider = CoreAPI.getProvider('datacat');
             if (!provider?.importCharacter) return { ok: false, error: 'Provider not available' };
+            if (view._cdCancelled) return { ok: false, cancelled: true, error: 'Cancelled' };
             const hit = card.raw;
             const charId = cdCharId(hit);
             const sourceKind = cdSourceKind(hit);
-            let character = hit._fullCharacter || await fetchDatacatCharacter(charId, sourceKind).catch(() => null);
+            let character = hit._fullCharacter || await fetchDatacatCharacter(charId, sourceKind, { signal: view._cdAbortController?.signal }).catch(error => {
+                if (error.code === 'not_found') return null;
+                throw error;
+            });
             if (!character) {
+                if (sourceKind === 'direct_upload') return { ok: false, error: 'Datacat upload unavailable' };
                 // once the server queue is provably full, dont burn 2 min per remaining card
-                if (view._dcJammed) return { ok: false, error: 'Extraction queue full (skipped)' };
+                if (view._dcJammed) return { ok: false, error: 'Retrieval queue full (skipped)' };
                 character = await cdDatacatExtract(view, charId, sourceKind);
                 if (!character) {
-                    return { ok: false, error: view._dcJammed ? 'Extraction queue full' : 'Extraction failed or timed out' };
+                    return { ok: false, error: view._dcJammed ? 'Retrieval queue full' : 'Retrieval failed or timed out' };
                 }
             }
-            const result = await provider.importCharacter(charId, character, {});
-            if (!result.success) return { ok: false, error: result.error || 'Import failed' };
+            if (view._cdCancelled) return { ok: false, cancelled: true, error: 'Cancelled' };
+            const result = await provider.importCharacter(charId, character, {
+                definitionSource: 'source', sourceKind, interactive: true, reusePanel: true,
+                signal: view._cdAbortController?.signal,
+                onStatus: message => { const label = document.getElementById('creatorDlCurrent'); if (label) label.textContent = message; },
+            });
+            if (result.panelClosed) {
+                view._cdCancelled = true;
+                view._cdAbortController?.abort();
+            }
+            if (!result.success) return { ok: false, cancelled: result.cancelled, error: result.error || 'Import failed' };
             const summaryArgs = {
                 galleryCharacters: result.hasGallery ? [{
                     name: result.characterName,
                     provider,
                     linkInfo: { providerId: 'datacat', id: result.providerCharId },
-                    url: `https://datacat.run/characters/${result.providerCharId}`,
+                    url: buildDatacatUrl(result.providerCharId, sourceKind),
                     avatar: result.fileName,
                     galleryId: result.galleryId,
                     cardData: result.cardData,
@@ -1856,6 +1868,7 @@ export class BrowseView {
         _cdActiveView = this;
         this._cdRunning = true;
         this._cdCancelled = false;
+        this._cdAbortController = new AbortController();
         const originalBtnHtml = triggerBtn?.innerHTML;
         if (triggerBtn) {
             triggerBtn.disabled = true;
@@ -1911,6 +1924,8 @@ export class BrowseView {
                             if (added) this.addCharToLookup(added);
                         }
                         if (res.summaryArgs && CoreAPI.getSetting('importMediaAction') !== 'none') CoreAPI.queueImportMediaJobs(res.summaryArgs);
+                    } else if (res?.cancelled) {
+                        skipped++;
                     } else {
                         failed++;
                         failures.push(card.name || '?');
@@ -1926,6 +1941,8 @@ export class BrowseView {
             this.refreshInLibraryBadges();
             this._cdShowDone({ creatorName, imported, failed, failures, skipped, cancelled: this._cdCancelled });
         } finally {
+            if (this.provider?.id === 'datacat') closeDatacatExportPanel();
+            this._cdAbortController = null;
             this._cdRunning = false;
             _cdActiveView = null;
             if (triggerBtn) {
@@ -1976,6 +1993,10 @@ export class BrowseView {
 
     _cdRequestCancel() {
         this._cdCancelled = true;
+        if (this.provider?.id === 'datacat') {
+            this._cdAbortController?.abort();
+            closeDatacatExportPanel();
+        }
         const label = document.getElementById('creatorDlCurrent');
         if (label) label.textContent = 'Cancelling after the current card...';
         const btn = document.getElementById('creatorDlCancelBtn');

@@ -3,12 +3,26 @@ import * as CoreAPI from './core-api.js';
 let isInitialized = false;
 let currentUpdateChecks = new Map(); // fullPath -> { local, remote, diffs }
 let abortController = null;
+let singleCheckController = null;
 let pendingBatchCharacters = [];
 let batchCheckPaused = false;
 let batchCheckRunning = false;
 let batchCheckedCount = 0;
 let batchSelectedAvatars = new Set(); // Characters checked for inclusion in Apply All
 let batchStatusFilter = 'all'; // Active filter: 'all' | 'has-updates' | 'up-to-date' | 'errors' | 'unavailable' | 'applied'
+
+// Persist the export choice alongside an accepted update, retaining local link metadata.
+function preserveDatacatExportSelection(char, remoteData, updatedFields) {
+    const local = char.data?.extensions?.datacat || char.extensions?.datacat;
+    const remote = remoteData?.extensions?.datacat;
+    if (!local?.id || remote?.id !== local.id) return;
+    updatedFields['extensions.datacat'] = {
+        ...local,
+        sourceKind: remote.sourceKind || local.sourceKind || null,
+        definitionSource: remote.definitionSource || local.definitionSource || 'source',
+        variantId: remote.variantId ?? local.variantId ?? '',
+    };
+}
 
 // Base fields to compare (key -> display label) - provider fields merged at init
 const BASE_COMPARABLE_FIELDS = {
@@ -582,6 +596,10 @@ function showSingleCheckModal(char) {
  * @param {Object} char - Character to check
  */
 async function performSingleCheck(char) {
+    singleCheckController?.abort();
+    const controller = new AbortController();
+    singleCheckController = controller;
+    currentUpdateChecks.delete(char.avatar);
     const statusEl = document.getElementById('cardUpdateSingleStatus');
     const contentEl = document.getElementById('cardUpdateSingleContent');
     const applyBtn = document.getElementById('cardUpdateSingleApplyBtn');
@@ -596,15 +614,23 @@ async function performSingleCheck(char) {
     try {
         // Ensure heavy fields are loaded before comparing card content
         await CoreAPI.hydrateCharacter(char);
+        if (controller.signal.aborted) return;
         
         await provider.refreshRemoteData(linkInfo, {
+            signal: controller.signal,
             onStatus: (msg) => {
+                if (controller.signal.aborted) return;
                 statusEl.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${CoreAPI.escapeHtml(msg)}`;
             },
         });
         
+        if (controller.signal.aborted) return;
         statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Fetching remote card...';
-        const remoteCard = aliasRemoteCardTags(await provider.fetchRemoteCard(linkInfo));
+        const remoteCard = aliasRemoteCardTags(await provider.fetchRemoteCard(linkInfo, {
+            interactive: true, signal: controller.signal,
+            onStatus: (msg) => { if (!controller.signal.aborted) statusEl.textContent = msg; },
+        }));
+        if (controller.signal.aborted) return;
         
         if (!remoteCard) {
             statusEl.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Could not fetch remote card data';
@@ -630,8 +656,10 @@ async function performSingleCheck(char) {
         applyBtn.disabled = false;
         
     } catch (error) {
+        if (controller.signal.aborted) return;
         console.error('[CardUpdates] Check failed:', error);
-        statusEl.innerHTML = '<i class="fa-solid fa-xmark"></i> Error checking for updates';
+        statusEl.textContent = error.name === 'AbortError' ? 'Verification cancelled. Your local card is unchanged.'
+            : (error.code ? error.message : 'Error checking for updates');
     }
 }
 
@@ -1408,7 +1436,7 @@ async function performBatchCheck(characters, allowedFields, startFrom = 0) {
             const match = CoreAPI.getCharacterProvider(char);
             if (!match) {
                 if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> No provider';
-                if (itemEl) itemEl.dataset.status = 'errors';
+                if (itemEl) itemEl.dataset.status = 'error';
                 errors++;
                 continue;
             }
@@ -1421,7 +1449,10 @@ async function performBatchCheck(characters, allowedFields, startFrom = 0) {
             });
 
             if (abortController.signal.aborted || batchCheckPaused) break;
-            const remoteCard = aliasRemoteCardTags(await match.provider.fetchRemoteCard(match.linkInfo));
+            const remoteCard = aliasRemoteCardTags(await match.provider.fetchRemoteCard(match.linkInfo, {
+                interactive: false, signal: abortController.signal,
+            }));
+            if (abortController.signal.aborted || batchCheckPaused) break;
             
             if (!remoteCard) {
                 if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-ghost"></i> Removed / Private';
@@ -1458,9 +1489,17 @@ async function performBatchCheck(characters, allowedFields, startFrom = 0) {
                 }
             }
         } catch (error) {
+            if (abortController.signal.aborted) break;
             console.error('[CardUpdates] Batch check error for:', char.avatar, error);
-            if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-xmark"></i> Error';
+            if (statusEl) {
+                statusEl.textContent = error.code === 'verification_required' ? 'Verification required'
+                    : (error.code ? error.message : 'Error');
+            }
             if (itemEl) itemEl.dataset.status = 'error';
+            currentUpdateChecks.delete(char.avatar);
+            batchSelectedAvatars.delete(char.avatar);
+            const checkbox = itemEl?.querySelector('.card-update-batch-checkbox');
+            if (checkbox) { checkbox.checked = false; checkbox.disabled = true; }
             errors++;
         }
         
@@ -1569,6 +1608,7 @@ async function applySingleUpdates() {
             try { await versionsModule.autoSnapshotBeforeChange(char, 'update'); } catch (_) {}
         }
         if (hasListingName) await applyListingName(char, remoteCard);
+        preserveDatacatExportSelection(char, remoteData, updatedFields);
         const hasCardFields = Object.keys(updatedFields).length > 0;
         const success = hasCardFields ? await CoreAPI.applyCardFieldUpdates(char.avatar, updatedFields) : true;
         
@@ -1777,6 +1817,7 @@ async function applyAllBatchUpdates() {
                 try { await versionsModule.autoSnapshotBeforeChange(char, 'update'); } catch (_) {}
             }
             if (hasListingName) await applyListingName(char, remoteCard);
+            preserveDatacatExportSelection(char, remoteData, updatedFields);
             const hasCardFields = Object.keys(updatedFields).length > 0;
             const success = hasCardFields ? await CoreAPI.applyCardFieldUpdates(avatar, updatedFields) : true;
             
@@ -1836,6 +1877,8 @@ async function applyAllBatchUpdates() {
 // ========================================
 
 function closeSingleModal() {
+    singleCheckController?.abort();
+    singleCheckController = null;
     singleModalAvatar = null;
     singleModalClosedAt = Date.now();
     document.getElementById('cardUpdateSingleModal')?.classList.remove('visible');

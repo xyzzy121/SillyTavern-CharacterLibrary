@@ -2,7 +2,7 @@
 //
 // DataCat aggregates JanitorAI characters with its own REST API layer
 // and AI-powered character scoring. Uses ella.janitorai.com CDN for images.
-// No version history. No authentication required.
+// Browsing uses a helper session; gated exports use Datacat's browser verification.
 
 import { ProviderBase } from '../provider-interface.js';
 import CoreAPI from '../../core-api.js';
@@ -10,24 +10,24 @@ import { assignGalleryId, importFromPng, fetchWithProxy } from '../provider-util
 import datacatBrowseView from './datacat-browse.js';
 import { initJanitorBridge } from '../janitor-bridge.js';
 import './datacat-avatar-restore.js';
+import { acquireDatacatExport } from './datacat-export.js';
+import { closeDatacatExportPanel } from './datacat-export-bridge.js';
 import {
-    DATACAT_API_BASE,
+    getDatacatCharacterId, getDatacatSourceKind, normalizeDatacatSourceKind,
+    normalizeDefinitionSource, parseDatacatUrl, buildDatacatUrl,
+    matchRetrievalStatus, isRetrievalShortcut,
+} from './datacat-contract.js';
+import {
     resolveDatacatAvatarUrl,
     setApiRequest,
     setSavedTokenGetter,
     slugify,
-    stripHtml,
-    resolveTagNames,
     fetchDatacatCharacter,
-    fetchDatacatDownload,
     validateDcSession,
     clearDcSession,
     initDcSession,
     checkDcPluginAvailable,
     buildV2FromDatacat,
-    buildV2FromDownload,
-    extractCharacterBookFromScripts,
-    hydrateDatacatScripts,
     hasUnfetchedLorebook,
     submitExtraction,
     fetchExtractionStatus,
@@ -50,11 +50,10 @@ class DatacatProvider extends ProviderBase {
     get name() { return 'DataCat'; }
     get icon() { return 'fa-solid fa-cat'; }
     get iconUrl() { return 'https://datacat.run/catgif.gif'; }
-    // Deprecated supersedes beta: the row shows one status badge, and the enable gate shows the
-    // deprecation notice instead of the old "experimental, expect rough edges" warning.
-    get deprecated() { return true; }
+    get beta() { return true; }
+    get enableWarning() { return 'Datacat is experimental. Browsing requires cl-helper 1.13.0; some downloads require the optional Datacat companion userscript and human verification.'; }
     get disabledByDefault() { return true; }
-    get minClHelperVersion() { return '1.0.0'; }
+    get minClHelperVersion() { return '1.13.0'; }
     get browseView() { return datacatBrowseView; }
 
     get linkStatFields() {
@@ -100,14 +99,16 @@ class DatacatProvider extends ProviderBase {
         const dc = extensions?.datacat;
         if (!dc) return null;
 
-        const id = dc.id;
+        const id = getDatacatCharacterId({ id: dc.id });
         if (!id) return null;
 
         return {
             providerId: 'datacat',
             id,
             fullPath: String(id),
-            sourceKind: dc.sourceKind || null,
+            sourceKind: normalizeDatacatSourceKind(dc.sourceKind),
+            definitionSource: normalizeDefinitionSource(dc.definitionSource),
+            variantId: dc.variantId || '',
             linkedAt: dc.linkedAt || null
         };
     }
@@ -115,14 +116,17 @@ class DatacatProvider extends ProviderBase {
     setLinkInfo(char, linkInfo) {
         if (!char) return;
         if (!char.data) char.data = {};
-        if (!char.data.extensions) char.data.extensions = {};
+        if (!char.data.extensions) char.data.extensions = { ...char.extensions };
 
         if (linkInfo) {
             const existing = char.data.extensions.datacat || {};
             char.data.extensions.datacat = {
+                ...existing,
                 id: linkInfo.id,
-                sourceKind: linkInfo.sourceKind || existing.sourceKind || null,
-                linkedAt: linkInfo.linkedAt || new Date().toISOString(),
+                sourceKind: normalizeDatacatSourceKind(linkInfo.sourceKind || existing.sourceKind),
+                definitionSource: normalizeDefinitionSource(linkInfo.definitionSource ?? existing.definitionSource),
+                variantId: linkInfo.variantId ?? existing.variantId ?? '',
+                linkedAt: linkInfo.linkedAt || existing.linkedAt || new Date().toISOString(),
                 pageName: linkInfo.pageName || existing.pageName || null,
             };
         } else {
@@ -158,43 +162,19 @@ class DatacatProvider extends ProviderBase {
         // Normalize: library.js reads metadata.id as the link identifier.
         // DataCat API returns numeric auto-increment as `id` and UUID as `character_id`.
         // URLs and all API calls use the UUID, so expose it as `id`.
-        return { ...char, id: char.character_id || char.id };
+        return char ? { ...char, id: getDatacatCharacterId(char), sourceKind: getDatacatSourceKind(char) } : null;
     }
 
-    async fetchRemoteCard(linkInfo) {
+    async fetchRemoteCard(linkInfo, options = {}) {
         if (!linkInfo?.id) return null;
-        const sk = linkInfo.sourceKind || null;
         try {
-            // Try the download endpoint first (closest to V2 format)
-            const downloadData = await fetchDatacatDownload(linkInfo.id, sk);
-            if (downloadData?.data) {
-                const character = await fetchDatacatCharacter(linkInfo.id, sk);
-                if (character) await hydrateDatacatScripts(character);
-                const result = buildV2FromDownload(downloadData, character);
-                if (result) {
-                    result._listingName = this.getListingName(character);
-                    // Unknown-not-removed: stops the update check offering a phantom "lorebook removed"
-                    if (hasUnfetchedLorebook(character)) result._lorebookUnavailable = true;
-                }
-                return result;
-            }
-
-            // Fallback to building from character metadata
-            const character = await fetchDatacatCharacter(linkInfo.id, sk);
-            if (character) {
-                await hydrateDatacatScripts(character);
-                const result = buildV2FromDatacat(character);
-                if (result) {
-                    result._listingName = this.getListingName(character);
-                    if (hasUnfetchedLorebook(character)) result._lorebookUnavailable = true;
-                }
-                return result;
-            }
-
-            return null;
+            const exported = await acquireDatacatExport(linkInfo.id, {
+                ...linkInfo, ...options, interactive: options.interactive === true,
+            });
+            return exported.card;
         } catch (e) {
-            console.error('[DatacatProvider] fetchRemoteCard failed:', linkInfo.id, e);
-            return null;
+            if (e.code === 'not_found') return null;
+            throw e;
         }
     }
 
@@ -207,25 +187,25 @@ class DatacatProvider extends ProviderBase {
 
     async fetchLorebook(linkInfo) {
         if (!linkInfo?.id) return null;
-        try {
-            const character = await fetchDatacatCharacter(linkInfo.id, linkInfo.sourceKind || null);
-            if (character) await hydrateDatacatScripts(character);
-            return extractCharacterBookFromScripts(character);
-        } catch (e) {
-            console.error('[DatacatProvider] fetchLorebook failed:', linkInfo.id, e);
-            return null;
-        }
+        const card = await this.fetchRemoteCard(linkInfo);
+        return card?.data?.character_book || null;
     }
 
     async refreshRemoteData(linkInfo, options = {}) {
         if (!linkInfo?.id) return;
         if (CoreAPI.getSetting('datacatReextractOnUpdate') !== true) return;
 
-        const report = options?.onStatus;
+        const signal = options?.signal;
+        const checkCancelled = () => {
+            if (signal?.aborted) throw new DOMException('Datacat retrieval cancelled', 'AbortError');
+        };
+        const report = (message) => { if (!signal?.aborted) options.onStatus?.(message); };
 
         try {
+            checkCancelled();
             report?.('Checking cl-helper plugin...');
             const pluginOk = await checkDcPluginAvailable();
+            checkCancelled();
             if (!pluginOk) {
                 api?.debugLog?.('[DatacatProvider] refreshRemoteData: cl-helper not available, skipping re-extraction');
                 return;
@@ -233,61 +213,67 @@ class DatacatProvider extends ProviderBase {
 
             report?.('Validating DataCat session...');
             const sessionOk = await validateDcSession();
-            if (!sessionOk) {
+            checkCancelled();
+            if (!sessionOk.valid) {
                 api?.debugLog?.('[DatacatProvider] refreshRemoteData: no active DataCat session, skipping re-extraction');
                 return;
             }
 
             // Backfill from probe for older cards; the post-extract fetch will persist via buildV2*.
-            let sourceKind = linkInfo.sourceKind;
+            let sourceKind = normalizeDatacatSourceKind(linkInfo.sourceKind);
             if (!sourceKind) {
-                const probe = await fetchDatacatCharacter(linkInfo.id);
-                sourceKind = probe?.primary_content_source_kind || 'janitor';
+                const probe = await fetchDatacatCharacter(linkInfo.id, null, { signal });
+                checkCancelled();
+                sourceKind = getDatacatSourceKind(probe);
             }
+            if (sourceKind === 'direct_upload') return;
 
             const upstreamUrl = sourceKind === 'saucepan'
                 ? `https://saucepan.ai/companion/${linkInfo.id}`
                 : `https://janitorai.com/characters/${linkInfo.id}`;
             const publicFeed = CoreAPI.getSetting('datacatPublicFeed') === true;
 
-            report?.('Submitting re-extraction request...');
-            const result = await submitExtraction(upstreamUrl, { publicFeed, alwaysReextract: true });
+            checkCancelled();
+            report?.('Submitting retrieval request...');
+            const submittedAt = Date.now();
+            const result = await submitExtraction(upstreamUrl, { publicFeed, alwaysReextract: true, signal });
+            checkCancelled();
             if (!result?.success && !result?.queued && !result?.started) {
                 api?.debugLog?.('[DatacatProvider] refreshRemoteData: extraction submit failed:', result?.error);
                 return;
             }
 
             const submitRequestId = result?.requestId || null;
+            if (isRetrievalShortcut(result)) {
+                report?.('Character is already available');
+                return;
+            }
 
             if (result?.queued) {
                 const pos = result.queuePosition ? ` (position ${result.queuePosition})` : '';
-                report?.(`Queued for re-extraction${pos}...`);
+                report?.(`Queued for retrieval${pos}...`);
             } else {
-                report?.('Re-extraction started...');
+                report?.('Retrieval started...');
             }
 
-            const signal = options?.signal;
             const POLL_INTERVAL = 3000;
             const MAX_POLLS = 60;
             for (let i = 0; i < MAX_POLLS; i++) {
                 if (signal?.aborted) return;
                 await new Promise(r => setTimeout(r, POLL_INTERVAL));
                 if (signal?.aborted) return;
-                const status = await fetchExtractionStatus();
+                const status = await fetchExtractionStatus({ signal });
+                checkCancelled();
                 if (!status) continue;
 
-                // Match by requestId (v0.91+ history accumulates entries per char); fall back to characterId.
-                const done = status.history?.find(h => {
-                    if (submitRequestId && h.requestId) return h.requestId === submitRequestId;
-                    return h.characterId === linkInfo.id || h.character_id === linkInfo.id;
-                });
+                const done = matchRetrievalStatus(status, { requestId: submitRequestId, characterId: linkInfo.id, submittedAt });
                 if (done) {
-                    report?.('Re-extraction complete');
+                    report?.(done.success === false ? (done.message || done.error || 'Retrieval failed; using the available export') : 'Retrieval complete');
                     api?.debugLog?.('[DatacatProvider] refreshRemoteData: re-extraction complete for', linkInfo.id);
                     return;
                 }
 
-                if (status.inProgress) {
+                if (status.inProgress && (submitRequestId ? status.inProgress.requestId === submitRequestId : getDatacatCharacterId(status.inProgress) === linkInfo.id)) {
                     const phase = status.inProgress.status;
                     const PHASE_LABELS = {
                         opening_page: 'Opening page',
@@ -297,16 +283,13 @@ class DatacatProvider extends ProviderBase {
                         post_extract: 'Finalizing',
                         complete: 'Completing',
                     };
-                    report?.(PHASE_LABELS[phase] || `Extracting (${phase})...`);
-                } else if (!status.queue || status.queue.length === 0) {
-                    api?.debugLog?.('[DatacatProvider] refreshRemoteData: extraction finished (no longer in progress)');
-                    report?.('Re-extraction complete');
-                    return;
+                    report?.(PHASE_LABELS[phase] || `Retrieving (${phase})...`);
                 }
             }
-            report?.('Re-extraction timed out, using cached data');
+            report?.('Retrieval timed out, using the available export');
             api?.debugLog?.('[DatacatProvider] refreshRemoteData: re-extraction timed out after', MAX_POLLS * POLL_INTERVAL / 1000, 'seconds');
         } catch (err) {
+            if (err.name === 'AbortError' || signal?.aborted) return;
             console.error('[DatacatProvider] refreshRemoteData failed, continuing with cached data:', err);
         }
     }
@@ -334,7 +317,7 @@ class DatacatProvider extends ProviderBase {
 
     getCharacterUrl(linkInfo) {
         if (!linkInfo?.id) return null;
-        return `https://datacat.run/characters/${linkInfo.id}`;
+        return buildDatacatUrl(linkInfo.id, linkInfo.sourceKind);
     }
 
     openLinkUI(char) {
@@ -368,6 +351,8 @@ class DatacatProvider extends ProviderBase {
                 chat_count: character.chat_count ?? character.chatCount ?? character.stats?.chat,
                 message_count: character.message_count ?? character.messageCount ?? character.stats?.message,
                 primary_content_source_kind: character.primary_content_source_kind || null,
+                definitionSource: normalizeDefinitionSource(linkInfo.definitionSource),
+                variantId: linkInfo.variantId || '',
             };
             // Full row rides along so the preview skips its refetch and keeps the right source kind.
             preview._fullCharacter = character;
@@ -432,14 +417,7 @@ class DatacatProvider extends ProviderBase {
     }
 
     parseUrl(url) {
-        if (!url) return null;
-        try {
-            const u = new URL(url.startsWith('http') ? url : `https://${url}`);
-            // Extract UUID from any path containing it (e.g. /characters/recent/:uuid)
-            const match = u.pathname.match(/\/characters?\/(?:[^/]+\/)*([a-f0-9-]{36})/i);
-            if (match) return match[1];
-        } catch { /* ignore */ }
-        return null;
+        return parseDatacatUrl(url)?.id || null;
     }
 
     // ── Import Pipeline ─────────────────────────────────────
@@ -453,83 +431,61 @@ class DatacatProvider extends ProviderBase {
      */
     async importCharacter(identifier, hitData, options = {}) {
         try {
-            const charId = String(identifier);
-
-            // Fetch full character data; browse hits carry the full row as _fullCharacter.
-            let character = hitData?._fullCharacter || hitData || await fetchDatacatCharacter(charId);
-            if (!character) throw new Error('Could not fetch character data from DataCat');
-
-            const characterName = character.chat_name || character.chatName || character.name || 'Unnamed';
-
-            // Download-first for the best V2 mapping; the sourceKind hint keeps freshly-extracted chars from 404ing into the metadata fallback.
-            let characterCard;
-            const sourceKind = character.primary_content_source_kind
-                ? (character.primary_content_source_kind === 'saucepan' ? 'saucepan' : 'janitor')
-                : null;
-            const downloadData = await fetchDatacatDownload(charId, sourceKind);
-            // Listing-shaped hits carry no body source at all; the metadata build needs the full row.
-            if (!downloadData?.data && !character.chara_card_v2_json && !character.content_variants && !character.personality) {
-                character = await fetchDatacatCharacter(charId, sourceKind) || character;
+            const parsed = parseDatacatUrl(options.sourceUrl || String(identifier));
+            const charId = parsed?.id || getDatacatCharacterId({ id: String(identifier) });
+            if (!charId) throw new Error('Invalid Datacat character ID');
+            const definitionSource = normalizeDefinitionSource(options.definitionSource ?? hitData?.definitionSource);
+            const variantId = options.variantId ?? hitData?.variantId ?? '';
+            const sourceKind = normalizeDatacatSourceKind(options.sourceKind || parsed?.sourceKind)
+                || getDatacatSourceKind(hitData?._fullCharacter || hitData, null);
+            let exported = options.acquiredExport;
+            const existingLink = exported?.card?.data?.extensions?.datacat;
+            if (!existingLink || existingLink.id !== charId || exported.definitionSource !== definitionSource
+                || String(exported.variantId || '') !== String(variantId)
+                || (sourceKind && exported.sourceKind !== sourceKind)) {
+                exported = await acquireDatacatExport(charId, {
+                    character: hitData, sourceKind, definitionSource, variantId,
+                    interactive: options.interactive !== false, signal: options.signal,
+                    onStatus: options.onStatus || options.onProgress, reusePanel: options.reusePanel === true,
+                });
             }
-            // Lorebook content moved behind a per-script hampter fetch; hydrate before building.
-            await hydrateDatacatScripts(character);
-            if (downloadData?.data) {
-                characterCard = buildV2FromDownload(downloadData, character);
-            } else {
-                characterCard = buildV2FromDatacat(character);
-            }
-
-            if (!characterCard?.data) throw new Error('Failed to build character card');
-
-            // Ensure datacat extension is set. sourceKind persists normalized ('janitor'/'saucepan', the API hint values), not the raw row kind.
-            if (!characterCard.data.extensions) characterCard.data.extensions = {};
+            if (options.signal?.aborted) throw new DOMException('Import cancelled', 'AbortError');
+            // Import mutates tags/gallery fields; keep a preview's reusable export untouched.
+            const characterCard = structuredClone(exported.card);
+            const character = exported.character || hitData?._fullCharacter || hitData;
+            const characterName = characterCard.data.name || 'Unnamed';
             characterCard.data.extensions.datacat = {
-                ...(characterCard.data.extensions.datacat || {}),
-                id: charId,
-                sourceKind: sourceKind || characterCard.data.extensions.datacat?.sourceKind || null,
-                creatorId: character.creator_id || character.creatorId || null,
-                creatorName: character.creator_name || character.creatorName || null,
-                pageName: this.getListingName(character),
-                linkedAt: new Date().toISOString()
+                ...characterCard.data.extensions.datacat,
+                pageName: this.getListingName(character) || characterCard.data.extensions.datacat.pageName || characterName,
+                linkedAt: new Date().toISOString(),
             };
-
             assignGalleryId(characterCard, options, api);
-
-            // Download avatar. Listing rows top out at datacat's resized variants (640 card /
-            // 768 hero); only the detail payload's embedded V2 json points at the untouched
-            // original, so upgrade before resolving. Best-effort: keep the row on failure.
-            if (!character.chara_card_v2_json && !character.content_variants) {
-                character = await fetchDatacatCharacter(charId, sourceKind) || character;
-            }
             const avatarUrl = resolveDatacatAvatarUrl(character, { preferOriginal: true });
-            let imageBuffer = null;
-
-            if (avatarUrl) {
+            let imageBuffer = exported.imageBuffer || null;
+            if (!imageBuffer && avatarUrl) {
                 try {
-                    const resp = await fetchWithProxy(avatarUrl);
-                    imageBuffer = await resp.arrayBuffer();
-                } catch (e) {
-                    console.warn('[DatacatProvider] Avatar download failed:', e.message);
+                    const response = await fetchWithProxy(avatarUrl);
+                    if (response.ok) imageBuffer = await response.arrayBuffer();
+                } catch (error) {
+                    console.warn('[DatacatProvider] Avatar download failed:', error.message);
                 }
             }
-
+            if (options.signal?.aborted) throw new DOMException('Import cancelled', 'AbortError');
             return await importFromPng({
                 characterCard, imageBuffer,
-                fileName: `datacat_${slugify(characterName)}.png`,
-                characterName,
-                hasGallery: false,
-                providerCharId: charId,
-                fullPath: charId,
-                avatarUrl: avatarUrl || null,
-                api
+                fileName: 'datacat_' + slugify(characterName) + '.png',
+                characterName, hasGallery: false, providerCharId: charId,
+                fullPath: charId, avatarUrl: avatarUrl || null, api,
             });
         } catch (error) {
-            console.error(`[DatacatProvider] importCharacter failed for ${identifier}:`, error);
-            return { success: false, error: error.message };
+            if (error.name !== 'AbortError') console.error('[DatacatProvider] importCharacter failed:', identifier, error);
+            return { success: false, error: error.message, code: error.code, cancelled: error.name === 'AbortError', panelClosed: error.panelClosed === true };
         }
     }
 
     // ── Settings ────────────────────────────────────────────
+
+    finishImportBatch() { closeDatacatExportPanel(); }
 
     getSettings() {
         return [];

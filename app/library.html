@@ -1570,7 +1570,7 @@ https://jannyai.com/characters/uuid_slug
                                 <li>The search bar supports <strong>text search</strong> (searches character names and descriptions) as well as <strong>JanitorAI URLs</strong> for direct lookup</li>
                                 <li>Tags use JanitorAI's own tag system (Male, Female, Anime, etc.)</li>
                                 <li>Creator names can be blank on grid cards (JanitorAI's search index omits them for some characters); they fill in on the preview when the character is also on DataCat</li>
-                                <li>Characters not yet on DataCat can be <strong>extracted</strong> on demand</li>
+                                <li>Request <strong>retrieval</strong> of supported upstream characters not yet on DataCat</li>
                             </ul>
                             <p><strong>JanitorAI (Hampter)</strong> sort orders (Latest, Trending, Trending 24h, Popular, Relevance):</p>
                             <ul>
@@ -1593,10 +1593,10 @@ https://jannyai.com/characters/uuid_slug
                             </ul>
                             <p><strong>What needs no setup at all:</strong> DataCat's own sorts and its MeiliSearch <code>janny_*</code> sorts, JannyAI browsing and search, and signing in. A JannyAI card will still import without the userscript, but with no personality and no greeting, which is not much of a character.</p>
                             <p>Cloudflare's pass expires on a fixed timer rather than on idleness, so it lapses often. The managed browser handles that itself; userscript <strong>v1.2.1+</strong> renews it by briefly opening the site in a background tab. On mobile, a userscript-capable browser such as Firefox for Android works.</p>
-                            <p><strong>Across all modes:</strong> Pasting a <strong>JanitorAI character URL</strong> into the search bar will look up the character on DataCat. If it's found, the preview opens directly. If not, an extraction panel appears letting you request the character from DataCat's cloud service.</p>
-                            <p><strong>Extraction:</strong> When a character only exists on JanitorAI and hasn't been indexed by DataCat yet, the Import button changes to <strong>Extract</strong>. This sends a request to DataCat's cloud service, which visits the JanitorAI page and retrieves the full character definition. You can also paste a JanitorAI URL directly into the search bar to look up and extract specific characters.</p>
-                            <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> DataCat requires the cl-helper server plugin. Install it from Settings → Online → DataCat.</p>
-                            <p class="info-tip"><i class="fa-solid fa-arrows-rotate"></i> <strong>Re-extract on update checks:</strong> Toggle in Settings → Online → DataCat to force DataCat to pull fresh data from JanitorAI before each update check. Slower, but avoids comparisons against stale cached data on DataCat's side.</p>
+                            <p><strong>Across all modes:</strong> Pasting a <strong>JanitorAI, Saucepan, or Datacat character URL</strong> into the search bar looks up the character on DataCat. An available character opens in the preview. A missing upstream character offers retrieval; authentication, verification, restrictions, and service errors are reported separately.</p>
+                            <p><strong>Retrieval:</strong> The <strong>Retrieve</strong> action asks Datacat to collect a supported upstream character. Availability depends on Datacat and the creator's restrictions. Choose <strong>Source</strong> or <strong>Reimagination</strong> in the preview; imports and future linked-card updates retain that choice. Unavailable definitions cannot be selected.</p>
+                            <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> DataCat requires cl-helper 1.13.0 or newer. Update the helper through Settings → Info, then restart SillyTavern. For verified downloads, install <a href="../extras/cl-datacat-bridge.user.js" target="_blank" rel="noopener noreferrer">Datacat Export Companion</a>. Choose Source or Reimagination in the preview; complete verification in the Datacat panel. Batch update scans skip gated cards until you open a single-card check.</p>
+                            <p class="info-tip"><i class="fa-solid fa-arrows-rotate"></i> <strong>Retrieve again on update checks:</strong> Toggle in Settings → Online → DataCat to request fresh upstream data before comparing. This is slower and does not guarantee retrieval succeeds. Batch scans skip exports that require browser verification; a single-card check can open the verification panel.</p>
                         </div>
                         <div class="info-section">
                             <h4><i class="fa-solid fa-robot"></i> Botbooru</h4>
@@ -1615,7 +1615,7 @@ https://jannyai.com/characters/uuid_slug
                         </div>
                         <div class="info-section" id="helpJanitorai">
                             <h4><i class="fa-solid fa-broom"></i> JanitorAI</h4>
-                            <p>First-party access to janitorai.com. Roughly half of all JanitorAI characters withhold their <strong>hidden definition</strong> (the field is simply absent from the API), and this provider recovers them at the source. DataCat and JannyAI can recover hidden definitions too, but DataCat has been progressively closing itself off, and JannyAI's copies come without alternate greetings or creator browsing, so this is the complete, first-party path. Beta, and off by default.</p>
+                            <p>First-party access to janitorai.com. Roughly half of all JanitorAI characters withhold their <strong>hidden definition</strong> (the field is simply absent from the API), and this provider recovers them at the source. DataCat offers source exports and optional reimaginations with its own availability and verification rules. JannyAI's copies can omit alternate greetings and creator browsing. Beta, and off by default.</p>
                             <ul>
                                 <li>Browse and search janitorai.com directly, with its own sort orders (Latest, Trending, Trending 24h, Popular, Relevance)</li>
                                 <li>Filter by tags, NSFW toggle, and browse a single creator's characters</li>
@@ -2884,7 +2884,7 @@ https://jannyai.com/characters/uuid_slug
                         <details class="settings-provider-section" id="settingsDatacatSection">
                             <summary>
                                 <i class="fa-solid fa-cat provider-icon"></i> DataCat
-                                <span class="settings-provider-badge deprecated">Deprecated</span>
+                                <span class="settings-provider-badge">Experimental</span>
                                 <i class="fa-solid fa-chevron-right provider-chevron"></i>
                             </summary>
                             <div class="settings-provider-body">
@@ -2892,7 +2892,7 @@ https://jannyai.com/characters/uuid_slug
                                     <i class="fa-solid fa-puzzle-piece"></i>
                                     <div>
                                         <strong>cl-helper plugin required</strong>
-                                        <span>DataCat requires the cl-helper server plugin for API proxying. <a href="#" class="cl-goto-info">Open cl-helper status &rarr;</a></span>
+                                        <span>DataCat requires cl-helper 1.13.0 or newer. Update the plugin and restart SillyTavern. <a href="#" class="cl-goto-info">Open cl-helper status &rarr;</a></span>
                                     </div>
                                 </div>
                                 <div class="settings-group" id="datacatSettingsFields">
@@ -2928,28 +2928,34 @@ https://jannyai.com/characters/uuid_slug
                                     </div>
                                 </div>
                                 <div class="settings-group">
-                                    <div class="settings-group-title"><i class="fa-solid fa-cloud-arrow-down"></i> Extraction</div>
+                                    <div class="settings-group-title"><i class="fa-solid fa-cloud-arrow-down"></i> Retrieval</div>
                                     <div class="settings-row">
                                         <label class="settings-checkbox-label">
                                             <input type="checkbox" id="datacatPublicFeedCheckbox">
-                                            <span>Publish extracted characters on DataCat</span>
+                                            <span>Publish retrieved characters on DataCat</span>
                                         </label>
                                     </div>
                                     <div class="settings-row">
-                                        <span class="settings-hint">When enabled, extracted characters appear on the public DataCat feed and are accessible via URL. Disable to keep extractions private (API-only access).</span>
+                                        <span class="settings-hint">Requests public-feed visibility for retrieved characters. When disabled, retrieval requests use Datacat’s Yours visibility. Datacat controls final availability.</span>
                                     </div>
                                     <div class="settings-row">
                                         <label class="settings-checkbox-label">
                                             <input type="checkbox" id="datacatReextractOnUpdateCheckbox">
-                                            <span>Re-extract characters on update checks</span>
+                                            <span>Retrieve fresh data on update checks</span>
                                         </label>
                                     </div>
                                     <div class="settings-row">
-                                        <span class="settings-hint">Force DataCat to re-extract character data from JanitorAI before checking for updates. Slower, but ensures comparisons use fresh data instead of a stale cache.</span>
+                                        <span class="settings-hint">Request fresh JanitorAI or Saucepan data before comparing a linked card. Native Datacat uploads are not retrieved externally. The comparison uses the definition choice saved with the card.</span>
                                     </div>
                                     <div class="settings-row">
                                         <span class="settings-hint"><strong>Hampter sorts need the companion userscript.</strong> Latest, Trending, Trending 24h, Popular and Relevance are served by JanitorAI behind Cloudflare, and the userscript (<code>extras/cl-janitor-bridge.user.js</code>, Tampermonkey or Violentmonkey) is what reaches them: it borrows the Cloudflare pass from the browser you are reading this in. Every other DataCat sort works without it. <a href="#" id="hampterHelpLink">More in Help &amp; Tips.</a></span>
                                     </div>
+                                </div>
+                                <div class="settings-group">
+                                    <div class="settings-group-title"><i class="fa-solid fa-file-export"></i> Verified exports</div>
+                                    <div class="settings-row"><span class="settings-hint">Choose Source or Reimagination in the preview. Source is the default; your choice is saved for updates. If Datacat requires human verification, CharacterLibrary opens its export panel.</span></div>
+                                    <div class="settings-row"><span class="settings-hint">Install the optional <a href="../extras/cl-datacat-bridge.user.js" target="_blank" rel="noopener noreferrer">Datacat Export Companion userscript</a> in Tampermonkey or Violentmonkey, then click Export to Character Library inside Datacat. Complete verification there. Credentials stay on Datacat; this is separate from the JanitorAI Hampter bridge.</span></div>
+                                    <div class="settings-row"><span class="settings-hint">Batch update scans skip cards marked Verification required. Open a single-card update check to verify and compare them.</span></div>
                                 </div>
                                 <div class="settings-group">
                                     <div class="settings-group-title"><i class="fa-solid fa-user-lock"></i> JanitorAI Login (Hampter pagination)</div>

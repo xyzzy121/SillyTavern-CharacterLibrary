@@ -9,14 +9,12 @@ import { BrowseView } from '../browse-view.js';
 import CoreAPI from '../../core-api.js';
 import { IMG_PLACEHOLDER, formatNumber, BROWSE_PURIFY_CONFIG, skeletonLines, deferRender, deferCall, isMobileMode, finishBrowseImport, renderBrowseError } from '../provider-utils.js';
 import {
-    DATACAT_API_BASE,
     resolveDatacatAvatarUrl,
     stripHtml,
     resolveTagNames,
     checkDcPluginAvailable,
     initDcSession,
     fetchDatacatCharacter,
-    fetchDatacatDownload,
     fetchDatacatCreator,
     fetchDatacatCreatorCharacters,
     fetchRecentPublic,
@@ -27,9 +25,11 @@ import {
     searchMeiliJanny,
     fetchHampterCharacters,
     JANNY_TAG_MAP,
-    pickRecoveryVariant,
-    stripDatacatMarkers,
 } from './datacat-api.js';
+import { getDatacatCharacterId, getDatacatSourceKind, parseDatacatUrl, buildDatacatUrl,
+    normalizeDefinitionSource, getDatacatDefinitionOptions, normalizeRetrievalStatus,
+    matchRetrievalStatus, isRetrievalShortcut, getDatacatPageState } from './datacat-contract.js';
+import { acquireDatacatExport } from './datacat-export.js';
 // Saucepan lives in its own provider now; DataCat only needs these two for its
 // saucepan-SOURCED rows (creator listing + open_definition lock state).
 import { fetchSaucepanCompanion, fetchSaucepanCompanionsOfUser } from '../saucepan/saucepan-api.js';
@@ -94,9 +94,8 @@ let datacatFilterHideJanitor = false;
 let datacatFilterHideSaucepan = false;
 
 // Fresh endpoint pagination
-let datacatFreshLimit24 = 80;
-let datacatFreshLimitWeek = 20;
-const FRESH_PAGE_INCREMENT = 20;
+let datacatFreshOffset24 = 0;
+let datacatFreshOffsetWeek = 0;
 
 // NSFW filter (client-side)
 let datacatNsfwEnabled = false;
@@ -139,6 +138,8 @@ let hampterSearchQuery = '';
 
 // Extraction state
 let extractionPollTimer = null;
+let extractionPollGeneration = 0;
+let extractionRequestId = null;
 let extractionTargetUrl = null;
 let extractionTargetId = null;
 let extractionStartTime = null;
@@ -148,15 +149,18 @@ let extractionStartTime = null;
 // ========================================
 
 function getCharId(hit) {
-    return hit?.characterId || hit?.character_id || hit?.id || '';
+    return getDatacatCharacterId(hit);
 }
 
 function getCreatorId(hit) {
-    return hit?.creatorId || hit?.creator_id || '';
+    const row = hit?._fullCharacter || hit;
+    const owner = getSourceKind(row) === 'direct_upload'
+        ? row?.ownerUuid || row?.owner_uuid || row?.ownerUserUuid || row?.owner_user_uuid : '';
+    return owner || row?.creatorId || row?.creator_id || hit?.creatorId || hit?.creator_id || '';
 }
 
 function getCreatorName(hit) {
-    return hit?.creatorName || hit?.creator_name || '';
+    return hit?.creatorName || hit?.creator_name || hit?.ownerUsername || hit?.owner_username || '';
 }
 
 function getChatCount(hit) {
@@ -213,7 +217,7 @@ function isCharPossibleMatchObj(c) {
  * @returns {'janitor'|'saucepan'}
  */
 function getSourceKind(hit) {
-    return hit?.primary_content_source_kind === 'saucepan' ? 'saucepan' : 'janitor';
+    return getDatacatSourceKind(hit?._fullCharacter || hit);
 }
 
 // ========================================
@@ -255,6 +259,8 @@ function createDatacatCard(hit) {
     if (!isSingleSourceMode) {
         if (sourceKind === 'saucepan') {
             sourceBadges.push('<span class="browse-feature-badge source-saucepan" title="Source: Saucepan">S</span>');
+        } else if (sourceKind === 'direct_upload') {
+            sourceBadges.push('<span class="browse-feature-badge source-datacat" title="Source: Datacat upload">D</span>');
         } else if (sourceKind === 'janitor') {
             sourceBadges.push('<span class="browse-feature-badge source-janitor" title="Source: JanitorAI">J</span>');
         }
@@ -339,14 +345,6 @@ function advanceDatacatPage() {
         hampterCurrentPage++;
     } else if (isJannySortMode(datacatSortMode)) {
         meiliCurrentPage++;
-    } else {
-        const parsed = parseSortMode(datacatSortMode);
-        // Mirrors isFreshMode: tag-filtered or searched fresh sorts load via the offset endpoint,
-        // so growing the fresh limits for them advanced nothing (the old stall) - they ride the offset
-        if (parsed && datacatActiveTagIds.size === 0 && !datacatSearchQuery) {
-            if (parsed.window === '24h') datacatFreshLimit24 += FRESH_PAGE_INCREMENT;
-            else datacatFreshLimitWeek += FRESH_PAGE_INCREMENT;
-        }
     }
     return loadCharacters(true);
 }
@@ -427,7 +425,8 @@ async function loadCharacters(append = false) {
 
     try {
         let list = [];
-        let total = 0;
+        let total = null;
+        let pageInfo = null;
 
         if (datacatBrowseMode === 'creator' && datacatCreatorId) {
             if (datacatCreatorSource === 'saucepan') {
@@ -457,10 +456,12 @@ async function loadCharacters(append = false) {
                 const data = await fetchDatacatCreatorCharacters(datacatCreatorId, {
                     limit: PAGE_SIZE,
                     offset: datacatCurrentOffset,
-                    sortBy: datacatCreatorSortMode
+                    sortBy: datacatCreatorSortMode,
+                    sourceKind: datacatCreatorSource === 'direct_upload' ? 'direct_upload' : undefined,
                 });
                 list = data?.list || [];
-                total = data?.total || 0;
+                total = data?.total ?? null;
+                pageInfo = data?.pagination || data;
                 sortCreatorResults(list, datacatCreatorSortMode);
             }
         } else if (isJannySortMode(datacatSortMode)) {
@@ -519,22 +520,24 @@ async function loadCharacters(append = false) {
                     offset: datacatCurrentOffset,
                     tagIds: tagIds.length > 0 ? tagIds : undefined,
                     search: datacatSearchQuery || undefined,
-                    // recent-public honors only sortBy=score, so Score sorts survive tag/search
-                    // filtering; the other fresh sorts fall back to newest-first on this path
-                    sortBy: parsed?.sortBy === 'score' ? 'score' : undefined
+                    sortBy: parsed?.sortBy || 'fresh'
                 });
                 list = data?.characters || [];
-                total = data?.totalCount || 0;
+                total = data?.totalCount ?? null;
+                pageInfo = data?.pagination || data;
             } else {
                 const is24h = parsed.window === '24h';
                 const data = await fetchFreshCharacters({
                     sortBy: parsed.sortBy,
-                    limit24: is24h ? datacatFreshLimit24 : 0,
-                    limitWeek: is24h ? 0 : datacatFreshLimitWeek,
+                    limit24: is24h ? PAGE_SIZE : 0,
+                    limitWeek: is24h ? 0 : PAGE_SIZE,
+                    offset24: datacatFreshOffset24,
+                    offsetWeek: datacatFreshOffsetWeek,
                 });
                 if (data) {
-                    list = is24h ? data.last24h : data.thisWeek;
-                    total = list.length;
+                    list = (is24h ? data.last24h : data.thisWeek) || [];
+                    pageInfo = is24h ? data.pagination24 : data.paginationWeek;
+                    total = pageInfo?.total ?? null;
                 }
             }
         }
@@ -557,23 +560,30 @@ async function loadCharacters(append = false) {
                 const existingIds = new Set(datacatCharacters.map(c => getCharId(c)));
                 datacatCharacters = datacatCharacters.concat(list.filter(c => {
                     const id = getCharId(c);
-                    return !id || !existingIds.has(id);
+                    if (id && existingIds.has(id)) return false;
+                    if (id) existingIds.add(id);
+                    return true;
                 }));
             } else {
-                datacatCharacters = list;
+                const seen = new Set();
+                datacatCharacters = list.filter(row => { const id = getCharId(row); if (id && seen.has(id)) return false; if (id) seen.add(id); return true; });
             }
             // Advance by what actually arrived, not by PAGE_SIZE: the server clamps the limit
-            datacatCurrentOffset = (append ? datacatCurrentOffset : 0) + list.length;
-            datacatHasMore = datacatCurrentOffset < total;
+            const page = getDatacatPageState(pageInfo, append ? datacatCurrentOffset : 0, list.length, total);
+            datacatCurrentOffset = page.nextOffset;
+            datacatHasMore = page.hasMore;
         } else if (isMeili) {
             if (append) {
                 const existingIds = new Set(datacatCharacters.map(c => getCharId(c)));
                 datacatCharacters = datacatCharacters.concat(list.filter(c => {
                     const id = getCharId(c);
-                    return !id || !existingIds.has(id);
+                    if (id && existingIds.has(id)) return false;
+                    if (id) existingIds.add(id);
+                    return true;
                 }));
             } else {
-                datacatCharacters = list;
+                const seen = new Set();
+                datacatCharacters = list.filter(row => { const id = getCharId(row); if (id && seen.has(id)) return false; if (id) seen.add(id); return true; });
             }
             datacatHasMore = meiliCurrentPage < meiliTotalPages;
         } else if (isHampter) {
@@ -581,17 +591,25 @@ async function loadCharacters(append = false) {
                 const existingIds = new Set(datacatCharacters.map(c => getCharId(c)));
                 datacatCharacters = datacatCharacters.concat(list.filter(c => {
                     const id = getCharId(c);
-                    return !id || !existingIds.has(id);
+                    if (id && existingIds.has(id)) return false;
+                    if (id) existingIds.add(id);
+                    return true;
                 }));
             } else {
-                datacatCharacters = list;
+                const seen = new Set();
+                datacatCharacters = list.filter(row => { const id = getCharId(row); if (id && seen.has(id)) return false; if (id) seen.add(id); return true; });
             }
             datacatHasMore = hampterCurrentPage < hampterTotalPages;
         } else {
-            // Fresh mode: the endpoint returns a cumulative top-N list, replace wholesale
-            datacatCharacters = list;
-            const activeLimit = freshParsed.window === '24h' ? datacatFreshLimit24 : datacatFreshLimitWeek;
-            datacatHasMore = list.length >= activeLimit;
+            const is24h = freshParsed.window === '24h';
+            const offset = is24h ? datacatFreshOffset24 : datacatFreshOffsetWeek;
+            const page = getDatacatPageState(pageInfo, append ? offset : 0, list.length, total);
+            if (is24h) datacatFreshOffset24 = page.nextOffset;
+            else datacatFreshOffsetWeek = page.nextOffset;
+            const seen = new Set(append ? datacatCharacters.map(getCharId) : []);
+            const added = list.filter(c => { const id = getCharId(c); if (id && seen.has(id)) return false; if (id) seen.add(id); return true; });
+            datacatCharacters = append ? datacatCharacters.concat(added) : added;
+            datacatHasMore = page.hasMore;
         }
 
         const renderedBefore = append ? datacatGridRenderedCount : 0;
@@ -1114,7 +1132,7 @@ function sortCreatorResults(list, mode) {
 
 async function browseCreator(creatorId, opts = {}) {
     if (!creatorId) return;
-    const source = opts.source === 'saucepan' ? 'saucepan' : 'datacat';
+    const source = ['saucepan', 'direct_upload'].includes(opts.source) ? opts.source : 'datacat';
     datacatBrowseMode = 'creator';
     datacatCreatorId = creatorId;
     datacatCreatorSource = source;
@@ -1129,14 +1147,17 @@ async function browseCreator(creatorId, opts = {}) {
     const bannerName = document.getElementById('datacatCreatorBannerName');
 
     if (source === 'saucepan') {
-        // Saucepan creators aren't on DataCat - skip the creator profile lookup.
+        // The separate Saucepan author list uses a handle instead of a Datacat profile.
         datacatCreatorName = opts.name || saucepanCreatorHandle || creatorId;
     } else {
-        const creator = await fetchDatacatCreator(creatorId);
+        const creator = await fetchDatacatCreator(creatorId, { sourceKind: source === 'direct_upload' ? source : undefined }).catch(error => {
+            debugLog('[DatacatBrowse] Creator metadata unavailable:', error.message);
+            return null;
+        });
         if (creator) {
-            datacatCreatorName = creator.userName || creatorId;
+            datacatCreatorName = creator.name || creator.userName || creator.username || opts.name || creatorId;
         } else {
-            datacatCreatorName = creatorId;
+            datacatCreatorName = opts.name || creatorId;
         }
     }
     view._cdRef = { creatorId, source, name: datacatCreatorName, handle: saucepanCreatorHandle };
@@ -1167,8 +1188,8 @@ function clearCreatorFilter() {
     _saucepanCreatorFullList = [];
     datacatCharacters = [];
     datacatCurrentOffset = 0;
-    datacatFreshLimit24 = 80;
-    datacatFreshLimitWeek = 20;
+    datacatFreshOffset24 = 0;
+    datacatFreshOffsetWeek = 0;
     datacatHasMore = true;
     datacatGridRenderedCount = 0;
 
@@ -1236,15 +1257,17 @@ function doSearch() {
     // DataCat URL -> browse creator or look up character
     try {
         const url = new URL(val.startsWith('http') ? val : `https://${val}`);
-        if (/datacat\.run$/i.test(url.hostname)) {
-            const charMatch = url.pathname.match(/\/characters?\/(?:[^/]+\/)*([a-f0-9-]{36})/i);
+        if (/^(www\.)?datacat\.run$/i.test(url.hostname)) {
+            const charMatch = parseDatacatUrl(url.href);
             if (charMatch) {
-                fetchCharacterAndOpenPreview(charMatch[1]);
+                fetchCharacterAndOpenPreview(charMatch.id, charMatch.sourceKind);
                 return;
             }
-            const creatorMatch = url.pathname.match(/\/creators?\/([a-f0-9-]{36})/i);
+            const creatorMatch = url.pathname.match(/^\/creators?\/([^/]+)/i);
+            const ownerMatch = url.pathname.match(/^\/(?:profiles\/users|users)\/([a-f0-9-]{36})/i);
+            if (ownerMatch) { browseCreator(ownerMatch[1], { source: 'direct_upload' }); return; }
             if (creatorMatch) {
-                browseCreator(creatorMatch[1]);
+                browseCreator(decodeURIComponent(creatorMatch[1]));
                 return;
             }
         }
@@ -1318,10 +1341,12 @@ async function performDatacatCreatorSearch() {
     // URL detection
     try {
         const u = new URL(query.startsWith('http') ? query : `https://${query}`);
-        if (/datacat\.run$/i.test(u.hostname)) {
-            const creatorMatch = u.pathname.match(/\/creators?\/([a-f0-9-]{36})/i);
+        if (/^(www\.)?datacat\.run$/i.test(u.hostname)) {
+            const creatorMatch = u.pathname.match(/^\/creators?\/([^/]+)/i);
+            const ownerMatch = u.pathname.match(/^\/(?:profiles\/users|users)\/([a-f0-9-]{36})/i);
+            if (ownerMatch) { browseCreator(ownerMatch[1], { source: 'direct_upload' }); return; }
             if (creatorMatch) {
-                browseCreator(creatorMatch[1]);
+                browseCreator(decodeURIComponent(creatorMatch[1]));
                 return;
             }
         }
@@ -1338,7 +1363,7 @@ async function performDatacatCreatorSearch() {
             const handle = getCreatorName(hit);
             browseCreator(creatorId, { source: 'saucepan', handle, name: handle });
         } else {
-            browseCreator(creatorId);
+            browseCreator(creatorId, { source: getSourceKind(hit) === 'direct_upload' ? 'direct_upload' : 'datacat', name: getCreatorName(hit) });
         }
         return true;
     };
@@ -1346,7 +1371,7 @@ async function performDatacatCreatorSearch() {
     // Scan followed creators
     const followMatch = datacatFollowedCreators.find(c => c.name?.toLowerCase() === lowerQuery);
     if (followMatch) {
-        browseCreator(followMatch.id);
+        browseCreator(followMatch.id, { source: followMatch.source, name: followMatch.name, handle: followMatch.name });
         return;
     }
 
@@ -1361,7 +1386,7 @@ async function performDatacatCreatorSearch() {
     // Partial match fallback
     const partialFollow = datacatFollowedCreators.find(c => c.name?.toLowerCase().includes(lowerQuery));
     if (partialFollow) {
-        browseCreator(partialFollow.id);
+        browseCreator(partialFollow.id, { source: partialFollow.source, name: partialFollow.name, handle: partialFollow.name });
         return;
     }
 
@@ -1378,14 +1403,14 @@ async function performDatacatCreatorSearch() {
     showToast('Creator not found. Try pasting a DataCat creator URL instead.', 'warning');
 }
 
-async function fetchCharacterAndOpenPreview(characterId) {
+async function fetchCharacterAndOpenPreview(characterId, sourceKind) {
     const grid = document.getElementById('datacatGrid');
     if (grid) {
         renderLoadingState(grid, 'Looking up character...', 'browse-loading');
     }
 
     try {
-        const character = await fetchDatacatCharacter(characterId);
+        const character = await fetchDatacatCharacter(characterId, sourceKind);
         if (character) {
             openPreviewModal(character);
         } else {
@@ -1436,7 +1461,13 @@ async function lookupExternalCharacter(charId, originalUrl, source = 'janitor') 
             clearCreatorFilter();
             return;
         }
-    } catch { /* not found */ }
+    } catch (error) {
+        if (error?.code !== 'not_found') {
+            showToast('DataCat lookup failed: ' + error.message, 'error');
+            if (grid) renderBrowseError(grid, { message: error.message });
+            return;
+        }
+    }
 
     showExtractionPanel(charId, originalUrl, source);
 }
@@ -1456,16 +1487,16 @@ function showExtractionPanel(charId, originalUrl, source = 'janitor') {
             </div>
             <h3>Character Not on DataCat</h3>
             <p class="datacat-extract-desc">
-                This ${cfg.notFoundCopy} (<code>${escapeHtml(shortId)}...</code>) hasn't been extracted yet.
+                This ${cfg.notFoundCopy} (<code>${escapeHtml(shortId)}...</code>) hasn't been retrieved yet.
                 DataCat can retrieve its definition using a cloud browser instance.
             </p>
             <p class="datacat-extract-note">
                 <i class="fa-solid fa-circle-info"></i>
-                Extraction typically takes 15-60 seconds. A public account is used by default.
+                Retrieval typically takes 15-60 seconds. A public account is used by default.
             </p>
             <div class="datacat-extract-actions">
                 <button id="datacatExtractBtn" class="action-btn primary" data-url="${escapeHtml(sourceUrl)}" data-id="${escapeHtml(charId)}" data-source="${escapeHtml(source)}">
-                    <i class="fa-solid fa-cloud-arrow-down"></i> Extract Character
+                    <i class="fa-solid fa-cloud-arrow-down"></i> Retrieve Character
                 </button>
                 <a href="${escapeHtml(sourceUrl)}" target="_blank" class="action-btn secondary">
                     <i class="fa-solid fa-external-link"></i> View on ${cfg.label}
@@ -1494,36 +1525,43 @@ async function startExtraction(janitorUrl, janitorId, source = 'janitor') {
     progressEl.innerHTML = `
         <div class="datacat-extract-status">
             <i class="fa-solid fa-spinner fa-spin"></i>
-            <span>Submitting extraction request...</span>
+            <span>Submitting retrieval request...</span>
         </div>
     `;
 
     extractionTargetUrl = janitorUrl;
     extractionTargetId = janitorId;
     extractionStartTime = Date.now();
+    const submittedAt = extractionStartTime;
 
     try {
         const result = await submitExtraction(janitorUrl, { publicFeed: getSetting('datacatPublicFeed') === true });
+        if (extractionStartTime !== submittedAt) return;
 
-        if (result.queued || result.started) {
-            extractBtn.innerHTML = '<i class="fa-solid fa-hourglass-half"></i> Extracting...';
+        extractionRequestId = result.requestId || result.request_id || result.job?.requestId || result.task?.requestId || null;
+        if (isRetrievalShortcut(result)) {
+            updateExtractionProgress('success', 'Character already retrieved. Loading...');
+            await fetchExtractedCharacter(janitorId, source);
+        } else if (result.queued || result.started || extractionRequestId || ['queued', 'running', 'pending'].includes(result.status)) {
+            extractBtn.innerHTML = '<i class="fa-solid fa-hourglass-half"></i> Retrieving...';
             const position = result.queued ? ` (queue position: ${result.queuePosition || 1})` : '';
-            updateExtractionProgress('pending', result.queued ? `Queued for extraction${position}` : 'Extraction started, waiting for completion...');
+            updateExtractionProgress('pending', result.queued ? `Queued for retrieval${position}` : 'Retrieval started, waiting for completion...');
             startExtractionPolling(janitorId, source);
         } else if (result.requiresLogin) {
             extractBtn.disabled = false;
-            extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Extract Character';
-            updateExtractionProgress('error', 'DataCat has no valid session. The extraction service may be temporarily unavailable.');
+            extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retrieve Character';
+            updateExtractionProgress('error', 'DataCat has no valid session. The retrieval service may be temporarily unavailable.');
         } else if (result.error || result.errorCode) {
             extractBtn.disabled = false;
             extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-            updateExtractionProgress('error', result.message || result.error || 'Extraction failed');
+            updateExtractionProgress('error', result.message || result.error || 'Retrieval failed');
         } else {
             extractBtn.disabled = false;
             extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
             updateExtractionProgress('error', 'Unexpected response from DataCat');
         }
     } catch (e) {
+        if (extractionStartTime !== submittedAt) return;
         extractBtn.disabled = false;
         extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
         updateExtractionProgress('error', `Failed to submit: ${e.message}`);
@@ -1531,9 +1569,9 @@ async function startExtraction(janitorUrl, janitorId, source = 'janitor') {
 }
 
 function humanizeExtractionError(msg) {
-    if (!msg) return 'Extraction failed';
+    if (!msg) return 'Retrieval failed';
     if (/CHARACTER_NOT_FOUND_OR_SET_TO_PRIVATE/i.test(msg)) return 'Character not found or privated';
-    if (/WORKER.?ERROR/i.test(msg)) return msg.replace(/WORKER.?ERROR\s*\(?/i, '').replace(/\)$/, '').trim() || 'Extraction failed';
+    if (/WORKER.?ERROR/i.test(msg)) return msg.replace(/WORKER.?ERROR\s*\(?/i, '').replace(/\)$/, '').trim() || 'Retrieval failed';
     return msg;
 }
 
@@ -1572,75 +1610,62 @@ function updateExtractionProgress(status, message) {
 }
 
 function startExtractionPolling(janitorId, source = 'janitor') {
-    stopExtractionPolling();
-
-    let elapsedTimer = setInterval(() => {
-        const progressEl = document.getElementById('datacatExtractProgress');
-        if (!progressEl || !extractionStartTime) { clearInterval(elapsedTimer); return; }
-        const statusEl = progressEl.querySelector('.datacat-extract-elapsed');
-        if (statusEl) {
-            const elapsed = Math.round((Date.now() - extractionStartTime) / 1000);
-            statusEl.textContent = `(${elapsed}s)`;
-        }
-    }, 1000);
-
-    extractionPollTimer = setInterval(async () => {
-        try {
-            const status = await fetchExtractionStatus();
-            if (!status) return;
-
-            const completedEntry = status.history?.find(h => {
-                const historyId = String(h.characterId || '').trim();
-                return historyId === janitorId;
-            });
-
-            if (completedEntry) {
-                clearInterval(elapsedTimer);
-                stopExtractionPolling();
-
-                if (completedEntry.success !== false && completedEntry.status !== 'error') {
-                    updateExtractionProgress('success', 'Extraction complete! Loading character...');
-                    // Fetch the now-available character
-                    setTimeout(() => fetchExtractedCharacter(janitorId, source), 1000);
-                } else {
-                    const errMsg = humanizeExtractionError(completedEntry.error || completedEntry.message);
-                    updateExtractionProgress('error', errMsg);
-                    const extractBtn = document.getElementById('datacatExtractBtn');
-                    if (extractBtn) {
-                        extractBtn.disabled = false;
-                        extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-                    }
-                }
-                return;
-            }
-
-            // Still in progress: update status text
-            if (status.inProgress) {
-                const phase = status.inProgress.status || 'processing';
-                const phaseNames = {
-                    opening_page: 'Opening character page',
-                    preparing: 'Preparing extraction',
-                    initiating: 'Initiating extraction',
-                    pulling: 'Pulling character data',
-                    post_extract: 'Finalizing',
-                    complete: 'Completing',
-                };
-                const phaseName = phaseNames[phase] || phase.replace(/_/g, ' ');
-                updateExtractionProgress('pending', phaseName + '...');
-            } else if (status.queueLength > 0) {
-                updateExtractionProgress('pending', `Waiting in queue (${status.queueLength} ahead)...`);
-            }
-        } catch (e) {
-            debugLog('[DatacatBrowse] Extraction poll error:', e);
-        }
-    }, 3000);
+    pollDatacatRetrieval(janitorId, {
+        progress: message => updateExtractionProgress('pending', message),
+        complete: async () => {
+            updateExtractionProgress('success', 'Retrieval complete! Loading character...');
+            await fetchExtractedCharacter(janitorId, source);
+        },
+        failed: message => {
+            updateExtractionProgress('error', message);
+            const button = document.getElementById('datacatExtractBtn');
+            if (button) { button.disabled = false; button.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry'; }
+        },
+    });
 }
 
 function stopExtractionPolling() {
-    if (extractionPollTimer) {
-        clearInterval(extractionPollTimer);
-        extractionPollTimer = null;
-    }
+    extractionPollGeneration++;
+    clearTimeout(extractionPollTimer);
+    extractionPollTimer = null;
+}
+
+function pollDatacatRetrieval(characterId, handlers) {
+    stopExtractionPolling();
+    const generation = extractionPollGeneration;
+    const submittedAt = extractionStartTime;
+    const requestId = extractionRequestId;
+    const deadline = Date.now() + 180000;
+    const tick = async () => {
+        if (generation !== extractionPollGeneration) return;
+        if (Date.now() >= deadline) {
+            stopExtractionPolling();
+            handlers.failed('Retrieval timed out. Check Datacat before retrying; the remote job may still finish.');
+            return;
+        }
+        try {
+            const status = normalizeRetrievalStatus(await fetchExtractionStatus());
+            if (generation !== extractionPollGeneration) return;
+            const completed = matchRetrievalStatus(status, { requestId, characterId, submittedAt });
+            if (completed) {
+                stopExtractionPolling();
+                if (completed.success === false) handlers.failed(humanizeExtractionError(completed.error || completed.message || completed.status));
+                else await handlers.complete(completed);
+                return;
+            }
+            const active = status.inProgress;
+            const matches = active && (requestId && active.requestId ? active.requestId === requestId
+                : String(active.characterId || '').toLowerCase() === String(characterId).toLowerCase());
+            const elapsed = Math.round((Date.now() - submittedAt) / 1000);
+            handlers.progress((matches ? String(active.status || 'Retrieving').replace(/_/g, ' ') : 'Waiting for retrieval') + ' (' + elapsed + 's)');
+        } catch (error) {
+            if (generation !== extractionPollGeneration) return;
+            debugLog('[DatacatBrowse] Retrieval status failed:', error);
+            handlers.progress('Could not refresh retrieval status: ' + error.message);
+        }
+        if (generation === extractionPollGeneration) extractionPollTimer = setTimeout(tick, 3000);
+    };
+    extractionPollTimer = setTimeout(tick, 1000);
 }
 
 function clearExtractionState() {
@@ -1648,11 +1673,15 @@ function clearExtractionState() {
     extractionTargetUrl = null;
     extractionTargetId = null;
     extractionStartTime = null;
+    extractionRequestId = null;
 }
 
 async function fetchExtractedCharacter(janitorId, source = 'janitor') {
+    const generation = extractionPollGeneration;
+    let failure = 'Retrieval complete, but the character could not be loaded yet. Try again in a moment.';
     try {
         const character = await fetchDatacatCharacter(janitorId, source);
+        if (generation !== extractionPollGeneration) return;
         if (character) {
             character._fullCharacter = character;
             openPreviewModal(character);
@@ -1660,15 +1689,27 @@ async function fetchExtractedCharacter(janitorId, source = 'janitor') {
         }
         // Might need a brief delay for DataCat indexing
         await new Promise(r => setTimeout(r, 2000));
+        if (generation !== extractionPollGeneration) return;
         const retry = await fetchDatacatCharacter(janitorId, source);
+        if (generation !== extractionPollGeneration) return;
         if (retry) {
             retry._fullCharacter = retry;
             openPreviewModal(retry);
             return;
         }
-        updateExtractionProgress('success', 'Extraction complete, but the character could not be loaded yet. Try searching again in a moment.');
     } catch (e) {
-        updateExtractionProgress('error', `Character extracted but failed to load: ${e.message}`);
+        failure = `Character retrieved but failed to load: ${e.message}`;
+    }
+    if (generation !== extractionPollGeneration) return;
+    updateExtractionProgress('error', failure);
+    updateInlineExtractionCTA('error', failure);
+    showToast(failure, 'warning');
+    for (const id of ['datacatExtractBtn', 'datacatImportBtn']) {
+        const button = document.getElementById(id);
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
+        }
     }
 }
 
@@ -1689,27 +1730,27 @@ function updateInlineExtractionCTA(state, detail) {
     if (state === 'submitting') {
         cta.classList.add('extracting');
         if (iconWrap) iconWrap.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin datacat-modal-extract-icon"></i>';
-        if (message) message.textContent = 'Submitting extraction request...';
+        if (message) message.textContent = 'Submitting retrieval request...';
         if (hint) hint.textContent = '';
         if (btn) btn.style.display = 'none';
     } else if (state === 'extracting') {
         cta.classList.add('extracting');
         if (iconWrap) iconWrap.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin datacat-modal-extract-icon"></i>';
-        if (message) message.textContent = 'Extraction in progress';
+        if (message) message.textContent = 'Retrieval in progress';
         if (hint) hint.textContent = detail || '';
         if (btn) btn.style.display = 'none';
     } else if (state === 'progress') {
-        if (message) message.textContent = detail || 'Extracting...';
+        if (message) message.textContent = detail || 'Retrieving...';
     } else if (state === 'done') {
         cta.classList.add('success');
         if (iconWrap) iconWrap.innerHTML = '<i class="fa-solid fa-circle-check datacat-modal-extract-icon"></i>';
-        if (message) message.textContent = 'Extraction complete!';
+        if (message) message.textContent = 'Retrieval complete!';
         if (hint) hint.textContent = 'Loading character...';
         if (btn) btn.style.display = 'none';
     } else if (state === 'error') {
         cta.classList.add('error');
         if (iconWrap) iconWrap.innerHTML = '<i class="fa-solid fa-triangle-exclamation datacat-modal-extract-icon"></i>';
-        if (message) message.textContent = detail || 'Extraction failed';
+        if (message) message.textContent = detail || 'Retrieval failed';
         if (hint) hint.textContent = 'Try again or check back later.';
         if (btn) { btn.disabled = false; btn.style.display = ''; btn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry'; }
     }
@@ -1729,12 +1770,18 @@ async function startModalExtraction(charId, source = 'janitor') {
     extractionTargetUrl = sourceUrl;
     extractionTargetId = charId;
     extractionStartTime = Date.now();
+    const submittedAt = extractionStartTime;
 
     try {
         const result = await submitExtraction(sourceUrl, { publicFeed: getSetting('datacatPublicFeed') === true });
+        if (extractionStartTime !== submittedAt) return;
 
-        if (result.queued || result.started) {
-            importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Extracting...';
+        extractionRequestId = result.requestId || result.request_id || result.job?.requestId || result.task?.requestId || null;
+        if (isRetrievalShortcut(result)) {
+            updateInlineExtractionCTA('done');
+            await fetchExtractedCharacter(charId, source);
+        } else if (result.queued || result.started || extractionRequestId || ['queued', 'running', 'pending'].includes(result.status)) {
+            importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Retrieving...';
             const position = result.queued ? ` (${result.queuePosition || 1})` : '';
             updateInlineExtractionCTA('extracting', position.trim() ? `Queue position${position}` : '');
             startModalExtractionPolling(charId, source);
@@ -1742,14 +1789,15 @@ async function startModalExtraction(charId, source = 'janitor') {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Extract';
             updateInlineExtractionCTA('error', 'Session unavailable');
-            showToast('DataCat has no valid session. The extraction service may be temporarily unavailable.', 'error');
+            showToast('DataCat has no valid session. The retrieval service may be temporarily unavailable.', 'error');
         } else {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-            updateInlineExtractionCTA('error', result.message || result.error || 'Extraction failed');
-            showToast(result.message || result.error || 'Extraction failed', 'error');
+            updateInlineExtractionCTA('error', result.message || result.error || 'Retrieval failed');
+            showToast(result.message || result.error || 'Retrieval failed', 'error');
         }
     } catch (e) {
+        if (extractionStartTime !== submittedAt) return;
         importBtn.disabled = false;
         importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
         updateInlineExtractionCTA('error', e.message);
@@ -1758,92 +1806,20 @@ async function startModalExtraction(charId, source = 'janitor') {
 }
 
 function startModalExtractionPolling(charId, source = 'janitor') {
-    stopExtractionPolling();
-
-    const importBtn = document.getElementById('datacatImportBtn');
-
-    let elapsedTimer = setInterval(() => {
-        if (!importBtn || !extractionStartTime) { clearInterval(elapsedTimer); return; }
-        const elapsed = Math.round((Date.now() - extractionStartTime) / 1000);
-        if (importBtn.disabled) {
-            const phase = importBtn.dataset.extractPhase || 'Extracting';
-            const label = `${phase}... (${elapsed}s)`;
-            updateInlineExtractionCTA('progress', label);
-        }
-    }, 1000);
-
-    extractionPollTimer = setInterval(async () => {
-        try {
-            const status = await fetchExtractionStatus();
-            if (!status) return;
-
-            const completedEntry = status.history?.find(h => {
-                const historyId = String(h.characterId || '').trim();
-                return historyId === charId;
-            });
-
-            if (completedEntry) {
-                clearInterval(elapsedTimer);
-                clearExtractionState();
-
-                if (completedEntry.success !== false && completedEntry.status !== 'error') {
-                    if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-check-circle"></i> Done! Loading...';
-                    updateInlineExtractionCTA('done');
-                    showToast('Extraction complete! Loading character...', 'success');
-                    await new Promise(r => setTimeout(r, 1000));
-                    try {
-                        const character = await fetchDatacatCharacter(charId, source);
-                        if (character) {
-                            character._fullCharacter = character;
-                            openPreviewModal(character);
-                            return;
-                        }
-                        await new Promise(r => setTimeout(r, 2000));
-                        const retry = await fetchDatacatCharacter(charId, source);
-                        if (retry) {
-                            retry._fullCharacter = retry;
-                            openPreviewModal(retry);
-                            return;
-                        }
-                        showToast('Character extracted but not yet available. Try searching again.', 'warning');
-                    } catch (e) {
-                        showToast(`Extracted but failed to load: ${e.message}`, 'error');
-                    }
-                    if (importBtn) {
-                        importBtn.disabled = false;
-                        importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-                    }
-                    updateInlineExtractionCTA('error', 'Extracted but failed to load');
-                } else {
-                    const errMsg = humanizeExtractionError(completedEntry.error || completedEntry.message);
-                    showToast(errMsg, 'error');
-                    if (importBtn) {
-                        importBtn.disabled = false;
-                        importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-                    }
-                    updateInlineExtractionCTA('error', errMsg);
-                }
-                return;
-            }
-
-            if (status.inProgress) {
-                const phase = status.inProgress.status || 'processing';
-                const phaseNames = {
-                    opening_page: 'Opening page',
-                    preparing: 'Preparing',
-                    initiating: 'Initiating',
-                    pulling: 'Pulling data',
-                    post_extract: 'Finalizing',
-                    complete: 'Completing',
-                };
-                if (importBtn) importBtn.dataset.extractPhase = phaseNames[phase] || phase.replace(/_/g, ' ');
-            } else if (status.queueLength > 0 && importBtn) {
-                importBtn.dataset.extractPhase = `Queue (${status.queueLength})`;
-            }
-        } catch (e) {
-            debugLog('[DatacatBrowse] Modal extraction poll error:', e);
-        }
-    }, 3000);
+    const button = document.getElementById('datacatImportBtn');
+    pollDatacatRetrieval(charId, {
+        progress: message => updateInlineExtractionCTA('progress', message),
+        complete: async () => {
+            updateInlineExtractionCTA('done');
+            if (button) button.innerHTML = '<i class="fa-solid fa-check-circle"></i> Done! Loading...';
+            await fetchExtractedCharacter(charId, source);
+        },
+        failed: message => {
+            updateInlineExtractionCTA('error', message);
+            if (button) { button.disabled = false; button.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry'; }
+            showToast(message, 'error');
+        },
+    });
 }
 
 // ========================================
@@ -1997,26 +1973,32 @@ async function loadFollowingCharacters(forceRefresh = false) {
 
                     let offset = 0;
                     const limit = 50;
-                    while (true) {
+                    const creatorSeen = new Set();
+                    for (let pageNumber = 0; pageNumber < 200; pageNumber++) {
                         // Tolerant like the CD adapter: a failed page keeps what this creator
                         // already contributed instead of discarding the partial list
                         const data = await fetchDatacatCreatorCharacters(creator.id, {
                             limit,
                             offset,
-                            sortBy: 'newest'
+                            sortBy: 'newest',
+                            sourceKind: source === 'direct_upload' ? 'direct_upload' : undefined,
                         }).catch(() => null);
                         if (!data) break;
                         const list = data.list || [];
                         for (const c of list) {
+                            const id = getCharId(c);
+                            if (id && creatorSeen.has(id)) continue;
+                            if (id) creatorSeen.add(id);
                             allChars.push({
                                 ...c,
                                 _followedCreatorName: creator.name,
                                 _followedCreatorId: creator.id,
-                                _followedCreatorSource: 'datacat',
+                                _followedCreatorSource: source,
                             });
                         }
-                        if (list.length < limit || allChars.length >= (data?.total || 0)) break;
-                        offset += limit;
+                        const page = getDatacatPageState(data.pagination || data, offset, list.length, data.total);
+                        if (!page.hasMore) break;
+                        offset = page.nextOffset;
                     }
                     return allChars;
                 } catch (e) {
@@ -2126,7 +2108,7 @@ function _handleFollowingCardClick(e) {
             if (hit && getSourceKind(hit) === 'saucepan') {
                 browseCreator(creatorId, { source: 'saucepan', handle: getCreatorName(hit), name: getCreatorName(hit) });
             } else {
-                browseCreator(creatorId);
+                browseCreator(creatorId, { source: getSourceKind(hit) === 'direct_upload' ? 'direct_upload' : 'datacat', name: getCreatorName(hit) });
             }
         }
         return;
@@ -2212,7 +2194,9 @@ let datacatDetailFetchPromise = null;
 let datacatLastCreatorNotes = '';
 
 function openPreviewModal(hit) {
+    clearExtractionState();
     datacatSelectedChar = hit;
+    hit.definitionSource = normalizeDefinitionSource(hit.definitionSource);
 
     // Ensure modal DOM exists and event listeners are wired even when called
     // from outside the Online tab (e.g. "Open on DataCat" from the link modal
@@ -2256,7 +2240,7 @@ function openPreviewModal(hit) {
             openBtn.href = `https://saucepan.ai/companion/${charId}`;
             openBtn.title = 'Open on Saucepan';
         } else {
-            openBtn.href = `${DATACAT_API_BASE}/characters/${charId}`;
+            openBtn.href = buildDatacatUrl(charId, getSourceKind(hit));
             openBtn.title = 'Open on DataCat';
         }
     }
@@ -2285,6 +2269,8 @@ function openPreviewModal(hit) {
         creatorNotesSection.style.display = 'block';
         creatorNotesEl.innerHTML = skeletonLines(2);
     }
+
+    document.getElementById('datacatDefinitionSelector')?.remove();
 
     // Definition sections: all hidden, single loading indicator shown
     const defLoading = document.getElementById('datacatCharDefinitionLoading');
@@ -2369,7 +2355,7 @@ async function fetchAndPopulateDetails(hit, token) {
                 <i class="fa-solid fa-lock"></i>
                 <div>
                     <strong>Locked Definition</strong>
-                    <p>This Saucepan companion's definition is not publicly available. Extraction may not retrieve the full character body.</p>
+                    <p>This Saucepan companion's definition is not publicly available. Retrieval may not retrieve the full character body.</p>
                 </div>
             </div>
         `;
@@ -2409,9 +2395,9 @@ async function fetchAndPopulateDetails(hit, token) {
                     <i class="fa-solid fa-wand-magic-sparkles datacat-modal-extract-icon"></i>
                 </div>
                 <p class="datacat-modal-extract-message">${escapeHtml(message)}</p>
-                <p class="datacat-modal-extract-hint">Use DataCat's extraction service to retrieve this character's full definition from ${cfg.label}.</p>
+                <p class="datacat-modal-extract-hint">Use DataCat's retrieval service to retrieve this character's full definition from ${cfg.label}.</p>
                 <button class="action-btn primary datacat-modal-extract-btn" data-extract-id="${escapeHtml(String(charId))}" data-extract-source="${source}">
-                    <i class="fa-solid fa-cloud-arrow-down"></i> Extract Character
+                    <i class="fa-solid fa-cloud-arrow-down"></i> Retrieve Character
                 </button>
             </div>
         `;
@@ -2428,284 +2414,171 @@ async function fetchAndPopulateDetails(hit, token) {
         }
     }
 
-    // Start download fetch early (runs in parallel with character fetch)
     const hitSource = getSourceKind(hit);
-    const downloadPromise = fetchDatacatDownload(charId, hitSource).catch(() => null);
-
+    let character = hit._fullCharacter;
     try {
-        const character = hit._fullCharacter || await fetchDatacatCharacter(charId, hitSource);
-
+        character ||= await fetchDatacatCharacter(charId, hitSource);
         if (token !== datacatDetailFetchToken) return;
-
-        // Hide the loading indicator
-        const defLoading = document.getElementById('datacatCharDefinitionLoading');
-        if (defLoading) defLoading.style.display = 'none';
-
         if (!character) {
+            if (hitSource === 'direct_upload') throw new Error('This Datacat upload is not available.');
             const saucepanDetail = await saucepanDetailPromise;
-            const lockedDef = isSaucepanHit && saucepanDetail && saucepanDetail.open_definition === false;
-            showExtractionCTA(isSaucepanHit
-                ? 'This Saucepan character has not been extracted to DataCat yet.'
-                : 'Character definition is hidden or unavailable.',
-                { locked: lockedDef });
+            showExtractionCTA('This character has not been retrieved to Datacat yet.', {
+                locked: isSaucepanHit && saucepanDetail?.open_definition === false,
+            });
             return;
         }
-
-        // Store full data on the selected char for import
-        if (datacatSelectedChar && getCharId(datacatSelectedChar) === charId) {
-            datacatSelectedChar._fullCharacter = character;
+        hit._fullCharacter = character;
+        Object.assign(hit, { creatorId: getCreatorId(character) || getCreatorId(hit),
+            creator_name: getCreatorName(character) || getCreatorName(hit) });
+        const creatorEl = document.getElementById('datacatCharCreator');
+        if (creatorEl) creatorEl.textContent = getCreatorName(hit) || 'Unknown';
+        const avatarEl = document.getElementById('datacatCharAvatar');
+        const fullAvatar = resolveDatacatAvatarUrl(character, { preferOriginal: true });
+        if (avatarEl && fullAvatar) avatarEl.dataset.full = fullAvatar;
+        for (const [elementId, value] of [
+            ['datacatCharChats', getChatCount(character)], ['datacatCharMessages', getMsgCount(character)],
+            ['datacatCharTokens', getTotalTokens(character)],
+        ]) {
+            const element = document.getElementById(elementId);
+            if (element && value) element.textContent = formatNumber(value);
         }
-
-        // The listing row only knew the 640px card variant; upgrade the avatar viewer to the
-        // true original now that the detail payload is here.
-        const detailAvatarImg = document.getElementById('datacatCharAvatar');
-        if (detailAvatarImg) {
-            const fullRes = resolveDatacatAvatarUrl(character, { preferOriginal: true });
-            if (fullRes) detailAvatarImg.dataset.full = fullRes;
-        }
-
-        // Update creator name if available (MeiliSearch hits lack it)
-        const charCreatorName = character.creator_name || character.creatorName || '';
-        if (charCreatorName) {
-            const creatorEl = document.getElementById('datacatCharCreator');
-            if (creatorEl) creatorEl.textContent = charCreatorName;
-            if (datacatSelectedChar && getCharId(datacatSelectedChar) === charId) {
-                datacatSelectedChar.creator_name = charCreatorName;
-            }
-        }
-
-        // Only Saucepan repair variants overload description with the body; janitor variants mirror the row blurb and must never paint as the body.
-        const recoveredVariant = pickRecoveryVariant(character);
-        const charIsSaucepan = getSourceKind(character) === 'saucepan' || getSourceKind(hit) === 'saucepan';
-        const v2Data = character?.chara_card_v2_json?.data || null;
-        const saucepanBody = charIsSaucepan
-            ? (recoveredVariant?.description || v2Data?.description || character.description || '')
-            : '';
-        const personality = charIsSaucepan
-            ? saucepanBody
-            : (character.personality || recoveredVariant?.personality || stripDatacatMarkers(v2Data?.description) || '');
-        const scenario = recoveredVariant?.scenario || character.scenario || v2Data?.scenario || '';
-        const firstMessage = recoveredVariant?.first_message || character.first_message || v2Data?.first_mes || '';
-        const canPaintBody = !!recoveredVariant || !charIsSaucepan || !!saucepanBody;
-
-        // Resolve Saucepan lock state if we have detail data. When the
-        // character is on DataCat but the definition is locked AND we have
-        // no recovered variant, the body sections are empty: surface a
-        // banner so the user understands why.
-        const saucepanDetail = await saucepanDetailPromise;
-        const saucepanLocked = isSaucepanHit && saucepanDetail && saucepanDetail.open_definition === false;
-        const showLockedBanner = saucepanLocked && !recoveredVariant;
-
-        const descSection = document.getElementById('datacatCharDescriptionSection');
-        if (descSection) {
-            const descEl = document.getElementById('datacatCharDescription');
-            if (personality && canPaintBody) {
-                descSection.style.display = 'block';
-                if (descEl) {
-                    // locked banner stays app-side; the definition body renders in the contained iframe
-                    cleanupCreatorNotesContainer(descEl);
-                    descEl.innerHTML = showLockedBanner ? renderLockedDefBanner() : '';
-                    const descBody = document.createElement('div');
-                    descEl.appendChild(descBody);
-                    renderCardHtmlSecure(personality, name, descBody);
-                }
-            } else if (showLockedBanner) {
-                descSection.style.display = 'block';
-                if (descEl) descEl.innerHTML = renderLockedDefBanner();
-            } else {
-                descSection.style.display = 'none';
-                if (descEl) descEl.innerHTML = '';
-            }
-        }
-
-        const scenarioSection = document.getElementById('datacatCharScenarioSection');
-        const scenarioEl = document.getElementById('datacatCharScenario');
-        if (scenarioSection && scenario && canPaintBody) {
-            scenarioSection.style.display = 'block';
-            if (scenarioEl) deferRender(scenarioEl, () => safePurify(formatRichText(scenario, name, true), BROWSE_PURIFY_CONFIG));
-        } else if (scenarioSection) {
-            scenarioSection.style.display = 'none';
-        }
-
-        const firstMsgSection = document.getElementById('datacatCharFirstMsgSection');
-        const firstMsgEl = document.getElementById('datacatCharFirstMsg');
-        if (firstMsgSection && firstMessage && canPaintBody) {
-            firstMsgSection.style.display = 'block';
-            if (firstMsgEl) {
-                deferRender(firstMsgEl, () => safePurify(formatRichText(firstMessage, name, true), BROWSE_PURIFY_CONFIG));
-                firstMsgEl.dataset.fullContent = firstMessage;
-            }
-        } else if (firstMsgSection) {
-            firstMsgSection.style.display = 'none';
-        }
-
-        // Silently update stats values if full character has better data
-        const chatsEl = document.getElementById('datacatCharChats');
-        const msgsEl = document.getElementById('datacatCharMessages');
-        const tokensEl = document.getElementById('datacatCharTokens');
-        const fullChatCount = getChatCount(character);
-        const fullMsgCount = getMsgCount(character);
-        const fullTokens = getTotalTokens(character);
-        if (chatsEl && fullChatCount) chatsEl.textContent = formatNumber(fullChatCount);
-        if (msgsEl && fullMsgCount) msgsEl.textContent = formatNumber(fullMsgCount);
-        if (tokensEl && fullTokens) tokensEl.textContent = formatNumber(fullTokens);
-
-        // Refresh creator notes only if content changed (avoids iframe rebuild flash).
-        // Source field differs by row kind: JanitorAI puts the blurb in
-        // `character.description`; Saucepan puts the body there and exposes
-        // the actual blurb via `companion_snapshot.full_description` (with
-        // formatting markers) or the V2 mapping in `chara_card_v2_json.data`.
-        const fullCreatorNotes = (charIsSaucepan
-            ? (character?.companion_snapshot?.full_description
-                || character?.intercepted_chat_data?.companion_snapshot?.full_description
-                || v2Data?.creator_notes
-                || '')
-            : (character.description || '')).trim();
-        const creatorNotesSection = document.getElementById('datacatCharCreatorNotesSection');
-        const creatorNotesEl = document.getElementById('datacatCharCreatorNotes');
-        if (fullCreatorNotes && fullCreatorNotes !== datacatLastCreatorNotes) {
-            datacatLastCreatorNotes = fullCreatorNotes;
-            if (creatorNotesSection) creatorNotesSection.style.display = 'block';
-            if (creatorNotesEl) {
-                if (!creatorNotesEl.querySelector('iframe')) creatorNotesEl.innerHTML = skeletonLines(3);
-                deferCall(creatorNotesEl, () => renderCreatorNotesSecure(fullCreatorNotes, name, creatorNotesEl));
-            }
-        } else if (!fullCreatorNotes && !datacatLastCreatorNotes) {
-            if (creatorNotesSection) creatorNotesSection.style.display = 'none';
-            if (creatorNotesEl) creatorNotesEl.innerHTML = '';
-        }
-
-        // Update tags only if they differ from what's already rendered
-        if (character.tags?.length) {
-            const tagsEl = document.getElementById('datacatCharTags');
-            if (tagsEl) {
-                const fullTags = resolveTagNames(character.tags);
-                const newHtml = fullTags.map(t => `<span class="browse-tag">${escapeHtml(t)}</span>`).join('');
-                if (tagsEl.innerHTML !== newHtml) tagsEl.innerHTML = newHtml;
-            }
-        }
-
-        // Linked lorebooks (external, metadata-only). DataCat stores attached
-        // lorebooks/scripts on `character.scripts[]`. Their entries are not
-        // reachable through cl-helper, so this is a heads-up surface only
         renderDatacatLorebooks(character.scripts);
-
-        // Saucepan portraits gallery
         const portraits = character?.companion_snapshot?.portraits;
-        if (Array.isArray(portraits) && portraits.length > 0) {
+        if (Array.isArray(portraits) && portraits.length) {
+            const gallery = document.getElementById('datacatCharGalleryGrid');
             const gallerySection = document.getElementById('datacatCharGallerySection');
-            const galleryGrid = document.getElementById('datacatCharGalleryGrid');
             const galleryLabel = document.getElementById('datacatCharGalleryLabel');
-            if (gallerySection && galleryGrid) {
+            if (gallery && gallerySection) {
                 gallerySection.style.display = 'block';
-                if (galleryLabel) galleryLabel.textContent = `(${portraits.length})`;
-                galleryGrid.innerHTML = portraits.map(p => {
-                    const url = p?.image?.highres_url;
+                if (galleryLabel) galleryLabel.textContent = '(' + portraits.length + ')';
+                gallery.innerHTML = portraits.map(portrait => {
+                    const url = resolveDatacatAvatarUrl({ avatar: portrait?.image?.highres_url, sourceKind: 'saucepan' });
                     if (!url) return '';
-                    const title = p?.description || p?.name || 'Gallery image';
+                    const title = portrait.description || portrait.name || 'Gallery image';
                     return `<div class="browse-gallery-cell"><img class="browse-gallery-thumb" src="${escapeHtml(url)}" alt="${escapeHtml(title)}" title="${escapeHtml(title)}" loading="lazy" onload="this.parentElement.classList.add('loaded')" onerror="this.parentElement.classList.add('load-failed')"></div>`;
                 }).join('');
             }
         }
-
-        // Enable import button now that full character data is confirmed
-        const importBtn = document.getElementById('datacatImportBtn');
-        if (importBtn && !importBtn.dataset.extractId) {
-            const inLibrary = isCharInLocalLibrary(hit);
-            if (inLibrary) {
-                importBtn.innerHTML = '<i class="fa-solid fa-check"></i> In Library';
-                importBtn.classList.add('secondary');
-                importBtn.classList.remove('primary', 'warning');
-            } else {
-                const creatorName = character.creator_name || character.creatorName || hit.creator_name || '';
-                const possibleMatch = view.isCharPossibleMatch(name, creatorName);
-                if (possibleMatch) {
-                    importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import (Possible Match)';
-                    importBtn.classList.add('warning');
-                    importBtn.classList.remove('primary', 'secondary');
-                } else {
-                    importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
-                    importBtn.classList.add('primary');
-                    importBtn.classList.remove('secondary', 'warning');
-                }
-            }
-            importBtn.disabled = false;
+        renderDatacatDefinitionSelector(hit, character);
+        const selected = normalizeDefinitionSource(hit.definitionSource);
+        if (!getDatacatDefinitionOptions(character)[selected]) {
+            throw new Error(selected === 'reimagination' ? 'Reimagination is unavailable for this character. Choose Source.' : 'The Source definition is unavailable for this character.');
         }
-
-        // Fetch download data for alternate greetings and example messages
-        downloadPromise.then(downloadData => {
-            if (token !== datacatDetailFetchToken) return;
-            const d = downloadData?.data;
-
-            // /download is authoritative for the body fields when available.
-            // The character endpoint sometimes carries a short synopsis that
-            // DataCat scraped from JanitorAI's listing page in the
-            // `personality` slot - using that as the Description gives the
-            // preview content that doesn't match what gets imported. Import
-            // already prefers /download via buildV2FromDownload, so this
-            // mirrors that behavior.
-            //
-            // Exception: Saucepan with a recovery variant. The recovered
-            // variant is the only authoritative source for repaired cards;
-            // /download returns empty fields in that case.
-            const useRecoveryAsAuthority = charIsSaucepan && !!recoveredVariant;
-            const needSaucepanFallback = charIsSaucepan && !recoveredVariant;
-            if (d) {
-                const dlDesc = d.personality || d.description || '';
-                const shouldOverwriteDesc = !useRecoveryAsAuthority
-                    && dlDesc
-                    && (needSaucepanFallback || !personality || dlDesc !== personality);
-                if (shouldOverwriteDesc) {
-                    const ds = document.getElementById('datacatCharDescriptionSection');
-                    const de = document.getElementById('datacatCharDescription');
-                    if (ds) ds.style.display = 'block';
-                    if (de) {
-                        cleanupCreatorNotesContainer(de);
-                        de.innerHTML = showLockedBanner ? renderLockedDefBanner() : '';
-                        const deBody = document.createElement('div');
-                        de.appendChild(deBody);
-                        renderCardHtmlSecure(dlDesc, name, deBody);
-                    }
-                }
-                if (d.scenario && !useRecoveryAsAuthority && (needSaucepanFallback || !scenario || d.scenario !== scenario)) {
-                    const ss = document.getElementById('datacatCharScenarioSection');
-                    const se = document.getElementById('datacatCharScenario');
-                    if (ss) ss.style.display = 'block';
-                    if (se) deferRender(se, () => safePurify(formatRichText(d.scenario, name, true), BROWSE_PURIFY_CONFIG));
-                }
-                if (d.first_mes && !useRecoveryAsAuthority && (needSaucepanFallback || !firstMessage || d.first_mes !== firstMessage)) {
-                    const fs = document.getElementById('datacatCharFirstMsgSection');
-                    const fe = document.getElementById('datacatCharFirstMsg');
-                    if (fs) fs.style.display = 'block';
-                    if (fe) {
-                        deferRender(fe, () => safePurify(formatRichText(d.first_mes, name, true), BROWSE_PURIFY_CONFIG));
-                        fe.dataset.fullContent = d.first_mes;
-                    }
-                }
-            }
-
-            // Example messages - only present in the download payload
-            const mesExample = d?.mes_example || '';
-            const mesSection = document.getElementById('datacatCharMesExampleSection');
-            const mesEl = document.getElementById('datacatCharMesExample');
-            if (mesExample && mesSection && mesEl) {
-                mesSection.style.display = 'block';
-                deferRender(mesEl, () => safePurify(formatRichText(mesExample, name, true), BROWSE_PURIFY_CONFIG));
-                mesEl.dataset.fullContent = mesExample;
-            } else if (mesSection) {
-                mesSection.style.display = 'none';
-            }
-
-            renderAltGreetings(d?.alternate_greetings, name);
-        });
+        const cached = hit._acquiredExport;
+        const acquisition = cached && cached.definitionSource === selected
+            && String(cached.variantId || '') === String(hit.variantId || '') ? cached
+            : await acquireDatacatExport(charId, {
+                sourceKind: hitSource, definitionSource: selected, variantId: hit.variantId,
+                character, interactive: false,
+            });
+        if (token !== datacatDetailFetchToken) return;
+        hit._acquiredExport = acquisition;
+        renderDatacatExportPreview(acquisition.card, name);
+        setDatacatImportReady(hit);
     } catch (err) {
         debugLog('[DatacatBrowse] Detail fetch error:', err);
+        if (token !== datacatDetailFetchToken) return;
+        // Only a missing detail record offers retrieval; export restrictions remain distinct.
+        if (!character && hitSource !== 'direct_upload' && err?.code === 'not_found') {
+            showExtractionCTA('This character has not been retrieved to Datacat yet.');
+        } else {
+            const section = document.getElementById('datacatCharDescriptionSection');
+            const body = document.getElementById('datacatCharDescription');
+            if (section) section.style.display = 'block';
+            const verification = err?.code === 'verification_required';
+            if (body) body.textContent = verification
+                ? 'Verification required. Select Import to open Datacat and send this definition through the optional companion userscript.'
+                : (err?.message || 'Could not load this definition.');
+            const notesSection = document.getElementById('datacatCharCreatorNotesSection');
+            if (notesSection) notesSection.style.display = 'none';
+            const available = character ? getDatacatDefinitionOptions(character)[normalizeDefinitionSource(hit.definitionSource)] : true;
+            setDatacatImportReady(hit, !available || (!character && !verification));
+        }
+    } finally {
         if (token === datacatDetailFetchToken) {
-            const defLoading = document.getElementById('datacatCharDefinitionLoading');
-            if (defLoading) defLoading.style.display = 'none';
-            showExtractionCTA('Could not load character definition.');
+            const loading = document.getElementById('datacatCharDefinitionLoading');
+            if (loading) loading.style.display = 'none';
         }
     }
+}
+
+function setDatacatImportReady(hit, disabled = false) {
+    const button = document.getElementById('datacatImportBtn');
+    if (!button) return;
+    const owned = isCharInLocalLibrary(hit);
+    button.disabled = disabled;
+    button.classList.toggle('secondary', owned);
+    button.classList.toggle('primary', !owned);
+    button.classList.remove('warning');
+    button.innerHTML = owned ? '<i class="fa-solid fa-check"></i> In Library' : '<i class="fa-solid fa-download"></i> Import';
+}
+
+function renderDatacatDefinitionSelector(hit, character) {
+    let controls = document.getElementById('datacatDefinitionSelector');
+    if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'datacatDefinitionSelector';
+        controls.className = 'datacat-definition-selector browse-char-section';
+        document.getElementById('datacatCharDefinitionLoading')?.before(controls);
+    }
+    const availability = getDatacatDefinitionOptions(character);
+    const selected = normalizeDefinitionSource(hit.definitionSource);
+    const variants = availability.variants || [];
+    if (selected === 'reimagination' && !hit.variantId && variants.length) hit.variantId = variants[0].id;
+    controls.innerHTML = '<label for="datacatDefinitionSource">Definition</label>'
+        + '<select id="datacatDefinitionSource"><option value="source"' + (availability.source ? '' : ' disabled') + '>Source</option>'
+        + '<option value="reimagination"' + (availability.reimagination ? '' : ' disabled') + '>Reimagination</option></select>'
+        + (selected === 'reimagination' && variants.length > 1 ? '<label for="datacatDefinitionVariant">Version</label><select id="datacatDefinitionVariant">'
+            + variants.map(v => '<option value="' + escapeHtml(String(v.id)) + '">' + escapeHtml(v.name || String(v.id)) + '</option>').join('') + '</select>' : '')
+        + '<p class="datacat-definition-hint">' + (!availability.source ? 'Source is unavailable. ' : '')
+        + (!availability.reimagination ? 'Reimagination is unavailable for this character. ' : '')
+        + 'Preview and import use the selected definition.</p>';
+    const select = controls.querySelector('#datacatDefinitionSource');
+    select.value = selected;
+    select.addEventListener('change', () => {
+        hit.definitionSource = select.value;
+        delete hit.variantId;
+        delete hit._acquiredExport;
+        openPreviewModal(hit);
+    });
+    const variantSelect = controls.querySelector('#datacatDefinitionVariant');
+    if (variantSelect) {
+        variantSelect.value = String(hit.variantId || '');
+        variantSelect.addEventListener('change', () => {
+            hit.variantId = variantSelect.value;
+            delete hit._acquiredExport;
+            openPreviewModal(hit);
+        });
+    }
+}
+
+function renderDatacatExportPreview(card, fallbackName) {
+    const data = card.data;
+    const name = data.name || fallbackName;
+    const description = [data.description, data.personality].filter(Boolean).join('\n\n');
+    for (const [prefix, value] of [
+        ['Description', description], ['Scenario', data.scenario], ['FirstMsg', data.first_mes], ['MesExample', data.mes_example],
+    ]) {
+        const section = document.getElementById('datacatChar' + prefix + 'Section');
+        const element = document.getElementById('datacatChar' + prefix);
+        if (section) section.style.display = value ? 'block' : 'none';
+        if (element) {
+            cleanupCreatorNotesContainer(element);
+            element.innerHTML = '';
+            element.dataset.fullContent = value || '';
+            if (value) renderCardHtmlSecure(value, name, element);
+        }
+    }
+    const notes = document.getElementById('datacatCharCreatorNotes');
+    const notesSection = document.getElementById('datacatCharCreatorNotesSection');
+    if (notesSection) notesSection.style.display = data.creator_notes ? 'block' : 'none';
+    if (notes) {
+        cleanupCreatorNotesContainer(notes);
+        notes.innerHTML = '';
+        if (data.creator_notes) renderCreatorNotesSecure(data.creator_notes, name, notes);
+    }
+    datacatLastCreatorNotes = data.creator_notes || '';
+    renderAltGreetings(data.alternate_greetings, name);
 }
 
 function renderDatacatLorebooks(scripts) {
@@ -2899,31 +2772,28 @@ async function importCharacter(charData) {
             try { await datacatDetailFetchPromise; } catch { /* ignore */ }
         }
 
-        const character = charData._fullCharacter;
-        if (!character) {
-            showToast('Character definition not available. Try extracting first.', 'warning');
-            if (importBtn) {
-                importBtn.disabled = false;
-                importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
-            }
-            return;
-        }
-        const charName = character.chat_name || character.name || charData.name || '';
-        const charCreator = character.creator_name || charData.creatorName || charData.creator_name || '';
-
-        // Body resolution mirrors buildV2FromDatacat so the dupe scorer compares body-to-body, not blurb-to-body.
-        const dupeRecovered = pickRecoveryVariant(character);
-        const dupeV2 = character.chara_card_v2_json?.data || null;
-        const dupeBody = getSourceKind(character) === 'saucepan'
-            ? (dupeRecovered?.description || dupeRecovered?.personality || dupeV2?.description || character.description || '')
-            : (character.personality || dupeRecovered?.personality || stripDatacatMarkers(dupeV2?.description) || '');
+        const selected = normalizeDefinitionSource(charData.definitionSource);
+        const cached = charData._acquiredExport;
+        const acquiredExport = cached && cached.definitionSource === selected
+            && String(cached.variantId || '') === String(charData.variantId || '') ? cached
+            : await acquireDatacatExport(charId, {
+                sourceKind: getSourceKind(charData), definitionSource: selected,
+                variantId: charData.variantId, character: charData._fullCharacter,
+                interactive: true, onStatus: message => { if (importBtn) importBtn.textContent = message; },
+            });
+        charData._acquiredExport = acquiredExport;
+        const character = acquiredExport.character || charData._fullCharacter || charData;
+        const cardData = acquiredExport.card.data;
+        const charName = cardData.name || charData.name || '';
+        const charCreator = cardData.creator || getCreatorName(character);
+        const dupeBody = [cardData.description, cardData.personality].filter(Boolean).join('\n\n');
         const duplicateMatches = await checkCharacterForDuplicatesAsync({
             name: charName,
             creator: charCreator,
             fullPath: String(charId),
             description: dupeBody,
-            first_mes: character.first_message || dupeV2?.first_mes || '',
-            scenario: character.scenario || dupeV2?.scenario || ''
+            first_mes: cardData.first_mes || '',
+            scenario: cardData.scenario || ''
         });
 
         if (duplicateMatches && duplicateMatches.length > 0) {
@@ -2959,7 +2829,7 @@ async function importCharacter(charData) {
 
         if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Importing...';
 
-        const result = await provider.importCharacter(charId, character, { inheritedGalleryId });
+        const result = await provider.importCharacter(charId, character, { inheritedGalleryId, acquiredExport, definitionSource: selected, variantId: charData.variantId });
         if (!result.success) throw new Error(result.error || 'Import failed');
 
         const mediaUrls = result.embeddedMediaUrls || [];
@@ -2973,7 +2843,7 @@ async function importCharacter(charData) {
                 name: result.characterName,
                 provider,
                 linkInfo: { providerId: 'datacat', id: result.providerCharId },
-                url: `https://datacat.run/characters/${result.providerCharId}`,
+                url: buildDatacatUrl(result.providerCharId, getSourceKind(character)),
                 avatar: result.fileName,
                 galleryId: result.galleryId,
                 cardData: result.cardData
@@ -3003,7 +2873,7 @@ async function importCharacter(charData) {
 
     } catch (err) {
         console.error('[DatacatBrowse] Import failed:', err);
-        showToast(`Import failed: ${err.message}`, 'error');
+        showToast(err.name === 'AbortError' ? 'Import cancelled' : `Import failed: ${err.message}`, err.name === 'AbortError' ? 'info' : 'error');
         if (importBtn) {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
@@ -3107,7 +2977,7 @@ function initDatacatView() {
                     if (hit && getSourceKind(hit) === 'saucepan') {
                         browseCreator(creatorId, { source: 'saucepan', handle: getCreatorName(hit), name: getCreatorName(hit) });
                     } else {
-                        browseCreator(creatorId);
+                        browseCreator(creatorId, { source: getSourceKind(hit) === 'direct_upload' ? 'direct_upload' : 'datacat', name: getCreatorName(hit) });
                     }
                 }
                 return;
@@ -3240,8 +3110,8 @@ function initDatacatView() {
             if (bannerSort) bannerSort.value = el.value;
         } else {
             datacatSortMode = el.value;
-            datacatFreshLimit24 = 80;
-            datacatFreshLimitWeek = 20;
+            datacatFreshOffset24 = 0;
+            datacatFreshOffsetWeek = 0;
             meiliCurrentPage = 1;
             hampterCurrentPage = 1;
             hampterSearchQuery = '';
@@ -3279,8 +3149,8 @@ function initDatacatView() {
             loadFollowingCharacters(true);
         } else {
             datacatCurrentOffset = 0;
-            datacatFreshLimit24 = 80;
-            datacatFreshLimitWeek = 20;
+            datacatFreshOffset24 = 0;
+            datacatFreshOffsetWeek = 0;
             hampterCurrentPage = 1;
             loadCharacters(false);
         }
@@ -3412,14 +3282,15 @@ function ensureModalEventsAttached() {
     if (creatorLink) {
         creatorLink.addEventListener('click', (e) => {
             e.preventDefault();
-            const creatorId = getCreatorId(datacatSelectedChar);
+            const hit = datacatSelectedChar;
+            const creatorId = getCreatorId(hit);
             if (creatorId) {
                 closePreviewModal();
-                if (datacatSelectedChar && getSourceKind(datacatSelectedChar) === 'saucepan') {
-                    const handle = getCreatorName(datacatSelectedChar);
+                if (getSourceKind(hit) === 'saucepan') {
+                    const handle = getCreatorName(hit);
                     browseCreator(creatorId, { source: 'saucepan', handle, name: handle });
                 } else {
-                    browseCreator(creatorId);
+                    browseCreator(creatorId, { source: getSourceKind(hit) === 'direct_upload' ? 'direct_upload' : 'datacat', name: getCreatorName(hit) });
                 }
             }
         });
@@ -3573,8 +3444,8 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         const lowerQ = raw.toLowerCase();
         const sources = [
             ...datacatFollowedCreators.map(c => ({ id: c.id, name: c.name, source: c.source || 'datacat' })),
-            ...datacatCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getSourceKind(c) === 'saucepan' ? 'saucepan' : 'datacat' })),
-            ...datacatFollowingCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getSourceKind(c) === 'saucepan' ? 'saucepan' : 'datacat' })),
+            ...datacatCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getSourceKind(c) === 'janitor' ? 'datacat' : getSourceKind(c) })),
+            ...datacatFollowingCharacters.map(c => ({ id: getCreatorId(c), name: getCreatorName(c), source: getSourceKind(c) === 'janitor' ? 'datacat' : getSourceKind(c) })),
         ];
         const exact = sources.find(c => c.name?.toLowerCase() === lowerQ);
         const match = exact || sources.find(c => c.name?.toLowerCase().includes(lowerQ));
@@ -3590,7 +3461,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             const id = getCreatorId(feedHit);
             if (id) {
                 const name = getCreatorName(feedHit);
-                const source = getSourceKind(feedHit) === 'saucepan' ? 'saucepan' : 'datacat';
+                const source = getSourceKind(feedHit) === 'janitor' ? 'datacat' : getSourceKind(feedHit);
                 if (isCreatorFollowed(id, source)) {
                     showToast('Already following this creator', 'info');
                     return null;
@@ -3617,7 +3488,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         if (source === 'saucepan') {
             browseCreator(creator.id, { source: 'saucepan', handle: creator.handle || creator.name, name: creator.name });
         } else {
-            browseCreator(creator.id);
+            browseCreator(creator.id, { source, name: creator.name });
         }
     }
 
@@ -4087,8 +3958,8 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             datacatCharacters = [];
             datacatCurrentOffset = 0;
             datacatSearchQuery = '';
-            datacatFreshLimit24 = 80;
-            datacatFreshLimitWeek = 20;
+            datacatFreshOffset24 = 0;
+            datacatFreshOffsetWeek = 0;
             datacatHasMore = true;
             datacatIsLoading = false;
             datacatFollowingLoading = false;

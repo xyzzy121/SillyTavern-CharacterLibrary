@@ -251,9 +251,11 @@ export class ProviderBase {
      * The returned object should already be normalized to V2 spec - providers
      * are responsible for mapping their own field names.
      * @param {ProviderLinkInfo} linkInfo
+     * @param {{interactive?: boolean, signal?: AbortSignal, onStatus?: function}} [options]
+     * Only a foreground action may opt into an interactive verification flow.
      * @returns {Promise<Object|null>} V2-spec card data or null
      */
-    async fetchRemoteCard(linkInfo) { return null; }
+    async fetchRemoteCard(linkInfo, options = {}) { return null; }
 
     /**
      * Normalize raw remote data into V2 card spec. Called internally by

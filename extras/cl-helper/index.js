@@ -960,35 +960,19 @@ async function testDcToken(token) {
 
 // Read-only API paths forwarded by /dc-proxy.
 const DC_ALLOWED_PATHS = [
-    /^\/api\/characters\/fresh\b/,
-    /^\/api\/characters\/recent-public\b/,
+    /^\/api\/features$/,
+    /^\/api\/characters\/fresh$/,
+    /^\/api\/characters\/recent-public$/,
+    /^\/api\/characters\/recent-public\/[a-f0-9-]+$/,
     /^\/api\/characters\/[a-f0-9-]+$/,
-    /^\/api\/characters\/[a-f0-9-]+\/download\b/,
-    /^\/api\/creators\/[a-f0-9-]+$/,
-    /^\/api\/creators\/[a-f0-9-]+\/characters\b/,
-    /^\/api\/tags\/faceted\b/,
+    /^\/api\/characters\/[a-f0-9-]+\/download$/,
+    /^\/api\/creators\/(?:saucepan(?::|%3A))?[a-f0-9-]+$/i,
+    /^\/api\/creators\/(?:saucepan(?::|%3A))?[a-f0-9-]+\/characters$/i,
+    /^\/api\/profiles\/users\/[a-f0-9-]+(?:\/bots)?$/,
+    /^\/api\/tags\/faceted$/,
+    /^\/api\/retrieval\/(?:status-projection|status)$/,
     /^\/api\/extraction\/status-projection$/,
 ];
-
-// Resolve a usable public session ID for the extraction endpoint.
-async function getPublicSessionId(token) {
-    try {
-        const resp = await fetch(`${DATACAT_BASE}/api/users`, {
-            headers: dcHeaders(token),
-        });
-        if (!resp.ok) return null;
-        const data = await resp.json();
-        const publicUser = (data.users || []).find(u => u.isPublic);
-        if (!publicUser?.sessions) return null;
-        // Pick a non-background, logged_in session
-        const session = publicUser.sessions.find(
-            s => s.purpose !== 'BACKGROUND_SCRAPER' && s.status === 'logged_in'
-        );
-        return session?.id || null;
-    } catch {
-        return null;
-    }
-}
 
 function registerDataCatRoutes(router) {
     router.post('/dc-init', async (req, res) => {
@@ -1001,7 +985,9 @@ function registerDataCatRoutes(router) {
                 if (check.ok) {
                     return res.json({ ok: true, cached: true, token: dcSessionToken });
                 }
-            } catch { /* fall through to create new */ }
+                // Restrictions and outages are not evidence that the token expired.
+                if (check.status !== 401) return res.json({ ok: false, reason: `Session check returned ${check.status}` });
+            } catch (error) { return res.json({ ok: false, reason: 'Could not validate the existing DataCat session' }); }
             dcSessionToken = null;
         }
 
@@ -1109,6 +1095,9 @@ function registerDataCatRoutes(router) {
         let extractionKind = null;
         try {
             const parsed = new URL(url);
+            if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+                return res.status(400).json({ error: 'Invalid character URL' });
+            }
             const isJanitor = /^(www\.)?janitorai\.com$/i.test(parsed.hostname) || /^(www\.)?jannyai\.com$/i.test(parsed.hostname);
             const isSaucepan = /^(www\.)?saucepan\.ai$/i.test(parsed.hostname);
             if (!isJanitor && !isSaucepan) {
@@ -1129,16 +1118,10 @@ function registerDataCatRoutes(router) {
         const wantPublicFeed = req.body.publicFeed !== false;
         const alwaysReextract = req.body.alwaysReextract === true;
 
-        // Resolve a public session ID when public feed is requested
-        let sessionId = null;
-        if (wantPublicFeed) {
-            sessionId = await getPublicSessionId(dcSessionToken);
-        }
-
         try {
             let endpoint, body;
             if (extractionKind === 'saucepan') {
-                endpoint = `${DATACAT_BASE}/api/saucepan-extract/run`;
+                endpoint = `${DATACAT_BASE}/api/saucepan-retrieval/run`;
                 body = {
                     companion: url,
                     sourceKind: 'one_off',
@@ -1147,16 +1130,20 @@ function registerDataCatRoutes(router) {
                     extractHidden: false,
                     idempotencyKey: requestId,
                     alwaysReextract,
+                    appearOnPublicFeed: wantPublicFeed,
+                    publicFeedVisibilityIntent: wantPublicFeed,
+                    visibilityIntent: wantPublicFeed ? 'public' : 'mine',
                     vpnNamespace: 'general_scraper',
                     netnsRole: 'general_scraper',
                 };
             } else {
-                endpoint = `${DATACAT_BASE}/api/character/smart-extract-v2`;
+                endpoint = `${DATACAT_BASE}/api/character/retrieval-v2`;
                 body = {
                     url,
                     openLoginIfNoSession: true,
-                    sessionId,
-                    appearOnPublicFeed: wantPublicFeed && !!sessionId,
+                    appearOnPublicFeed: wantPublicFeed,
+                    publicFeedVisibilityIntent: wantPublicFeed,
+                    visibilityIntent: wantPublicFeed ? 'public' : 'mine',
                     useSeparateWorkerServer: true,
                     inlinePostExtractCreatorProfile: true,
                     idempotencyKey: requestId,
@@ -1175,8 +1162,14 @@ function registerDataCatRoutes(router) {
                 body: JSON.stringify(body),
             });
 
-            const data = await response.json();
-            res.status(response.status).json(data);
+            const responseText = await response.text();
+            let data;
+            try { data = JSON.parse(responseText); }
+            catch {
+                return res.status(response.ok ? 502 : response.status).json({ error: 'DataCat returned an invalid retrieval response', code: 'INVALID_RESPONSE' });
+            }
+            // Preserve upstream classifications; expose our correlation ID if upstream omits it.
+            res.status(response.status).json({ ...data, requestId: data.requestId || requestId });
         } catch (err) {
             console.error('[cl-helper] DC extract error:', err.message);
             res.status(502).json({ error: 'Failed to reach DataCat' });
@@ -1184,10 +1177,6 @@ function registerDataCatRoutes(router) {
     });
 
     router.get('/dc-proxy/*', async (req, res) => {
-        if (!dcSessionToken) {
-            return res.status(401).json({ error: 'No DataCat session token configured' });
-        }
-
         const targetPath = '/' + req.params[0];
 
         const normalizedPath = new URL(targetPath, DATACAT_BASE).pathname;
@@ -1199,20 +1188,24 @@ function registerDataCatRoutes(router) {
         const targetUrl = new URL(targetPath, DATACAT_BASE);
         targetUrl.search = new URL(req.url, 'http://localhost').search;
 
-        if (targetUrl.hostname !== 'datacat.run') {
+        if (targetUrl.origin !== DATACAT_BASE) {
             return res.status(403).json({ error: 'Proxy target must be datacat.run' });
         }
 
         try {
             const response = await fetch(targetUrl.toString(), {
                 method: 'GET',
-                headers: dcHeaders(dcSessionToken),
-                redirect: 'follow',
+                headers: dcSessionToken ? dcHeaders(dcSessionToken) : Object.fromEntries(Object.entries(dcHeaders('')).filter(([key]) => key !== 'X-Session-Token')),
+                redirect: 'manual',
             });
 
             const contentType = response.headers.get('content-type') || '';
             res.status(response.status);
             res.set('Content-Type', contentType);
+            for (const name of ['retry-after', 'cache-control']) {
+                const value = response.headers.get(name);
+                if (value) res.set(name, value);
+            }
 
             if (contentType.includes('application/json')) {
                 res.send(await response.text());

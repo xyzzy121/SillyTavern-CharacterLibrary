@@ -690,41 +690,35 @@ CharacterTavern requires a session cookie for NSFW content. To set it up:
 <details>
 <summary><h3>DataCat (Experimental)</h3></summary>
 
-**Auth:** None required. An anonymous session is created automatically via the [cl-helper plugin](#cl-helper-plugin-not-detected).
+**Auth:** Browsing uses an anonymous session created by **cl-helper 1.13.0 or newer**. Datacat can require human verification before exporting a card; that happens in your browser on Datacat.
 
-> **This provider is experimental and disabled by default.** Enable it in Settings > Online > Providers. Expect rough edges: the API is barebones and some features may return incomplete results.
+> **Experimental and disabled by default.** Enable it in Settings > Online > Providers. Existing provider preferences and card links are preserved when updating.
 
-DataCat aggregates JanitorAI characters with its own REST API and AI-powered character scoring.
+- Browse and search Datacat's JanitorAI, Saucepan, and native Datacat characters, with recent and Fresh feeds, tags, creator catalogs, and following.
+- Preview a character and choose **Source** or **Reimagination**. Source is the default; Reimagination is Datacat's AI-generated alternative and is available only when Datacat provides it. CharacterLibrary remembers the choice for linked-card updates and never silently substitutes another definition.
+- Import cards with their exported greetings, notes, lorebooks, extensions, and artwork. Current source-qualified Datacat URLs and older character links both work.
+- Retrieve missing JanitorAI or Saucepan characters, and optionally request fresh retrieval before update comparisons. Availability depends on Datacat's service and creator settings. Native Datacat uploads are not sent to external retrieval services.
+- JanitorAI MeiliSearch and Hampter sort modes remain available. Hampter sorts use the separate JanitorAI bridge described below.
 
-- Browse recent and popular characters
-- Sort by newest, trending, popular, and Hampter algorithm modes
-- Hampter sort orders (Latest, Trending, Trending 24h, Popular, Relevance) sit behind Cloudflare bot protection. A direct browser load is hit-or-miss (Cloudflare usually blocks it), so the companion **userscript** (`extras/cl-janitor-bridge.user.js`, installed in Tampermonkey or Violentmonkey) is the reliable path; it makes the Cloudflare-gated request from your own browser. JanitorAI serves only the first page of these sorts anonymously; paste your JanitorAI `sb-auth-auth-token` cookie under Settings > Online > DataCat to page further (the session then refreshes itself). Other DataCat and MeiliSearch sort orders need neither
-- Filter by tags and NSFW toggle
-- In-app character preview with card details
-- Character linking and card updates
-- **Creator search** to find characters by a specific creator
-- **JanitorAI search** via MeiliSearch integration (searches JanitorAI's full catalog through DataCat)
-- **Following tab** to browse characters from creators you follow
-- **Inline extraction** in the preview modal when viewing a JanitorAI character not yet on DataCat
-- **Re-extraction for updates** to ensure the latest character definition is compared during update checks
+#### Setup and upgrading
 
-#### JanitorAI Extraction
+1. Install or update the bundled **cl-helper to 1.13.0**, then **restart SillyTavern**. Updating the extension alone does not reload a running server plugin. Settings > Info shows the helper's running version and update controls.
+2. Enable DataCat in Settings > Online > Providers. Its browsing session initializes automatically.
+3. For downloads that request verification, install [the Datacat Export Companion](extras/cl-datacat-bridge.user.js) in Tampermonkey or Violentmonkey on the browser where you use CharacterLibrary. Allow it on datacat.run, including frames. It needs page-context execution to call Datacat's export tools.
+4. Click Import or check a single linked card for updates. When the Datacat panel opens, click **Export to Character Library** inside it and complete Datacat's verification. The companion passes your selected Source/Reimagination choice to Datacat's own export function and returns the PNG card. Datacat account credentials stay on Datacat.
+5. If the panel reports that the companion is missing, install/enable it and click **Reload**. Close or Cancel stops the pending export without replacing a local card. Browsers that block embedded Datacat or do not support userscripts cannot complete this optional verified-export flow.
 
-DataCat can extract character definitions from JanitorAI URLs, including private/hidden definitions that aren't available via JanitorAI's public API:
+User-started bulk imports reuse one panel and export characters serially. Batch update scans never open verification panels: a gated card is labeled **Verification required** and skipped; use a single-card update check to complete verification and compare it.
 
-1. Paste a JanitorAI character URL in the DataCat search bar
-2. If the character is already on DataCat, the preview opens directly
-3. If not, an extraction panel appears. Click **Extract** to queue the request
-4. DataCat runs a cloud browser instance to retrieve the character definition
-5. Once complete, the character is available for preview and import
+The helper session and the embedded Datacat browser session are separate. Verifying an export in the browser does not unlock the helper's downloads or share a login token with CharacterLibrary. Creator download restrictions and redirects are reported instead of falling back to a reconstructed card.
 
-Extraction is handled entirely by DataCat's servers. The `appearOnPublicFeed` option in Settings controls whether extracted characters appear on DataCat's public feed.
+#### Retrieval
 
-#### Setup
-1. Ensure the [cl-helper plugin](#cl-helper-plugin-not-detected) is installed and detected (required for session proxying)
-2. Enable DataCat in Settings > Online > Providers
-3. The session initializes automatically on first browse
-4. (Optional, for the Hampter sort orders) Install the companion userscript `extras/cl-janitor-bridge.user.js` in a userscript manager like Tampermonkey or Violentmonkey, and add your JanitorAI login in Settings > Online > DataCat to page past the first page
+Paste a JanitorAI or Saucepan URL to look up its character. A genuinely missing character offers **Retrieve**; session errors and temporary outages are reported separately. Once Datacat completes the matching retrieval request, the character becomes available for preview and export. Enable **Publish retrieved characters on DataCat** only when you want your requested public-feed visibility set to public. Reimagination selection downloads an existing alternative; it does not request generation or repair.
+
+#### JanitorAI Hampter sorts
+
+Latest, Trending, Trending 24h, Popular, and Relevance use JanitorAI's Cloudflare-protected endpoints. Install [the JanitorAI Bridge](extras/cl-janitor-bridge.user.js) for those sorts. To page past JanitorAI's anonymous limit, add your JanitorAI session under Settings > Online > DataCat. This is a **different script** from the Datacat Export Companion; the two scripts serve separate purposes. Other Datacat and MeiliSearch sort orders need no userscript.
 
 </details>
 
