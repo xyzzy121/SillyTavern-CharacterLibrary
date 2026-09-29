@@ -2083,12 +2083,10 @@ function buildChatLoreButtonHtml(chat) {
     return `<button class="chat-lore-btn" data-action="lore" title="Bind a lorebook to this chat" aria-label="Bind a lorebook to this chat">${icon}</button>`;
 }
 
-// Cheap content signature of a loaded chat (message count + last message's timestamp/text),
-// used to detect that ST appended/edited the file between our read and our write.
+// Compare the complete persisted content: same-length edits, earlier swipes, and
+// metadata changes must also stop our full-file save from overwriting newer data.
 function chatSignature(messages) {
-    if (!Array.isArray(messages) || !messages.length) return '0';
-    const last = messages[messages.length - 1] || {};
-    return `${messages.length}:${last.send_date || ''}:${(last.mes || '').length}`;
+    return JSON.stringify(messages);
 }
 
 /**
@@ -2166,9 +2164,6 @@ async function setChatBoundWorld(char, chatFile, worldName) {
             return false;
         }
 
-        if (worldName) header.chat_metadata[CHAT_LORE_KEY] = worldName;
-        else delete header.chat_metadata[CHAT_LORE_KEY];
-
         // Guard 2: re-read right before writing; abort if the file changed under us
         // (ST appended a message / swiped) so we never overwrite newer content.
         const sigBefore = chatSignature(messages);
@@ -2177,6 +2172,14 @@ async function setChatBoundWorld(char, chatFile, worldName) {
             CoreAPI.showToast('This chat changed while updating its lorebook; nothing was written. Try again.', 'warning', 6000);
             return false;
         }
+
+        // The user may have opened this chat while either read was in flight.
+        if (isActiveChat(char, fileName)) {
+            CoreAPI.showToast('This chat is now open in SillyTavern; its lorebook was not changed.', 'warning', 6000);
+            return false;
+        }
+        if (worldName) header.chat_metadata[CHAT_LORE_KEY] = worldName;
+        else delete header.chat_metadata[CHAT_LORE_KEY];
 
         const ok = await saveChatToServer({ character: char, file_name: fileName, isGroup: false }, messages);
         return ok;

@@ -517,15 +517,16 @@ class JannyProvider extends ProviderBase {
         try {
             const slug = linkInfo.slug || slugify(linkInfo.name || '');
             const data = await fetchCharacterDetails(linkInfo.id, slug);
-            if (data) {
+            if (data?.character && typeof data.character.name === 'string') {
                 const result = buildV2FromDetails(data);
                 if (result) result._listingName = this.getListingName(data.character);
                 return result;
             }
-            return null;
+            throw new Error('JannyAI returned an invalid character detail response');
         } catch (e) {
             console.error('[JannyProvider] fetchRemoteCard failed:', linkInfo.id, e);
-            return null;
+            if (e.notFound) return null;
+            throw e;
         }
     }
 

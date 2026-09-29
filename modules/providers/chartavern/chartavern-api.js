@@ -239,10 +239,7 @@ export async function searchCards(opts = {}, apiRequest) {
 export async function fetchCharacterDetail(author, slug, apiRequest) {
     const url = `${CT_API_BASE}/character/${encodeURIComponent(author)}/${encodeURIComponent(slug)}`;
     const resp = await ctFetch(url, apiRequest);
-    if (!resp.ok) {
-        throw new Error(`CT detail returned HTTP ${resp.status}`);
-    }
-    return resp.json();
+    return readJsonClassified(resp);
 }
 
 /**

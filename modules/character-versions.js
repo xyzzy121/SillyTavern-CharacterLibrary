@@ -62,25 +62,20 @@ async function fileUpload(name, data) {
 }
 
 async function fileRead(name) {
-    try {
-        const resp = await fetch(`/user/files/${name}`);
-        if (!resp.ok) return null;
-        const text = await resp.text();
-        if (!text || !text.trim()) return null;
-        return JSON.parse(text);
-    } catch (e) {
-        console.warn(`[CharVersions] fileRead(${name}):`, e.message);
-        return null;
-    }
+    const resp = await fetch(`/user/files/${name}`, { cache: 'no-store' });
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error(`Could not read version history (HTTP ${resp.status})`);
+    return JSON.parse(await resp.text());
 }
 
 async function fileDelete(name) {
     try {
         const resp = await CoreAPI.apiRequest('/files/delete', 'POST', { path: `user/files/${name}` });
-        return resp.ok;
+        if (!resp.ok && resp.status !== 404) throw new Error(`File deletion failed (HTTP ${resp.status})`);
+        return true;
     } catch (e) {
         console.warn(`[CharVersions] fileDelete(${name}):`, e.message);
-        return false;
+        throw e;
     }
 }
 
@@ -99,13 +94,15 @@ async function ensureIndexLoaded() {
     if (_indexLoading) return _indexLoading;
     _indexLoading = (async () => {
         let idx = await fileRead(INDEX_FILE);
-        if (!idx || typeof idx !== 'object' || !idx.characters) {
+        if (idx === null) {
             idx = createEmptyIndex();
+        } else if (typeof idx !== 'object' || !idx.characters || Array.isArray(idx.characters)) {
+            throw new Error('Invalid version index; existing data was not changed');
         }
+        idx.avatarMap ||= {};
         cachedIndex = idx;
-        _indexLoading = null;
         return cachedIndex;
-    })();
+    })().finally(() => { _indexLoading = null; });
     return _indexLoading;
 }
 
@@ -176,69 +173,89 @@ function createEmptyCharFile(versionUid, name, avatar) {
 }
 
 async function loadCharFile(versionUid) {
-    if (charDataCache.has(versionUid)) return charDataCache.get(versionUid);
-    const data = await fileRead(charFileName(versionUid));
-    if (data) charDataCache.set(versionUid, data);
-    return data;
+    let data = charDataCache.get(versionUid);
+    if (!data) {
+        data = await fileRead(charFileName(versionUid));
+        if (data && (!Array.isArray(data.snapshots) || !Number.isInteger(data.nextId))) {
+            throw new Error('Invalid version history; existing data was not changed');
+        }
+        if (data) charDataCache.set(versionUid, data);
+    }
+    // Writers use a private copy until the server confirms the upload.
+    return data ? JSON.parse(JSON.stringify(data)) : data;
 }
 
 async function saveCharFile(versionUid, charFile) {
-    charDataCache.set(versionUid, charFile);
     await fileUpload(charFileName(versionUid), charFile);
+    charDataCache.set(versionUid, charFile);
     await updateIndex(versionUid, charFile.name, charFile.avatar, charFile.snapshots.length);
 }
 
 // --- Storage API ---
 
+// Serialize read-modify-write operations per character, including the first save
+// before a cache entry exists. Different characters can still save independently.
+const charFileWrites = new Map();
+function withCharFileWrite(versionUid, action) {
+    const previous = charFileWrites.get(versionUid) || Promise.resolve();
+    const pending = previous.catch(() => {}).then(action);
+    charFileWrites.set(versionUid, pending);
+    return pending.finally(() => {
+        if (charFileWrites.get(versionUid) === pending) charFileWrites.delete(versionUid);
+    });
+}
+
 // Deduplicates auto_backup snapshots and caps to configured max (default 10)
 async function storageSaveSnapshot(avatar, charName, label, source, data, versionUid) {
     if (!versionUid) throw new Error('version_uid required');
-    let charFile = await loadCharFile(versionUid);
-    if (!charFile) charFile = createEmptyCharFile(versionUid, charName, avatar);
+    return withCharFileWrite(versionUid, async () => {
+        let charFile = await loadCharFile(versionUid);
+        if (!charFile) charFile = createEmptyCharFile(versionUid, charName, avatar);
 
-    // Update metadata
-    charFile.name = charName;
-    charFile.avatar = avatar;
+        // Update metadata
+        charFile.name = charName;
+        charFile.avatar = avatar;
 
-    const dataCopy = JSON.parse(JSON.stringify(data));
+        const dataCopy = JSON.parse(JSON.stringify(data));
 
-    // Dedup: skip if the latest auto_backup for this character is identical
-    if (source === 'auto_backup') {
-        const existing = charFile.snapshots.filter(s => s.source === 'auto_backup');
-        if (existing.length > 0) {
-            const latest = existing[existing.length - 1];
-            if (JSON.stringify(latest.data) === JSON.stringify(dataCopy)) {
-                CoreAPI.debugLog('[CharVersions] Skipping duplicate auto-backup snapshot');
-                return latest.id;
+        // Dedup: skip if the latest auto_backup for this character is identical
+        if (source === 'auto_backup') {
+            const existing = charFile.snapshots.filter(s => s.source === 'auto_backup');
+            if (existing.length > 0) {
+                const latest = existing[existing.length - 1];
+                if (JSON.stringify(latest.data) === JSON.stringify(dataCopy)) {
+                    CoreAPI.debugLog('[CharVersions] Skipping duplicate auto-backup snapshot');
+                    return latest.id;
+                }
             }
         }
-    }
 
-    const id = charFile.nextId++;
-    charFile.snapshots.push({
-        id,
-        label,
-        source,
-        timestamp: Date.now(),
-        charName,
-        data: dataCopy
+        const id = charFile.nextId++;
+        charFile.snapshots.push({
+            id,
+            label,
+            source,
+            timestamp: Date.now(),
+            charName,
+            data: dataCopy
+        });
+
+        // Cap: prune oldest auto_backup snapshots beyond max
+        if (source === 'auto_backup') {
+            const maxBackups = CoreAPI.getSetting('maxAutoBackups') ?? 10;
+            if (maxBackups > 0) {
+                const autoBackups = charFile.snapshots.filter(s => s.source === 'auto_backup');
+                if (autoBackups.length > maxBackups) {
+                    const toRemove = autoBackups.slice(0, autoBackups.length - maxBackups);
+                    const removeIds = new Set(toRemove.map(s => s.id));
+                    charFile.snapshots = charFile.snapshots.filter(s => !removeIds.has(s.id));
+                }
+            }
+        }
+
+        await saveCharFile(versionUid, charFile);
+        return id;
     });
-
-    // Cap: prune oldest auto_backup snapshots beyond max
-    if (source === 'auto_backup') {
-        const maxBackups = CoreAPI.getSetting('maxAutoBackups') ?? 10;
-        if (maxBackups > 0) {
-            const autoBackups = charFile.snapshots.filter(s => s.source === 'auto_backup');
-            if (autoBackups.length > maxBackups) {
-                const toRemove = autoBackups.slice(0, autoBackups.length - maxBackups);
-                const removeIds = new Set(toRemove.map(s => s.id));
-                charFile.snapshots = charFile.snapshots.filter(s => !removeIds.has(s.id));
-            }
-        }
-    }
-
-    await saveCharFile(versionUid, charFile);
-    return id;
 }
 
 async function storageGetSnapshots(avatar, versionUid) {
@@ -262,40 +279,46 @@ async function storageGetSnapshot(versionUid, snapshotId) {
 
 async function storageDeleteSnapshot(versionUid, snapshotId) {
     if (!versionUid) return;
-    const charFile = await loadCharFile(versionUid);
-    if (!charFile) return;
-    charFile.snapshots = charFile.snapshots.filter(s => s.id !== snapshotId);
+    return withCharFileWrite(versionUid, async () => {
+        const charFile = await loadCharFile(versionUid);
+        if (!charFile) return;
+        charFile.snapshots = charFile.snapshots.filter(s => s.id !== snapshotId);
 
-    if (charFile.snapshots.length === 0 && !charFile.backup) {
-        // No data left - remove the file entirely
-        charDataCache.delete(versionUid);
-        await fileDelete(charFileName(versionUid));
-        await removeFromIndex(versionUid);
-    } else {
-        await saveCharFile(versionUid, charFile);
-    }
+        if (charFile.snapshots.length === 0 && !charFile.backup) {
+            // No data left - remove the file entirely
+            await fileDelete(charFileName(versionUid));
+            charDataCache.delete(versionUid);
+            await removeFromIndex(versionUid);
+        } else {
+            await saveCharFile(versionUid, charFile);
+        }
+    });
 }
 
 async function storageRenameSnapshot(versionUid, snapshotId, newLabel) {
     if (!versionUid) return;
-    const charFile = await loadCharFile(versionUid);
-    if (!charFile) return;
-    const snap = charFile.snapshots.find(s => s.id === snapshotId);
-    if (!snap) throw new Error('Snapshot not found');
-    snap.label = newLabel;
-    await saveCharFile(versionUid, charFile);
+    return withCharFileWrite(versionUid, async () => {
+        const charFile = await loadCharFile(versionUid);
+        if (!charFile) return;
+        const snap = charFile.snapshots.find(s => s.id === snapshotId);
+        if (!snap) throw new Error('Snapshot not found');
+        snap.label = newLabel;
+        await saveCharFile(versionUid, charFile);
+    });
 }
 
 async function storageSaveBackup(avatar, versionUid, data) {
     if (!versionUid) return;
-    let charFile = await loadCharFile(versionUid);
-    if (!charFile) charFile = createEmptyCharFile(versionUid, '', avatar);
-    charFile.avatar = avatar;
-    charFile.backup = {
-        timestamp: Date.now(),
-        data: JSON.parse(JSON.stringify(data))
-    };
-    await saveCharFile(versionUid, charFile);
+    return withCharFileWrite(versionUid, async () => {
+        let charFile = await loadCharFile(versionUid);
+        if (!charFile) charFile = createEmptyCharFile(versionUid, '', avatar);
+        charFile.avatar = avatar;
+        charFile.backup = {
+            timestamp: Date.now(),
+            data: JSON.parse(JSON.stringify(data))
+        };
+        await saveCharFile(versionUid, charFile);
+    });
 }
 
 async function storageGetBackup(versionUid) {
@@ -306,17 +329,19 @@ async function storageGetBackup(versionUid) {
 
 async function storageClearBackup(versionUid) {
     if (!versionUid) return;
-    const charFile = await loadCharFile(versionUid);
-    if (!charFile) return;
-    charFile.backup = null;
+    return withCharFileWrite(versionUid, async () => {
+        const charFile = await loadCharFile(versionUid);
+        if (!charFile) return;
+        charFile.backup = null;
 
-    if (charFile.snapshots.length === 0) {
-        charDataCache.delete(versionUid);
-        await fileDelete(charFileName(versionUid));
-        await removeFromIndex(versionUid);
-    } else {
-        await saveCharFile(versionUid, charFile);
-    }
+        if (charFile.snapshots.length === 0) {
+            await fileDelete(charFileName(versionUid));
+            charDataCache.delete(versionUid);
+            await removeFromIndex(versionUid);
+        } else {
+            await saveCharFile(versionUid, charFile);
+        }
+    });
 }
 
 // ========================================
@@ -1288,22 +1313,29 @@ function renderGreetingsDiff(field, localGreets, remoteGreets) {
 // ========================================
 
 async function restoreVersion() {
-    if (!currentChar) return;
+    const targetChar = currentChar;
+    const provider = currentProvider;
+    const linkInfo = currentLinkInfo;
+    const tab = activeTab;
+    const versionRef = selectedVersionRef;
+    const snapshotId = selectedSnapshotId;
+    const gen = _renderGen;
+    if (!targetChar) return;
 
     let cardData = null;
     let label = '';
 
-    if (activeTab === 'remote' && selectedVersionRef === '__provider_page__' && currentProvider?.supportsRemotePageVersion) {
-        cardData = await currentProvider.fetchRemotePageCard(currentLinkInfo);
-        label = `${currentProvider.name} metadata API state`;
-    } else if (activeTab === 'remote' && selectedVersionRef && currentProvider) {
-        const raw = await currentProvider.fetchVersionData(currentLinkInfo, selectedVersionRef);
+    if (tab === 'remote' && versionRef === '__provider_page__' && provider?.supportsRemotePageVersion) {
+        cardData = await provider.fetchRemotePageCard(linkInfo);
+        label = `${provider.name} metadata API state`;
+    } else if (tab === 'remote' && versionRef && provider) {
+        const raw = await provider.fetchVersionData(linkInfo, versionRef);
         if (!raw) { CoreAPI.showToast('Could not fetch version data', 'error'); return; }
         cardData = raw; // provider returns flat card fields
-        label = `${currentProvider.name} version ${selectedVersionRef}`;
-    } else if (activeTab === 'local' && selectedSnapshotId) {
-        const lookupUid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
-        const snap = lookupUid ? await storageGetSnapshot(lookupUid, selectedSnapshotId) : null;
+        label = `${provider.name} version ${versionRef}`;
+    } else if (tab === 'local' && snapshotId) {
+        const lookupUid = getVersionUid(targetChar) || await lookupUidByAvatar(targetChar.avatar);
+        const snap = lookupUid ? await storageGetSnapshot(lookupUid, snapshotId) : null;
         if (!snap) { CoreAPI.showToast('Snapshot not found', 'error'); return; }
         cardData = snap.data;
         label = `snapshot "${snap.label}"`;
@@ -1313,11 +1345,12 @@ async function restoreVersion() {
     }
 
     // Remote tags ride the ruleset here too; local snapshots stay byte-faithful.
-    if (activeTab === 'remote' && Array.isArray(cardData?.tags)) {
+    if (tab === 'remote' && Array.isArray(cardData?.tags)) {
         cardData.tags = CoreAPI.applyTagAliases(cardData.tags);
     }
 
-    const name = currentChar.data?.name || currentChar.name || 'Unknown';
+    if (gen !== _renderGen) return;
+    const name = targetChar.data?.name || targetChar.name || 'Unknown';
     const ok = await CoreAPI.showConfirm({
         title: 'Restore Version',
         message: `Overwrite "${name}" with ${label}?`,
@@ -1325,30 +1358,30 @@ async function restoreVersion() {
         danger: true,
         content: [{ type: 'note', text: 'The current state is backed up first.' }],
     });
-    if (!ok) return;
+    if (!ok || gen !== _renderGen) return;
 
     const status = el('.vt-status');
     status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restoring...';
 
     try {
-        const curData = await extractCardData(currentChar);
-        const uid = await ensureVersionUid(currentChar);
-        await storageSaveBackup(currentChar.avatar, uid, curData);
+        const curData = await extractCardData(targetChar);
+        const uid = await ensureVersionUid(targetChar);
+        await storageSaveBackup(targetChar.avatar, uid, curData);
 
         // Auto-snapshot before restore
         const ts = new Date().toLocaleString();
-        await storageSaveSnapshot(currentChar.avatar, name,
+        await storageSaveSnapshot(targetChar.avatar, name,
             `Restore - ${ts}`, 'auto_backup', curData, uid);
 
         const updates = {};
         let lorebookRestored = false;
         for (const f of CARD_FIELDS) {
             if (f === 'character_book') {
-                const hasLocal = currentChar.data?.character_book?.entries?.length > 0;
+                const hasLocal = targetChar.data?.character_book?.entries?.length > 0;
                 const hasRemote = cardData[f]?.entries?.length > 0;
                 if (hasRemote) {
                     updates[f] = cardData[f];
-                    if (activeTab === 'remote') lorebookRestored = true;
+                    if (tab === 'remote') lorebookRestored = true;
                 } else if (hasLocal && !hasRemote) {
                     // Remote has no lorebook - clear embedded copy
                     updates[f] = null;
@@ -1362,30 +1395,30 @@ async function restoreVersion() {
 
         // Namespace-level restore: bring the snapshot's namespace shape in, sentinel-delete leaves/namespaces absent from it. Flat keys + orphan namespaces stay sticky via the spread; no-ops on empty-extensions legacy snapshots.
         const deleteValue = await CoreAPI.getExtensionDeleteValue();
-        const nsUpdates = buildNamespaceUpdates(cardData?.extensions, currentChar.data?.extensions, deleteValue);
+        const nsUpdates = buildNamespaceUpdates(cardData?.extensions, targetChar.data?.extensions, deleteValue);
         Object.assign(updates, nsUpdates);
 
-        const success = await CoreAPI.applyCardFieldUpdates(currentChar.avatar, updates);
+        const success = await CoreAPI.applyCardFieldUpdates(targetChar.avatar, updates);
 
         // Merge remote lorebook entries into linked /worlds file
         if (success && lorebookRestored) {
             try {
-                await CoreAPI.mergeRemoteLorebookIntoWorldFile(currentChar.avatar, cardData.character_book);
+                await CoreAPI.mergeRemoteLorebookIntoWorldFile(targetChar.avatar, cardData.character_book);
             } catch (worldErr) {
                 console.error('[CharVersions] World file merge failed:', worldErr);
             }
         }
 
         if (success) {
-            if (activeTab === 'remote' && selectedVersionRef && currentProvider) {
-                const snapLabel = selectedVersionRef === '__provider_page__'
-                    ? `${currentProvider.name} metadata API (restored)` : `${currentProvider.name} v${selectedVersionRef} (restored)`;
-                const restoredTag = selectedVersionRef === '__provider_page__'
-                    ? 'provider_page' : selectedVersionRef;
-                await storageSaveSnapshot(currentChar.avatar, name,
+            if (tab === 'remote' && versionRef && provider) {
+                const snapLabel = versionRef === '__provider_page__'
+                    ? `${provider.name} metadata API (restored)` : `${provider.name} v${versionRef} (restored)`;
+                const restoredTag = versionRef === '__provider_page__'
+                    ? 'provider_page' : versionRef;
+                await storageSaveSnapshot(targetChar.avatar, name,
                     snapLabel, 'remote_restore', cardData, uid);
-                const extKey = `extensions.${currentProvider.id}`;
-                await CoreAPI.applyCardFieldUpdates(currentChar.avatar, {
+                const extKey = `extensions.${provider.id}`;
+                await CoreAPI.applyCardFieldUpdates(targetChar.avatar, {
                     [`${extKey}.restored_version`]: restoredTag,
                     [`${extKey}.restored_at`]: new Date().toISOString()
                 });
@@ -1405,12 +1438,16 @@ async function restoreVersion() {
 }
 
 async function undoRestore() {
-    if (!currentChar) return;
-    const uid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
+    const targetChar = currentChar;
+    const provider = currentProvider;
+    const gen = _renderGen;
+    if (!targetChar) return;
+    const uid = getVersionUid(targetChar) || await lookupUidByAvatar(targetChar.avatar);
     const backup = uid ? await storageGetBackup(uid) : null;
     if (!backup) { CoreAPI.showToast('No backup found', 'warning'); return; }
 
-    const name = currentChar.data?.name || currentChar.name || 'Unknown';
+    if (gen !== _renderGen) return;
+    const name = targetChar.data?.name || targetChar.name || 'Unknown';
     const ok = await CoreAPI.showConfirm({
         title: 'Undo Restore',
         message: `Revert "${name}" to its pre-restore state?`,
@@ -1418,7 +1455,7 @@ async function undoRestore() {
         danger: true,
         content: [{ type: 'stats', items: [{ icon: 'fa-solid fa-calendar', label: 'backup from', value: new Date(backup.timestamp).toLocaleString() }] }],
     });
-    if (!ok) return;
+    if (!ok || gen !== _renderGen) return;
 
     const status = el('.vt-status');
     status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Undoing...';
@@ -1430,16 +1467,16 @@ async function undoRestore() {
         for (const f of CARD_FIELDS) {
             if (backup.data?.[f] !== undefined) undoUpdates[f] = backup.data[f];
         }
-        const undoNsUpdates = buildNamespaceUpdates(backup.data?.extensions, currentChar.data?.extensions, deleteValue);
+        const undoNsUpdates = buildNamespaceUpdates(backup.data?.extensions, targetChar.data?.extensions, deleteValue);
         Object.assign(undoUpdates, undoNsUpdates);
-        const s = await CoreAPI.applyCardFieldUpdates(currentChar.avatar, undoUpdates);
+        const s = await CoreAPI.applyCardFieldUpdates(targetChar.avatar, undoUpdates);
         if (s) {
             await storageClearBackup(uid);
             // Clear restore metadata for the active provider
-            const provId = currentProvider?.id;
+            const provId = provider?.id;
             if (provId) {
                 const extKey = `extensions.${provId}`;
-                await CoreAPI.applyCardFieldUpdates(currentChar.avatar, {
+                await CoreAPI.applyCardFieldUpdates(targetChar.avatar, {
                     [`${extKey}.restored_version`]: null,
                     [`${extKey}.restored_at`]: null
                 });

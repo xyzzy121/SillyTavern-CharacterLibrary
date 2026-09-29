@@ -228,7 +228,7 @@ async function parseZip(file) {
             }
         }
 
-        entries.set(name, { method, compSize, size, localOffset });
+        entries.set(name, { method, compSize, size, localOffset, crc: cd.getUint32(p + 16, true) });
         p += 46 + nameLen + extraLen + commentLen;
     }
     return { file, entries };
@@ -244,14 +244,21 @@ async function readZipEntry(zip, name) {
     const nameLen = lh.getUint16(26, true);
     const extraLen = lh.getUint16(28, true);
     const start = e.localOffset + 30 + nameLen + extraLen;
+    if (start + e.compSize > zip.file.size) throw new Error(`Corrupt zip entry size: ${name}`);
     const blob = zip.file.slice(start, start + e.compSize);
-    if (e.method === 0) return new Uint8Array(await blob.arrayBuffer());
-    if (e.method === 8) {
+    let bytes;
+    if (e.method === 0) bytes = new Uint8Array(await blob.arrayBuffer());
+    else if (e.method === 8) {
         // Deflate support so bundles re-zipped by external tools still import.
         const stream = blob.stream().pipeThrough(new DecompressionStream('deflate-raw'));
-        return new Uint8Array(await new Response(stream).arrayBuffer());
+        bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+    } else {
+        throw new Error(`Unsupported zip compression method ${e.method} for ${name}`);
     }
-    throw new Error(`Unsupported zip compression method ${e.method} for ${name}`);
+    if (bytes.length !== e.size || CoreAPI.crc32(bytes) !== e.crc) {
+        throw new Error(`Corrupt zip entry (size or checksum mismatch): ${name}`);
+    }
+    return bytes;
 }
 
 // ========================================

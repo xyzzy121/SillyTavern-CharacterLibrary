@@ -201,6 +201,9 @@ function httpFailureError(status, text) {
     // Real auth statuses only, never a classified block page: Cloudflare challenges commonly
     // arrive as 403 and must not masquerade as an expired token; 5xx stays untagged likewise.
     if (!pageMsg && (status === 401 || status === 403)) err.authFailed = true;
+    // A disabled ST proxy also answers 404. Only an upstream missing resource may
+    // become Removed / Private in update checks; transport/configuration errors must throw.
+    if (!pageMsg && status === 404) err.notFound = true;
     return err;
 }
 

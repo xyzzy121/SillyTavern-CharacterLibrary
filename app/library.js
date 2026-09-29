@@ -740,11 +740,12 @@ async function probeSTSentinelSupport() {
         }
     } catch { /* host window may be cross-origin or opener-detached in re-opened tabs */ }
     try {
-        // /api/extensions/version exists on current ST and returns plain text version.
-        const resp = await fetch('/api/extensions/version', { headers: getRequestHeaders() });
+        // The application version is JSON at /version. /api/extensions/version
+        // is a POST endpoint for inspecting an installed extension's Git state.
+        const resp = await fetch('/version');
         if (resp.ok) {
-            const v = (await resp.text()).trim();
-            if (v && compareSemverParts(v, ST_MIN_VERSION_FOR_SENTINEL) >= 0) { debugLog('[ST sentinel] detected via /api/extensions/version:', v); return true; }
+            const v = (await resp.json()).pkgVersion;
+            if (v && compareSemverParts(String(v), ST_MIN_VERSION_FOR_SENTINEL) >= 0) { debugLog('[ST sentinel] detected via /version:', v); return true; }
         }
     } catch { /* endpoint may not exist on older ST */ }
     try {
@@ -982,7 +983,10 @@ async function callLLM(messages, opts = {}) {
         }
         if (response.status === 404) continue;
         if (!response.ok) {
-            const errText = await response.text().catch(() => '');
+            const errText = await response.text().catch(err => {
+                if (err.name === 'AbortError' || signal?.aborted) throw cancelled();
+                return '';
+            });
             throw new Error(`API returned ${response.status}: ${errText.slice(0, 300)}`);
         }
 
@@ -1022,8 +1026,10 @@ async function callLLM(messages, opts = {}) {
 
 // Append the OpenAI chat-completions path unless the URL already ends with it.
 function resolveCustomEndpoint(base) {
-    const u = (base || '').trim().replace(/\/+$/, '');
-    return /\/chat\/completions$/i.test(u) ? u : `${u}/chat/completions`;
+    // Append to the path, preserving query parameters used by compatible APIs.
+    const [, path, suffix] = (base || '').trim().match(/^([^?#]*)(.*)$/);
+    const normalized = path.replace(/\/+$/, '');
+    return (/\/chat\/completions$/i.test(normalized) ? normalized : `${normalized}/chat/completions`) + suffix;
 }
 
 /**
@@ -13764,37 +13770,36 @@ function showSaveConfirmation() {
 
 // Actually perform the save
 async function performSave() {
-    if (!activeChar || !pendingUpdates) return;
-
-    if (activeChar._slim) {
-        await hydrateCharacter(activeChar);
-        if (activeChar._slim) { showToast('Card data still loading, please try again', 'warning'); return; }
-    }
-
-    // Re-entrancy guard: a double-tap Confirm Save must not run two concurrent snapshot+write+upload passes.
-    if (_saveInProgress) return;
+    if (!activeChar || !pendingUpdates || _saveInProgress) return;
+    // Bind the entire transaction before its first await. Escape/navigation can
+    // open another card while hydration, snapshots or the server write is pending.
     _saveInProgress = true;
-
-    const hasAvatarChange = !!pendingAvatarFile;
-
-    // Auto-snapshot before edit (non-blocking - don't let snapshot failure block the save).
-    // When the avatar is also being replaced, embed the OLD image bytes in the snapshot
-    // so the version history can show/restore the original card image even after overwrite.
-    if (window.autoSnapshotBeforeChange) {
-        try { await window.autoSnapshotBeforeChange(activeChar, 'edit', { embedAvatar: hasAvatarChange }); } catch (_) {}
-    }
-
-    // Capture old name before the write so the gallery folder rename has the pre-write value.
+    const saveChar = activeChar;
+    const updates = pendingUpdates;
+    const savedValues = collectEditValues();
+    const avatarFile = pendingAvatarFile;
+    const saveGeneration = _modalOpenGen;
+    const isCurrentSave = () => activeChar?.avatar === saveChar.avatar && _modalOpenGen === saveGeneration;
     const oldName = originalValues.name;
-    const newName = pendingUpdates.name;
+    const newName = updates.name;
     const nameChanged = oldName && newName && oldName !== newName;
-    const galleryId = getCharacterGalleryId(activeChar);
+    const hasAvatarChange = !!avatarFile;
 
     try {
+        if (saveChar._slim) {
+            await hydrateCharacter(saveChar);
+            if (saveChar._slim) { showToast('Card data still loading, please try again', 'warning'); return; }
+        }
+        // Keep the old image in the snapshot when it is also being replaced.
+        if (window.autoSnapshotBeforeChange) {
+            try { await window.autoSnapshotBeforeChange(saveChar, 'edit', { embedAvatar: hasAvatarChange }); } catch (_) {}
+        }
+        const galleryId = getCharacterGalleryId(saveChar);
         // writeCardFields does the card write; performSave keeps the non-generic orchestration (avatar upload, gallery rename, date bump, refresh, notify).
-        const writeResult = await writeCardFields(activeChar, pendingUpdates);
+        const writeResult = await writeCardFields(saveChar, updates);
 
         if (writeResult.ok) {
+            let avatarSaved = !hasAvatarChange;
             // Upload replacement avatar (after fields succeeded). edit-avatar reads existing
             // card JSON from the PNG and re-embeds it into the new image, so all fields,
             // extensions, gallery_id, version_uid, chats, and the filename are preserved.
@@ -13803,8 +13808,8 @@ async function performSave() {
                     const formData = new FormData();
                     // ST's edit-avatar re-encodes as PNG and re-embeds existing card JSON,
                     // so we always send with .png filename regardless of source format.
-                    formData.append('avatar', new File([pendingAvatarFile], 'avatar.png', { type: pendingAvatarFile.type || 'image/png' }));
-                    formData.append('avatar_url', activeChar.avatar);
+                    formData.append('avatar', new File([avatarFile], 'avatar.png', { type: avatarFile.type || 'image/png' }));
+                    formData.append('avatar_url', saveChar.avatar);
                     const csrfToken = getCSRFToken();
                     const avatarResp = await fetch('/api/characters/edit-avatar', {
                         method: 'POST',
@@ -13815,6 +13820,7 @@ async function performSave() {
                         const err = await avatarResp.text().catch(() => '');
                         throw new Error(`Avatar upload failed (${avatarResp.status}): ${err}`);
                     }
+                    avatarSaved = true;
                 } catch (avatarErr) {
                     console.error('[Edit] Avatar upload failed:', avatarErr);
                     showToast(`Card saved, but image update failed: ${avatarErr.message}`, 'warning');
@@ -13822,55 +13828,63 @@ async function performSave() {
                 }
             }
 
-            showToast("Character saved successfully!", "success");
+            if (avatarSaved) showToast("Character saved successfully!", "success");
 
             // Close confirmation immediately so it doesn't wait on folder rename / grid refresh
-            document.getElementById('confirmSaveModal').classList.add('hidden');
+            if (isCurrentSave() && pendingUpdates === updates) document.getElementById('confirmSaveModal').classList.add('hidden');
 
             // Handle gallery folder rename if name changed and character has unique gallery folder
             if (nameChanged && galleryId && getSetting('uniqueGalleryFolders')) {
-                await handleGalleryFolderRename(activeChar, oldName, newName, galleryId);
+                await handleGalleryFolderRename(saveChar, oldName, newName, galleryId);
             }
 
             // Re-point activeChar to the canonical array entry in case writeCardFields received a different ref.
-            const charIndex = allCharacters.findIndex(c => c.avatar === activeChar.avatar);
-            if (charIndex !== -1 && allCharacters[charIndex] !== activeChar) {
+            const charIndex = allCharacters.findIndex(c => c.avatar === saveChar.avatar);
+            if (isCurrentSave() && charIndex !== -1 && allCharacters[charIndex] !== activeChar) {
                 activeChar = allCharacters[charIndex];
             }
 
             // Update last modified timestamp locally so sort by "Last Modified" reflects the change immediately.
             const nowMs = Date.now();
-            activeChar.date_added = nowMs;
-            if (activeChar._meta) activeChar._meta.date_added = nowMs;
+            saveChar.date_added = nowMs;
+            if (saveChar._meta) saveChar._meta.date_added = nowMs;
             if (charIndex !== -1) {
                 allCharacters[charIndex].date_added = nowMs;
                 if (allCharacters[charIndex]._meta) allCharacters[charIndex]._meta.date_added = nowMs;
             }
 
-            // Update original values to reflect saved state
-            originalValues = collectEditValues();
-
-            // Refresh the modal display to show saved changes
-            refreshModalDisplay();
+            // Inputs can change after the confirmation is dismissed during a save.
+            // Only the submitted values become the baseline; later edits stay dirty.
+            let unchangedSinceSave = false;
+            if (isCurrentSave()) {
+                unchangedSinceSave = generateChangesDiff(savedValues, collectEditValues()).length === 0
+                    && pendingAvatarFile === avatarFile && avatarSaved;
+                originalValues = savedValues;
+                originalRawData = {
+                    altGreetings: [...(updates.alternate_greetings || [])],
+                    characterBook: updates.character_book ? JSON.parse(JSON.stringify(updates.character_book)) : null,
+                };
+                if (unchangedSinceSave) refreshModalDisplay();
+            }
 
             // Cache-bust avatar URLs after image swap so the modal hero and grid cards
             // all fetch the new PNG without needing F5.
-            if (hasAvatarChange) {
-                bumpAvatarCacheBust(activeChar.avatar);
-                const newUrl = getCharacterAvatarUrl(activeChar.avatar);
+            if (hasAvatarChange && avatarSaved) {
+                bumpAvatarCacheBust(saveChar.avatar);
+                const newUrl = getCharacterAvatarUrl(saveChar.avatar);
                 const heroImg = document.getElementById('modalImage');
-                if (heroImg) heroImg.src = newUrl;
+                if (isCurrentSave() && pendingAvatarFile === avatarFile && heroImg) heroImg.src = newUrl;
                 const headerAvatar = document.querySelector('#charModal .mobile-header-avatar');
-                if (headerAvatar) headerAvatar.src = getCharacterAvatarStThumbUrl(activeChar.avatar);
+                if (isCurrentSave() && pendingAvatarFile === avatarFile && headerAvatar) headerAvatar.src = getCharacterAvatarStThumbUrl(saveChar.avatar);
                 // Repaint the edited card's grid image now, in case the re-render below reuses the node.
-                const gridUrl = gridUsesThumbnails() ? getCharacterAvatarThumbUrl(activeChar.avatar) : getCharacterAvatarUrl(activeChar.avatar);
-                const cardImg = findCardElement(activeChar.avatar)?.querySelector('.card-image');
+                const gridUrl = gridUsesThumbnails() ? getCharacterAvatarThumbUrl(saveChar.avatar) : getCharacterAvatarUrl(saveChar.avatar);
+                const cardImg = findCardElement(saveChar.avatar)?.querySelector('.card-image');
                 if (cardImg) cardImg.src = gridUrl;
-                clearPendingAvatar();
+                if (isCurrentSave() && pendingAvatarFile === avatarFile) clearPendingAvatar();
             }
             
             // Listing name + tagline feed the search keys (CL-side state the card write doesnt touch), so recompute them before the grid re-renders below.
-            for (const c of [activeChar, charIndex !== -1 ? allCharacters[charIndex] : null].filter(Boolean)) {
+            for (const c of [saveChar, charIndex !== -1 ? allCharacters[charIndex] : null].filter(Boolean)) {
                 const ln = getListingNameFromExtensions(c);
                 c._lowerListingName = ln ? ln.toLowerCase() : '';
                 c._lowerTagline = getDisplayTagline(c).toLowerCase();
@@ -13880,12 +13894,12 @@ async function performSave() {
             performSearch();
             
             // Lock editing and clean up
-            setEditLock(true);
-            pendingUpdates = null;
+            if (isCurrentSave() && unchangedSinceSave) setEditLock(true);
+            if (pendingUpdates === updates) pendingUpdates = null;
 
             // Tell ST to re-read the character so open chats pick up the edits
             // without requiring a tab refresh. Best-effort, non-blocking.
-            notifySTCharacterEdited(activeChar.avatar);
+            notifySTCharacterEdited(saveChar.avatar);
 
             // Fetch from server for full sync (in background)
             // forceRefresh avoids stale opener data overwriting recent changes
@@ -20786,6 +20800,7 @@ async function searchProvidersForLink(name, creator) {
 async function linkToSearchResult(btn) {
     const resultEl = btn.closest('.provider-link-search-result');
     if (!resultEl || !activeChar) return;
+    const targetChar = activeChar;
     
     const fullPath = resultEl.dataset.fullpath;
     let resultId = resultEl.dataset.id;
@@ -20818,12 +20833,14 @@ async function linkToSearchResult(btn) {
             }
         }
         
-        await saveProviderLink(activeChar, provider, { id: resultId, fullPath, pageName });
+        await saveProviderLink(targetChar, provider, { id: resultId, fullPath, pageName });
         
         showToast(`Linked to ${fullPath} (${provider.name})`, 'success');
         
-        updateProviderLinkIndicator(activeChar);
-        hideModal('providerLinkModal');
+        if (activeChar === targetChar) {
+            updateProviderLinkIndicator(targetChar);
+            hideModal('providerLinkModal');
+        }
         
     } catch (error) {
         console.error('[LinkSearch] Link error:', error);
@@ -20840,6 +20857,7 @@ async function linkToSearchResult(btn) {
  */
 async function linkToProviderUrl(url) {
     if (!activeChar) return;
+    const targetChar = activeChar;
     
     const btn = document.getElementById('providerLinkUrlBtn');
     
@@ -20874,12 +20892,14 @@ async function linkToProviderUrl(url) {
             }
         }
         
-        await saveProviderLink(activeChar, matchedProvider, { id: resultId, fullPath: parsedPath, pageName, sourceKind, sourceUrl: url });
+        await saveProviderLink(targetChar, matchedProvider, { id: resultId, fullPath: parsedPath, pageName, sourceKind, sourceUrl: url });
         
         showToast(`Linked to ${parsedPath} (${matchedProvider.name})`, 'success');
         
-        updateProviderLinkIndicator(activeChar);
-        hideModal('providerLinkModal');
+        if (activeChar === targetChar) {
+            updateProviderLinkIndicator(targetChar);
+            hideModal('providerLinkModal');
+        }
         
     } catch (error) {
         console.error('[LinkSearch] URL link error:', error);
@@ -20897,6 +20917,8 @@ async function linkToProviderUrl(url) {
  */
 async function unlinkFromProvider() {
     if (!activeChar) return;
+    const targetChar = activeChar;
+    const match = linkModalActiveProvider || window.ProviderRegistry?.getCharacterProvider(targetChar);
     
     const btn = document.getElementById('providerLinkUnlinkBtn');
     if (btn) {
@@ -20905,28 +20927,23 @@ async function unlinkFromProvider() {
     }
     
     try {
-        const match = linkModalActiveProvider || window.ProviderRegistry?.getCharacterProvider(activeChar);
         const provider = match?.provider;
         if (!provider) throw new Error('No provider found for this character');
+        await hydrateCharacter(targetChar);
+        if (!extensionsReady(targetChar)) throw new Error('Could not load the existing provider link');
 
         // Non-blocking auto-snapshot before unlink (destructive, restore is the only undo).
         if (window.autoSnapshotBeforeChange) {
-            try { await window.autoSnapshotBeforeChange(activeChar, 'unlink'); } catch (_) {}
+            try { await window.autoSnapshotBeforeChange(targetChar, 'unlink'); } catch (_) {}
         }
 
         // Capture provider display metadata before setLinkInfo wipes it, so it survives as CL-owned fallback.
-        const provTagline = activeChar.data?.extensions?.[provider.id]?.tagline;
-        const provPageName = activeChar.data?.extensions?.[provider.id]?.pageName;
-
-        // Drop the provider namespace in-memory so reads see unlinked state before the round-trip completes.
-        provider.setLinkInfo(activeChar, null);
-        const charInArray = allCharacters.find(c => c.avatar === activeChar.avatar);
-        if (charInArray && charInArray !== activeChar) {
-            provider.setLinkInfo(charInArray, null);
-        }
+        const provTagline = targetChar.data?.extensions?.[provider.id]?.tagline;
+        const provPageName = targetChar.data?.extensions?.[provider.id]?.pageName;
+        const charInArray = allCharacters.find(c => c.avatar === targetChar.avatar);
 
         // Sentinel-delete the provider namespace; migrate display metadata into cl only where cl is empty (dont clobber user values).
-        const existingCl = activeChar.data?.extensions?.cl;
+        const existingCl = targetChar.data?.extensions?.cl;
         const updates = { [`extensions.${provider.id}`]: ST_UNSET_SENTINEL };
         if (provTagline && !(existingCl && 'tagline' in existingCl)) {
             updates['extensions.cl.tagline'] = provTagline;
@@ -20935,11 +20952,12 @@ async function unlinkFromProvider() {
             updates['extensions.cl.pageName'] = provPageName;
         }
 
-        const success = await window.applyCardFieldUpdates(activeChar.avatar, updates);
-        if (!success) throw new Error('Failed to save unlink');
+        const result = await writeCardFields(targetChar, updates, { surgical: true });
+        if (!result.ok) throw new Error('Failed to save unlink');
+        try { await notifySTCharacterEdited(targetChar.avatar); } catch (_) { /* persisted successfully */ }
 
         // Recompute the listing-name + tagline search keys on both refs: CL-side state outside char.data, so the helper's write doesnt touch it.
-        for (const c of [activeChar, charInArray].filter(Boolean)) {
+        for (const c of [targetChar, charInArray].filter(Boolean)) {
             const ln = getListingNameFromExtensions(c);
             c._lowerListingName = ln ? ln.toLowerCase() : '';
             c._lowerTagline = getDisplayTagline(c).toLowerCase();
@@ -20947,8 +20965,10 @@ async function unlinkFromProvider() {
 
         showToast(`Unlinked from ${provider.name}`, 'info');
 
-        updateProviderLinkIndicator(activeChar);
-        openProviderLinkModal();
+        if (activeChar === targetChar) {
+            updateProviderLinkIndicator(targetChar);
+            openProviderLinkModal();
+        }
         
     } catch (error) {
         console.error('[Link] Unlink error:', error);
@@ -21973,31 +21993,31 @@ function updateBulkAutoLinkSelectedCount() {
 
 /**
  * Persist a provider link for a character.
- * Updates in-memory state via the provider's setLinkInfo, then saves to server.
+ * Stage the provider namespace after hydration, then update live state only after persistence.
  */
 async function saveProviderLink(char, provider, linkInfo) {
     if (!char?.avatar) throw new Error('No character or avatar');
+    await hydrateCharacter(char);
+    if (!extensionsReady(char)) throw new Error('Could not load the existing provider link');
 
     // Non-blocking auto-snapshot before link (overwrites the cl namespace).
     if (window.autoSnapshotBeforeChange) {
         try { await window.autoSnapshotBeforeChange(char, 'link'); } catch (_) {}
     }
 
-    // Populate provider namespace + drop cl in-memory so the spread carries the new link and the cl-delete has a target.
-    provider.setLinkInfo(char, linkInfo);
+    const staged = {
+        ...char,
+        data: { ...char.data, extensions: structuredClone(char.data?.extensions || char.extensions || {}) },
+    };
+    provider.setLinkInfo(staged, linkInfo);
+    const namespace = staged.data.extensions[provider.id];
     const charInArray = allCharacters.find(c => c.avatar === char.avatar);
-    if (charInArray && charInArray !== char) {
-        provider.setLinkInfo(charInArray, linkInfo);
-    }
-    for (const c of [char, charInArray].filter(Boolean)) {
-        if (c.data?.extensions && 'cl' in c.data.extensions) delete c.data.extensions.cl;
-    }
 
-    // Persist via applyCardFieldUpdates; the provider namespace rides the existing-extensions spread, so only the cl-delete is a dot-path update.
-    const success = await window.applyCardFieldUpdates(char.avatar, {
+    const result = await writeCardFields(char, {
+        [`extensions.${provider.id}`]: namespace ?? ST_UNSET_SENTINEL,
         'extensions.cl': ST_UNSET_SENTINEL,
-    });
-    if (!success) throw new Error('Failed to save provider link');
+    }, { surgical: true });
+    if (!result.ok) throw new Error('Failed to save provider link');
 
     // Recompute the listing-name + tagline search keys (CL-side state outside char.data; helper doesnt know about it).
     const listingName = getListingNameFromExtensions(char);
@@ -22008,11 +22028,18 @@ async function saveProviderLink(char, provider, linkInfo) {
         charInArray._lowerTagline = char._lowerTagline;
     }
 
-    // Same-tick ST sync: setLinkInfo on mainChar makes the new link visible immediately, ahead of the async refetch.
+    // Same-tick ST sync uses the exact persisted namespace, including its timestamp.
     try {
         const context = getSTContext();
         const mainChar = context?.characters?.find(c => c.avatar === char.avatar);
-        if (mainChar) provider.setLinkInfo(mainChar, linkInfo);
+        if (mainChar) {
+            mainChar.data ||= {};
+            mainChar.data.extensions ||= {};
+            if (namespace) mainChar.data.extensions[provider.id] = structuredClone(namespace);
+            else delete mainChar.data.extensions[provider.id];
+            delete mainChar.data.extensions.cl;
+        }
+        await notifySTCharacterEdited(char.avatar);
     } catch (_) { /* non-critical */ }
 }
 

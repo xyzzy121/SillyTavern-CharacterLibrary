@@ -425,18 +425,27 @@ class ChartavernProvider extends ProviderBase {
                     return cardData;
                 }
             } catch (e) {
+                if (e.name === 'AbortError') throw e;
                 console.warn('[ChartavernProvider] PNG extraction failed, falling back to detail API:', e.message);
             }
 
             // Fallback: detail API only (alternate_greetings will be empty)
             const data = await fetchCharacterDetail(parts[0], parts[1], api?.apiRequest);
-            if (!data?.card) return null;
+            if (!data?.card || Array.isArray(data.card) || typeof data.card.name !== 'string') {
+                throw new Error('CharacterTavern returned an invalid character detail response');
+            }
             const result = buildV2FromDetail(data.card, parts[0]);
-            if (result) result._listingName = this.getListingName(data.card);
+            if (result) {
+                result._listingName = this.getListingName(data.card);
+                // These fields are only present in the exported PNG, never in detail API.
+                result._unavailableFields = new Set(['alternate_greetings']);
+                result._lorebookUnavailable = true;
+            }
             return result;
         } catch (e) {
             console.error('[ChartavernProvider] fetchRemoteCard failed:', linkInfo.fullPath, e);
-            return null;
+            if (e.notFound) return null;
+            throw e;
         }
     }
 

@@ -239,8 +239,8 @@ class ChubProvider extends ProviderBase {
 
     // ── Remote Data ─────────────────────────────────────────
 
-    async fetchMetadata(fullPath) {
-        return fetchChubMetadata(fullPath);
+    async fetchMetadata(fullPath, options = {}) {
+        return fetchChubMetadata(fullPath, options);
     }
 
     /**
@@ -258,7 +258,8 @@ class ChubProvider extends ProviderBase {
         const useV4 = api?.getSetting('chubUseV4Api') || false;
 
         try {
-            const metadata = await this.fetchMetadata(fullPath);
+            const metadata = await this.fetchMetadata(fullPath, { strict: true });
+            if (!metadata) return null;
             const projectId = metadata?.id;
 
             const _listingName = this.getListingName(metadata);
@@ -294,18 +295,14 @@ class ChubProvider extends ProviderBase {
 
             // Last resort: PNG extraction
             const pngUrl = `${CHUB_AVATAR_BASE}${fullPath}/chara_card_v2.png`;
-            let response;
-            try { response = await fetch(pngUrl); }
-            catch { response = await fetch(`/proxy/${proxyEncode(pngUrl)}`); }
-            if (response.ok) {
-                const buffer = await response.arrayBuffer();
-                const cardData = api?.extractCharacterDataFromPng?.(buffer);
-                if (cardData) return cardData;
-            }
-            return null;
+            const response = await fetchWithProxy(pngUrl);
+            const buffer = await response.arrayBuffer();
+            const cardData = api?.extractCharacterDataFromPng?.(buffer);
+            if (cardData) return cardData;
+            throw new Error('Chub export did not contain a valid character card');
         } catch (e) {
             console.error('[ChubProvider] fetchRemoteCard failed:', fullPath, e);
-            return null;
+            throw e;
         }
     }
 

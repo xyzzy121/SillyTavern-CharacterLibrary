@@ -11,8 +11,7 @@ const STORAGE_VERSION = 1;
 
 let playlistsData = null;   // { version, playlists: {}, order: [] }
 let loaded = false;
-let saving = false;
-let saveQueued = false;
+let mutationQueue = Promise.resolve();
 
 // ========================================
 // FILE I/O
@@ -29,15 +28,11 @@ async function fileUpload(name, data) {
 }
 
 async function fileRead(name) {
-    try {
-        const resp = await fetch(`/user/files/${name}`);
-        if (!resp.ok) return null;
-        const text = await resp.text();
-        if (!text || !text.trim()) return null;
-        return JSON.parse(text);
-    } catch {
-        return null;
-    }
+    const resp = await fetch(`/user/files/${name}`, { cache: 'no-store' });
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error(`Could not read playlists (HTTP ${resp.status})`);
+    // A failed or corrupt read must never turn into an empty store that the next edit overwrites.
+    return JSON.parse(await resp.text());
 }
 
 // ========================================
@@ -62,45 +57,48 @@ async function loadPlaylists() {
     if (_loadingPromise) return _loadingPromise;
     _loadingPromise = (async () => {
         const data = await fileRead(PLAYLISTS_FILE);
-        if (data && data.version && data.playlists) {
+        if (data && data.version && data.playlists && typeof data.playlists === 'object' && !Array.isArray(data.playlists)) {
             playlistsData = data;
             const ids = Object.keys(data.playlists);
-            const orderSet = new Set(data.order || []);
+            playlistsData.order = [...new Set(Array.isArray(data.order) ? data.order : [])];
+            const orderSet = new Set(playlistsData.order);
             for (const id of ids) {
                 if (!orderSet.has(id)) {
                     playlistsData.order.push(id);
                 }
             }
             playlistsData.order = playlistsData.order.filter(id => data.playlists[id]);
-        } else {
+        } else if (data === null) {
             playlistsData = createEmptyData();
+        } else {
+            throw new Error('Invalid playlists file; existing data was not changed');
         }
         loaded = true;
-        _loadingPromise = null;
         return playlistsData;
-    })();
+    })().finally(() => { _loadingPromise = null; });
     return _loadingPromise;
 }
 
-async function savePlaylists() {
-    if (!playlistsData) return;
-    if (saving) {
-        saveQueued = true;
-        return;
-    }
-    saving = true;
-    try {
-        await fileUpload(PLAYLISTS_FILE, playlistsData);
-    } catch (e) {
-        console.error('[Playlists] Save failed:', e.message);
-        CoreAPI.showToast('Failed to save playlists', 'error');
-    } finally {
-        saving = false;
-        if (saveQueued) {
-            saveQueued = false;
-            savePlaylists();
+function savePlaylists(mutate) {
+    // Each caller waits for its own transaction. Reads and later mutations only
+    // see confirmed data, so a failed write cannot leak into a subsequent save.
+    const pending = mutationQueue.catch(() => {}).then(async () => {
+        await loadPlaylists();
+        const draft = JSON.parse(JSON.stringify(playlistsData));
+        const result = mutate(draft);
+        if (JSON.stringify(draft) === JSON.stringify(playlistsData)) return result;
+        try {
+            await fileUpload(PLAYLISTS_FILE, draft);
+        } catch (e) {
+            console.error('[Playlists] Save failed:', e.message);
+            CoreAPI.showToast('Failed to save playlists. Your previous playlists are unchanged.', 'error');
+            return false;
         }
-    }
+        playlistsData = draft;
+        return result;
+    });
+    mutationQueue = pending;
+    return pending;
 }
 
 // ========================================
@@ -108,28 +106,30 @@ async function savePlaylists() {
 // ========================================
 
 async function createPlaylist(name, description = '') {
-    await loadPlaylists();
-    const uid = generateUid();
-    playlistsData.playlists[uid] = {
-        name: name.trim(),
-        description: description.trim(),
-        icon: '',
-        color: '',
-        created: Date.now(),
-        modified: Date.now(),
-        characters: [],
-    };
-    playlistsData.order.push(uid);
-    await savePlaylists();
-    return uid;
+    return savePlaylists(data => {
+        const uid = generateUid();
+        data.playlists[uid] = {
+            name: name.trim(),
+            description: description.trim(),
+            icon: '',
+            color: '',
+            created: Date.now(),
+            modified: Date.now(),
+            characters: [],
+        };
+        data.order.push(uid);
+        return uid;
+    });
 }
 
 async function deletePlaylist(uid) {
-    await loadPlaylists();
-    if (!playlistsData.playlists[uid]) return false;
-    delete playlistsData.playlists[uid];
-    playlistsData.order = playlistsData.order.filter(id => id !== uid);
-    await savePlaylists();
+    const deleted = await savePlaylists(data => {
+        if (!data.playlists[uid]) return false;
+        delete data.playlists[uid];
+        data.order = data.order.filter(id => id !== uid);
+        return true;
+    });
+    if (!deleted) return false;
     // drop the filter if it was pointing here, plus repaint badges/sidebar
     CoreAPI.refreshPlaylistFilterIfActive(uid);
     CoreAPI.refreshPlaylistBadges();
@@ -137,34 +137,37 @@ async function deletePlaylist(uid) {
 }
 
 async function updatePlaylist(uid, updates) {
-    await loadPlaylists();
-    const pl = playlistsData.playlists[uid];
-    if (!pl) return false;
-    if (updates.name !== undefined) pl.name = updates.name.trim();
-    if (updates.description !== undefined) pl.description = updates.description.trim();
-    if (updates.icon !== undefined) pl.icon = updates.icon;
-    if (updates.color !== undefined) pl.color = updates.color;
-    pl.modified = Date.now();
-    await savePlaylists();
-    return true;
+    const submitted = { ...updates };
+    return savePlaylists(data => {
+        const pl = data.playlists[uid];
+        if (!pl) return false;
+        if (submitted.name !== undefined) pl.name = submitted.name.trim();
+        if (submitted.description !== undefined) pl.description = submitted.description.trim();
+        if (submitted.icon !== undefined) pl.icon = submitted.icon;
+        if (submitted.color !== undefined) pl.color = submitted.color;
+        pl.modified = Date.now();
+        return true;
+    });
 }
 
 async function addToPlaylist(uid, avatars) {
-    await loadPlaylists();
-    const pl = playlistsData.playlists[uid];
-    if (!pl) return false;
-    const existing = new Set(pl.characters);
-    let added = 0;
-    for (const avatar of avatars) {
-        if (!existing.has(avatar)) {
-            pl.characters.push(avatar);
-            existing.add(avatar);
-            added++;
+    const submitted = [...avatars];
+    const added = await savePlaylists(data => {
+        const pl = data.playlists[uid];
+        if (!pl) return false;
+        const existing = new Set(pl.characters);
+        let count = 0;
+        for (const avatar of submitted) {
+            if (!existing.has(avatar)) {
+                pl.characters.push(avatar);
+                existing.add(avatar);
+                count++;
+            }
         }
-    }
+        if (count > 0) pl.modified = Date.now();
+        return count;
+    });
     if (added > 0) {
-        pl.modified = Date.now();
-        await savePlaylists();
         CoreAPI.refreshPlaylistFilterIfActive(uid);
         CoreAPI.refreshPlaylistBadges();
     }
@@ -172,19 +175,20 @@ async function addToPlaylist(uid, avatars) {
 }
 
 async function removeFromPlaylist(uid, avatars) {
-    await loadPlaylists();
-    const pl = playlistsData.playlists[uid];
-    if (!pl) return false;
     const removeSet = new Set(avatars);
-    const before = pl.characters.length;
-    pl.characters = pl.characters.filter(a => !removeSet.has(a));
-    if (pl.characters.length !== before) {
-        pl.modified = Date.now();
-        await savePlaylists();
+    const removed = await savePlaylists(data => {
+        const pl = data.playlists[uid];
+        if (!pl) return false;
+        const before = pl.characters.length;
+        pl.characters = pl.characters.filter(a => !removeSet.has(a));
+        if (pl.characters.length !== before) pl.modified = Date.now();
+        return before - pl.characters.length;
+    });
+    if (removed > 0) {
         CoreAPI.refreshPlaylistFilterIfActive(uid);
         CoreAPI.refreshPlaylistBadges();
     }
-    return before - pl.characters.length;
+    return removed;
 }
 
 // ========================================
@@ -249,27 +253,23 @@ function isCharInAnyPlaylist(avatar) {
 
 async function onCharacterDeleted(avatar) {
     if (!playlistsData) return;
-    let changed = false;
-    for (const pl of Object.values(playlistsData.playlists)) {
-        const idx = pl.characters.indexOf(avatar);
-        if (idx !== -1) {
-            pl.characters.splice(idx, 1);
-            changed = true;
+    return savePlaylists(data => {
+        for (const pl of Object.values(data.playlists)) {
+            pl.characters = pl.characters.filter(a => a !== avatar);
         }
-    }
-    if (changed) await savePlaylists();
+        return true;
+    });
 }
 
 async function pruneDeletedCharacters() {
     if (!playlistsData) return;
     const validAvatars = new Set(CoreAPI.getAllCharacters().map(c => c.avatar));
-    let changed = false;
-    for (const pl of Object.values(playlistsData.playlists)) {
-        const before = pl.characters.length;
-        pl.characters = pl.characters.filter(a => validAvatars.has(a));
-        if (pl.characters.length !== before) changed = true;
-    }
-    if (changed) await savePlaylists();
+    return savePlaylists(data => {
+        for (const pl of Object.values(data.playlists)) {
+            pl.characters = pl.characters.filter(a => validAvatars.has(a));
+        }
+        return true;
+    });
 }
 
 // ========================================
@@ -412,7 +412,7 @@ async function handlePickerRowClick(e) {
     const inCount = pl.characters.filter(a => targetSet.has(a)).length;
 
     if (inCount === pickerAvatars.length) {
-        await removeFromPlaylist(uid, pickerAvatars);
+        if (await removeFromPlaylist(uid, pickerAvatars) === false) return;
         CoreAPI.showToast(`Removed from "${pl.name}"`, 'info');
     } else {
         const added = await addToPlaylist(uid, pickerAvatars);
@@ -426,6 +426,7 @@ async function handlePickerCreate() {
     const input = document.getElementById('playlistPickerSearch');
     const name = (input?.value || '').trim();
     if (!name) return;
+    const selectedAvatars = [...pickerAvatars];
 
     if (playlistNameExists(name)) {
         CoreAPI.showToast(`A playlist named "${name}" already exists`, 'warning');
@@ -433,10 +434,14 @@ async function handlePickerCreate() {
     }
 
     const uid = await createPlaylist(name);
-    if (pickerAvatars.length) {
-        await addToPlaylist(uid, pickerAvatars);
+    if (!uid) return;
+    if (selectedAvatars.length) {
+        if (await addToPlaylist(uid, selectedAvatars) === false) {
+            renderPickerList();
+            return;
+        }
     }
-    input.value = '';
+    if (input.value.trim() === name) input.value = '';
     renderPickerList();
     CoreAPI.showToast(`Created "${name}"`, 'success');
 }
@@ -684,7 +689,7 @@ function toggleIconPicker(btn) {
 }
 
 async function handleManageIconChange(uid, icon) {
-    await updatePlaylist(uid, { icon });
+    if (!await updatePlaylist(uid, { icon })) return;
     if (iconPickerEl) {
         iconPickerEl.classList.add('hidden');
         activeIconPickerUid = null;
@@ -693,7 +698,7 @@ async function handleManageIconChange(uid, icon) {
 }
 
 async function handleManageColorChange(uid, color) {
-    await updatePlaylist(uid, { color });
+    if (!await updatePlaylist(uid, { color })) return;
     if (iconPickerEl) {
         iconPickerEl.classList.add('hidden');
         activeIconPickerUid = null;
@@ -709,7 +714,7 @@ async function handleManageRename(uid, newName) {
         renderManageList();
         return;
     }
-    await updatePlaylist(uid, { name: trimmed });
+    if (!await updatePlaylist(uid, { name: trimmed })) renderManageList();
 }
 
 async function handleManageDelete(uid) {
@@ -722,7 +727,7 @@ async function handleManageDelete(uid) {
 
     if (!confirm(msg)) return;
 
-    await deletePlaylist(uid);
+    if (!await deletePlaylist(uid)) return;
     renderManageList();
     CoreAPI.showToast(`Deleted "${pl.name}"`, 'info');
 }
@@ -737,8 +742,8 @@ async function handleManageCreate() {
         return;
     }
 
-    await createPlaylist(name);
-    input.value = '';
+    if (!await createPlaylist(name)) return;
+    if (input.value.trim() === name) input.value = '';
     renderManageList();
     CoreAPI.showToast(`Created "${name}"`, 'success');
 }

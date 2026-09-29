@@ -52,7 +52,7 @@ export function getChubHeaders(includeAuth = true) {
 }
 
 export { fetchWithProxy } from '../provider-utils.js';
-import { proxyEncode } from '../provider-utils.js';
+import { proxyEncode, readJsonClassified } from '../provider-utils.js';
 
 // ========================================
 // RESPONSE HELPERS
@@ -88,7 +88,7 @@ const CHUB_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
  * @param {string} fullPath - e.g. "creator/slug"
  * @returns {Promise<Object|null>}
  */
-export async function fetchChubMetadata(fullPath) {
+export async function fetchChubMetadata(fullPath, { strict = false } = {}) {
     const cached = chubMetadataCache.get(fullPath);
     if (cached && Date.now() - cached.time < CHUB_CACHE_TTL) {
         debugLog('[Chub] Using cached metadata for:', fullPath);
@@ -103,23 +103,13 @@ export async function fetchChubMetadata(fullPath) {
         try {
             response = await fetch(url, { headers: getChubHeaders(true) });
         } catch (directError) {
+            if (directError.name === 'AbortError') throw directError;
             debugLog('[Chub] Direct fetch failed, trying proxy:', directError.message);
             const proxyUrl = `/proxy/${proxyEncode(url)}`;
             response = await fetch(proxyUrl, { headers: getChubHeaders(true) });
         }
 
-        if (!response.ok) {
-            if (response.status === 404) {
-                const text = await response.text();
-                if (text.includes('CORS proxy is disabled')) {
-                    console.error('[Chub] CORS blocked and proxy is disabled');
-                    return null;
-                }
-            }
-            return null;
-        }
-
-        const data = await response.json();
+        const data = await readJsonClassified(response);
         const result = data.node || null;
 
         if (result) {
@@ -134,7 +124,7 @@ export async function fetchChubMetadata(fullPath) {
                 max_res_url: result.max_res_url,
                 hasGallery: result.hasGallery,
                 creator: result.creator,
-                definition: {
+                definition: result.definition ? {
                     name: def.name,
                     personality: def.personality,
                     tavern_personality: def.tavern_personality,
@@ -149,7 +139,7 @@ export async function fetchChubMetadata(fullPath) {
                     character_version: def.character_version,
                     tagline: def.tagline,
                     embedded_lorebook: def.embedded_lorebook,
-                },
+                } : null,
                 related_lorebooks: result.related_lorebooks || [],
                 lastActivityAt: result.lastActivityAt || result.last_activity_at || null,
                 createdAt: result.createdAt || result.created_at || null,
@@ -166,8 +156,10 @@ export async function fetchChubMetadata(fullPath) {
             return strippedResult;
         }
 
+        if (strict) throw new Error('Chub returned an invalid character metadata response');
         return result;
     } catch (error) {
+        if (strict && !error.notFound) throw error;
         return null;
     }
 }
@@ -248,11 +240,16 @@ export async function buildCharacterCardFromChub(apiData) {
     const def = apiData.definition || {};
 
     let characterBook = def.embedded_lorebook || undefined;
+    let lorebookUnavailable = false;
     if (apiData.related_lorebooks?.length > 0 && apiData.id) {
+        lorebookUnavailable = true;
         try {
             debugLog('[Chub] Resolving linked lorebook for import via V4 Git API');
             const linked = await fetchChubLinkedLorebook(apiData.id);
-            if (linked?.entries?.length > 0) characterBook = linked;
+            if (linked?.entries?.length > 0) {
+                characterBook = linked;
+                lorebookUnavailable = false;
+            }
         } catch (e) {
             console.warn('[Chub] Failed to fetch linked lorebook for', apiData.fullPath, e);
         }
@@ -261,6 +258,7 @@ export async function buildCharacterCardFromChub(apiData) {
     return {
         spec: 'chara_card_v2',
         spec_version: '2.0',
+        ...(lorebookUnavailable && { _lorebookUnavailable: true }),
         data: {
             name: def.name || apiData.name || 'Unknown',
             description: def.personality || '',

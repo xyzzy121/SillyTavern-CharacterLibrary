@@ -168,7 +168,7 @@ class SaucepanProvider extends ProviderBase {
     async fetchLinkStats(linkInfo) {
         if (!linkInfo?.id) return null;
         try {
-            const companion = await fetchSaucepanCompanion(linkInfo.id);
+            const companion = await fetchSaucepanCompanion(linkInfo.id, { strict: true });
             if (!companion) return null;
             const chats = parseInt(companion.chat_count, 10) || 0;
             const favorites = parseInt(companion.favorite_count, 10) || 0;
@@ -202,9 +202,12 @@ class SaucepanProvider extends ProviderBase {
             const extractResult = await submitSaucepanExtraction(saucepanCompanionUrl(linkInfo.id));
             if (!extractResult.success) {
                 api?.debugLog?.('[SaucepanProvider] native extraction failed:', extractResult.error);
-                return null;
+                throw Object.assign(new Error(extractResult.error || 'Saucepan definition could not be retrieved'), {
+                    code: extractResult.locked ? 'creator_restricted' : 'export_failed',
+                });
             }
             const result = buildV2FromSaucepan(hit, extractResult);
+            if (!result) throw new Error('Saucepan returned an invalid or empty definition');
             if (result) {
                 result._listingName = this.getListingName(hit);
                 // extraction never fetches a lorebook, so character_book is unread, not empty
@@ -221,7 +224,8 @@ class SaucepanProvider extends ProviderBase {
             return result;
         } catch (e) {
             console.error('[SaucepanProvider] fetchRemoteCard failed:', linkInfo.id, e);
-            return null;
+            if (e.notFound) return null;
+            throw e;
         }
     }
 

@@ -13,6 +13,7 @@ let isInitialized = false;
 let currentImages = [];
 let currentIndex = 0;
 let currentCharacter = null;
+let galleryLoadGeneration = 0;
 let currentZoom = 1;
 let panX = 0;
 let panY = 0;
@@ -74,6 +75,7 @@ export async function openViewer(char, startIndex = 0) {
         return;
     }
     
+    const generation = ++galleryLoadGeneration;
     currentCharacter = char;
     currentImages = [];
     currentIndex = 0;
@@ -95,7 +97,8 @@ export async function openViewer(char, startIndex = 0) {
     
     // Fetch gallery images
     try {
-        const images = await fetchGalleryImages(char);
+        const images = await fetchGalleryImages(char, generation);
+        if (generation !== galleryLoadGeneration) return;
         currentImages = images;
         
         loader?.classList.add('hidden');
@@ -114,6 +117,7 @@ export async function openViewer(char, startIndex = 0) {
         showImage(validIndex);
         
     } catch (err) {
+        if (generation !== galleryLoadGeneration) return;
         console.error('[GalleryViewer] Failed to load gallery:', err);
         loader?.classList.add('hidden');
         emptyState?.classList.remove('hidden');
@@ -127,6 +131,7 @@ export function openViewerWithImages(images, startIndex = 0, title = 'Gallery', 
         return;
     }
     
+    galleryLoadGeneration++;
     currentCharacter = null;
     currentImages = images;
     currentIndex = 0;
@@ -159,6 +164,7 @@ export function openViewerWithImages(images, startIndex = 0, title = 'Gallery', 
 }
 
 export function closeViewer() {
+    galleryLoadGeneration++;
     const modal = document.getElementById('galleryViewerModal');
     const videoEl = document.getElementById('galleryViewerVideo');
     
@@ -210,7 +216,7 @@ export function closeViewer() {
     _lastNavDirection = 1;
 }
 
-async function fetchGalleryImages(char) {
+async function fetchGalleryImages(char, generation) {
     const folderName = CoreAPI.getGalleryFolderName(char);
     
     debugLog('[GalleryViewer] Fetching images for folder:', folderName);
@@ -233,7 +239,7 @@ async function fetchGalleryImages(char) {
     );
     
     const safeFolderName = CoreAPI.sanitizeFolderName(folderName);
-    _currentFolder = safeFolderName;
+    if (generation === galleryLoadGeneration) _currentFolder = safeFolderName;
 
     return mediaFiles.map(fileName => {
         const isVideoFile = fileName.match(/\.(mp4|webm|mov|avi|mkv|m4v)$/i);

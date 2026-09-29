@@ -22,15 +22,14 @@ async function fileUpload(name, data) {
 }
 
 async function fileRead(name) {
-    try {
-        const resp = await fetch(`/user/files/${name}`);
-        if (!resp.ok) return null;
-        const text = await resp.text();
-        if (!text || !text.trim()) return null;
-        return JSON.parse(text);
-    } catch {
-        return null;
-    }
+    const resp = await fetch(`/user/files/${name}`, { cache: 'no-store' });
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error(`Could not read saved snippets (HTTP ${resp.status})`);
+    // Only a missing file starts an empty store. Failed/corrupt reads must never
+    // allow a later edit to overwrite existing snippets with a fresh collection.
+    const data = JSON.parse(await resp.text());
+    if (data === null) throw new Error('Invalid snippets file; existing data was not changed');
+    return data;
 }
 
 // ========================================
@@ -39,8 +38,7 @@ async function fileRead(name) {
 
 let snippetsData = null;       // { version, snippets: [...], order: [...] }
 let loaded = false;
-let saving = false;
-let saveQueued = false;
+let snippetWriteQueue = Promise.resolve();
 let _loadingPromise = null;
 
 function createEmptyData() {
@@ -59,7 +57,9 @@ async function loadSnippets() {
     if (_loadingPromise) return _loadingPromise;
     _loadingPromise = (async () => {
         const data = await fileRead(SNIPPETS_FILE);
-        if (data && data.version && Array.isArray(data.snippets)) {
+        if (data && data.version === STORAGE_VERSION && Array.isArray(data.snippets)
+            && data.snippets.every(s => s && typeof s === 'object' && !Array.isArray(s)
+                && typeof s.id === 'string' && s.id.length > 0)) {
             snippetsData = {
                 version: STORAGE_VERSION,
                 snippets: data.snippets,
@@ -71,35 +71,38 @@ async function loadSnippets() {
                 if (!orderSet.has(id)) snippetsData.order.push(id);
             }
             snippetsData.order = snippetsData.order.filter(id => ids.has(id));
-        } else {
+        } else if (data === null) {
             snippetsData = createEmptyData();
+        } else {
+            throw new Error('Invalid snippets file; existing data was not changed');
         }
         loaded = true;
-        _loadingPromise = null;
         return snippetsData;
-    })();
+    })().finally(() => { _loadingPromise = null; });
     return _loadingPromise;
 }
 
-async function saveSnippetsFile() {
-    if (!snippetsData) return;
-    if (saving) {
-        saveQueued = true;
-        return;
-    }
-    saving = true;
-    try {
-        await fileUpload(SNIPPETS_FILE, snippetsData);
-    } catch (e) {
-        console.error('[CustomCSS] Save failed:', e.message);
-        CoreAPI.showToast?.('Failed to save snippets', 'error');
-    } finally {
-        saving = false;
-        if (saveQueued) {
-            saveQueued = false;
-            saveSnippetsFile();
+function saveSnippetChange(mutate) {
+    // Serialize whole mutations, not just uploads. A failed write must not become the
+    // next operation's saved baseline, and each caller must await its own disk write.
+    const operation = snippetWriteQueue.then(async () => {
+        try {
+            await loadSnippets();
+            const draft = JSON.parse(JSON.stringify(snippetsData));
+            const result = mutate(draft);
+            if (result === null) return null;
+            if (JSON.stringify(draft) === JSON.stringify(snippetsData)) return result;
+            await fileUpload(SNIPPETS_FILE, draft);
+            snippetsData = draft;
+            return result;
+        } catch (e) {
+            console.error('[CustomCSS] Save failed:', e.message);
+            CoreAPI.showToast?.('Failed to save snippets. Your changes have not been saved.', 'error');
+            return null;
         }
-    }
+    });
+    snippetWriteQueue = operation.catch(() => {});
+    return operation;
 }
 
 function getOrderedSnippets() {
@@ -129,16 +132,15 @@ function buildEnabledBundle() {
 }
 
 async function updateSnippet(id, patch) {
-    await loadSnippets();
-    const idx = snippetsData.snippets.findIndex(s => s.id === id);
-    if (idx === -1) return null;
-    snippetsData.snippets[idx] = { ...snippetsData.snippets[idx], ...patch, modified: Date.now() };
-    await saveSnippetsFile();
-    return snippetsData.snippets[idx];
+    return saveSnippetChange(draft => {
+        const idx = draft.snippets.findIndex(s => s.id === id);
+        if (idx === -1) return null;
+        draft.snippets[idx] = { ...draft.snippets[idx], ...patch, modified: Date.now() };
+        return draft.snippets[idx];
+    });
 }
 
 async function createSnippet(nameOrOpts = 'New Snippet') {
-    await loadSnippets();
     const opts = typeof nameOrOpts === 'string' ? { name: nameOrOpts } : (nameOrOpts || {});
     const snippet = {
         id: genId(),
@@ -149,51 +151,54 @@ async function createSnippet(nameOrOpts = 'New Snippet') {
         created: Date.now(),
         modified: Date.now(),
     };
-    snippetsData.snippets.push(snippet);
-    snippetsData.order.push(snippet.id);
-    await saveSnippetsFile();
-    return snippet;
+    return saveSnippetChange(draft => {
+        draft.snippets.push(snippet);
+        draft.order.push(snippet.id);
+        return snippet;
+    });
 }
 
 async function deleteSnippetById(id) {
-    await loadSnippets();
-    snippetsData.snippets = snippetsData.snippets.filter(s => s.id !== id);
-    snippetsData.order = snippetsData.order.filter(x => x !== id);
-    await saveSnippetsFile();
+    return saveSnippetChange(draft => {
+        draft.snippets = draft.snippets.filter(s => s.id !== id);
+        draft.order = draft.order.filter(x => x !== id);
+        return true;
+    });
 }
 
 // Pause all enabled snippets in one load+save. Used by Apply Raw.
 async function disableAllEnabledSnippets() {
-    await loadSnippets();
-    const now = Date.now();
-    let count = 0;
-    for (const s of snippetsData.snippets) {
-        if (s.enabled) {
-            s.enabled = false;
-            s.modified = now;
-            count++;
+    return saveSnippetChange(draft => {
+        const now = Date.now();
+        let count = 0;
+        for (const s of draft.snippets) {
+            if (s.enabled) {
+                s.enabled = false;
+                s.modified = now;
+                count++;
+            }
         }
-    }
-    if (count > 0) await saveSnippetsFile();
-    return count;
+        return count;
+    });
 }
 
 async function reorderSnippets(newOrderIds) {
-    await loadSnippets();
-    const ids = new Set(snippetsData.snippets.map(s => s.id));
-    const seen = new Set();
-    const next = [];
-    for (const id of newOrderIds) {
-        if (ids.has(id) && !seen.has(id)) {
-            next.push(id);
-            seen.add(id);
+    return saveSnippetChange(draft => {
+        const ids = new Set(draft.snippets.map(s => s.id));
+        const seen = new Set();
+        const next = [];
+        for (const id of newOrderIds) {
+            if (ids.has(id) && !seen.has(id)) {
+                next.push(id);
+                seen.add(id);
+            }
         }
-    }
-    for (const s of snippetsData.snippets) {
-        if (!seen.has(s.id)) next.push(s.id);
-    }
-    snippetsData.order = next;
-    await saveSnippetsFile();
+        for (const s of draft.snippets) {
+            if (!seen.has(s.id)) next.push(s.id);
+        }
+        draft.order = next;
+        return true;
+    });
 }
 
 // ========================================
@@ -603,14 +608,20 @@ async function saveActiveSnippet() {
         CoreAPI.showToast?.(`Snippet exceeds ${formatKB(max)} limit`, 'error');
         return;
     }
-    await updateSnippet(activeSnippetId, {
+    const savedId = activeSnippetId;
+    const submitted = {
         name: nameInput.value.trim() || 'Untitled',
         enabled: enabledInput.checked,
         css: cssTextarea.value,
-    });
-    editorDirty = false;
+    };
+    const saved = await updateSnippet(savedId, submitted);
+    if (!saved) return;
     setSnippetsDirty(true);
-    statusLabel.textContent = 'Saved (click Apply to publish)';
+    if (activeSnippetId === savedId) {
+        editorDirty = (nameInput.value.trim() || 'Untitled') !== submitted.name
+            || enabledInput.checked !== submitted.enabled || cssTextarea.value !== submitted.css;
+        statusLabel.textContent = editorDirty ? 'Unsaved' : 'Saved (click Apply to publish)';
+    }
     renderSidebar();
     CoreAPI.showToast?.('Snippet saved', 'success', 1500);
 }
@@ -710,7 +721,10 @@ function injectModal() {
         const checkbox = e.target.closest('.ccss-snippet-enable');
         if (checkbox) {
             const id = checkbox.dataset.id;
-            await updateSnippet(id, { enabled: checkbox.checked });
+            if (!(await updateSnippet(id, { enabled: checkbox.checked }))) {
+                checkbox.checked = !!findSnippet(id)?.enabled;
+                return;
+            }
             setSnippetsDirty(true);
             if (id === activeSnippetId) {
                 const enabledInput = document.getElementById('ccssSnippetEnabled');
@@ -723,7 +737,7 @@ function injectModal() {
     let dragItem = null;
     const persistOrderFromDOM = async () => {
         const ids = [...list.querySelectorAll('.ccss-snippet-item')].map(el => el.dataset.id);
-        await reorderSnippets(ids);
+        if (!(await reorderSnippets(ids))) { renderSidebar(); return; }
         setSnippetsDirty(true);
     };
 
@@ -807,6 +821,7 @@ function injectModal() {
     document.getElementById('ccssNewBtn')?.addEventListener('click', async () => {
         if (!confirmDiscardIfDirty()) return;
         const snippet = await createSnippet('New Snippet');
+        if (!snippet) return;
         setSnippetsDirty(true);
         loadSnippetIntoEditor(snippet.id);
         closeDrawer();
@@ -847,9 +862,9 @@ function injectModal() {
         if (!window.confirm(`Delete "${snippet.name || 'Untitled'}"? This cannot be undone.`)) return;
         const id = activeSnippetId;
         const wasEnabled = snippet.enabled;
+        if (!(await deleteSnippetById(id))) return;
         activeSnippetId = null;
         editorDirty = false;
-        await deleteSnippetById(id);
         if (wasEnabled) setSnippetsDirty(true);
         loadSnippetIntoEditor(null);
         CoreAPI.showToast?.('Snippet deleted', 'info', 1500);
@@ -886,9 +901,10 @@ function injectModal() {
             const noun = enabledCount === 1 ? 'snippet' : 'snippets';
             if (!window.confirm(`Applying Raw will pause ${enabledCount} enabled ${noun}. Continue?`)) return;
         }
+        const paused = await disableAllEnabledSnippets();
+        if (paused === null) return;
         CoreAPI.setSetting('customCSS', rawTextarea.value);
         CoreAPI.applyCustomCSS();
-        const paused = await disableAllEnabledSnippets();
         renderSidebar();
         setSnippetsDirty(computeSnippetsDirty());
         document.getElementById('ccssRawStatusLabel').textContent = 'Applied';
@@ -910,7 +926,7 @@ function injectModal() {
         const input = window.prompt('Save as snippet (enter a name):', 'Raw Snippet');
         if (input === null) return;
         const name = input.trim() || 'Raw Snippet';
-        await createSnippet({ name, css: rawTextarea.value, enabled: false });
+        if (!(await createSnippet({ name, css: rawTextarea.value, enabled: false }))) return;
         renderSidebar();
         CoreAPI.showToast?.(`Snippet "${name}" saved (disabled)`, 'success', 2000);
     });
@@ -942,7 +958,13 @@ function injectModal() {
 
 async function openModal() {
     injectModal();
-    await loadSnippets();
+    try {
+        await loadSnippets();
+    } catch (err) {
+        console.error('[CustomCSS] Could not load snippets:', err);
+        CoreAPI.showToast?.('Could not load saved snippets. Existing data is unchanged. Reopen the editor to retry.', 'error', 6000);
+        return;
+    }
     setSnippetsDirty(computeSnippetsDirty());
     const mode = getMode();
     setActiveMode(mode);

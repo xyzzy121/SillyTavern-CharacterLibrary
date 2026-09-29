@@ -2,7 +2,7 @@
 // saucepan-browse.js, plus DataCat and the Creator Downloads adapter for
 // creator/companion lookups. All calls go through cl-helper (transport only).
 
-import { CL_HELPER_PLUGIN_BASE } from '../provider-utils.js';
+import { CL_HELPER_PLUGIN_BASE, readJsonClassified } from '../provider-utils.js';
 
 // ========================================
 // CONSTANTS
@@ -435,11 +435,10 @@ async function fetchCompanionResult(id) {
     const promise = (async () => {
         try {
             const response = await saucepanFetch('GET', `/api/v2/companions/${encodeURIComponent(id)}`);
-            let data = null;
-            try { data = await response.json(); } catch { /* non-JSON body */ }
+            const data = await readJsonClassified(response);
             return { ok: response.ok, status: response.status, companion: data?.companion || null };
-        } catch {
-            return { ok: false, status: 0, companion: null };
+        } catch (error) {
+            return { ok: false, status: error.status || 0, companion: null, error };
         }
     })();
     const entry = { promise, ts: Date.now() };
@@ -462,9 +461,13 @@ async function fetchCompanionResult(id) {
  * @param {string} id
  * @returns {Promise<Object|null>}
  */
-export async function fetchSaucepanCompanion(id) {
+export async function fetchSaucepanCompanion(id, { strict = false } = {}) {
     if (!id) return null;
-    return (await fetchCompanionResult(id)).companion;
+    const result = await fetchCompanionResult(id);
+    if (strict && !result.companion && !result.error?.notFound) {
+        throw result.error || new Error('Saucepan returned an invalid companion response');
+    }
+    return result.companion;
 }
 
 /**

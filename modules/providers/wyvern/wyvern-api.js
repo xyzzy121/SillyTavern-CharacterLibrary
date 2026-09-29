@@ -5,6 +5,7 @@
 // receives getSetting + debugLog from CoreAPI.
 
 import CoreAPI from '../../core-api.js';
+import { fetchWithProxy as fetchMetadataWithProxy, readJsonClassified } from '../provider-utils.js';
 
 // ========================================
 // CONSTANTS
@@ -144,7 +145,7 @@ const WYVERN_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
  * @param {string} charId - Wyvern character nanoid (e.g. "_LbhnWCqY3xnBnpaAa8qYt")
  * @returns {Promise<Object|null>}
  */
-export async function fetchWyvernMetadata(charId) {
+export async function fetchWyvernMetadata(charId, { strict = false } = {}) {
     const cached = wyvernMetadataCache.get(charId);
     if (cached && Date.now() - cached.time < WYVERN_CACHE_TTL) {
         debugLog('[Wyvern] Using cached metadata for:', charId);
@@ -155,11 +156,12 @@ export async function fetchWyvernMetadata(charId) {
         const url = `${WYVERN_API_BASE}/characters/${charId}`;
         debugLog('[Wyvern] Fetching metadata from:', url);
 
-        const { fetchWithProxy: fwp } = await import('../provider-utils.js');
-        const response = await fwp(url, { headers: getWyvernHeaders(true) });
+        const response = await fetchMetadataWithProxy(url, { headers: getWyvernHeaders(true) });
 
-        const result = await response.json();
-        if (!result) return null;
+        const result = await readJsonClassified(response);
+        if (!result || typeof result !== 'object' || Array.isArray(result) || !result.id) {
+            throw new Error('Wyvern returned an invalid character metadata response');
+        }
 
         while (wyvernMetadataCache.size >= WYVERN_METADATA_CACHE_MAX) {
             const firstKey = wyvernMetadataCache.keys().next().value;
@@ -168,6 +170,7 @@ export async function fetchWyvernMetadata(charId) {
         wyvernMetadataCache.set(charId, { value: result, time: Date.now() });
         return result;
     } catch (error) {
+        if (strict && !error.notFound) throw error;
         return null;
     }
 }
@@ -327,16 +330,18 @@ function convertWyvernLorebook(lorebooks) {
         : (lb.entries && typeof lb.entries === 'object') ? Object.values(lb.entries)
         : [];
     if (entriesArray.length === 0) return undefined;
+    const numberOrDefault = (value, fallback) => value !== null && value !== undefined && value !== ''
+        && Number.isFinite(Number(value)) ? Number(value) : fallback;
 
     return {
         name: lb.name || '',
         description: lb.description || '',
-        scan_depth: Number(lb.scan_depth) || 2,
-        token_budget: Number(lb.token_budget) || 500,
+        scan_depth: numberOrDefault(lb.scan_depth, 2),
+        token_budget: numberOrDefault(lb.token_budget, 500),
         recursive_scanning: !!lb.recursive_scanning,
         extensions: lb.extensions || {},
         entries: entriesArray.map((e, i) => ({
-            id: Number(e.entry_id) || i,
+            id: numberOrDefault(e.entry_id, i),
             keys: Array.isArray(e.keys) ? e.keys : [],
             secondary_keys: Array.isArray(e.secondary_keys) ? e.secondary_keys : [],
             content: e.content || '',
@@ -345,8 +350,8 @@ function convertWyvernLorebook(lorebooks) {
             selective: !!e.selective,
             constant: !!e.constant,
             case_sensitive: !!e.case_sensitive,
-            insertion_order: Number(e.insertion_order) || 100,
-            priority: Number(e.priority) || 10,
+            insertion_order: numberOrDefault(e.insertion_order, 100),
+            priority: numberOrDefault(e.priority, 10),
             position: e.position === 'after_char' ? 'after_char' : 'before_char',
             extensions: e.extensions || {},
         }))

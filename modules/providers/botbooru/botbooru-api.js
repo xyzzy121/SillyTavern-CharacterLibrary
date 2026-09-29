@@ -97,8 +97,7 @@ export async function fetchWithProxy(url, opts = {}) {
             if (opts.body != null) headers['Content-Type'] = 'application/json';
             const r = await _apiRequest(`${BOTBOORU_PROXY_BASE}${path}`, opts.method || 'GET', null, { headers, body: opts.body });
             if (!r.ok) {
-                const detail = await r.text().catch(() => '');
-                throw new Error(`HTTP ${r.status}${detail ? ': ' + detail.slice(0, 200) : ''}`);
+                await readJsonClassified(r);
             }
             return r;
         }
@@ -200,14 +199,17 @@ export async function fetchBotbooruPost(id) {
  * @param {number|string} id
  * @returns {Promise<Object|null>} { spec, spec_version, data } or null
  */
-export async function fetchBotbooruCard(id) {
+export async function fetchBotbooruCard(id, { strict = false } = {}) {
     try {
         const resp = await fetchWithProxy(getBotbooruDownloadUrl(id, 'json'), { headers: getBotbooruHeaders(true) });
-        const card = await resp.json();
-        if (!card?.data?.name) return null;
+        const card = await readJsonClassified(resp);
+        if (!card?.data || typeof card.data.name !== 'string' || Array.isArray(card.data)) {
+            throw new Error('Botbooru returned an invalid character card');
+        }
         return card;
     } catch (e) {
         debugLog('[Botbooru] card json fetch failed:', id, e.message);
+        if (strict && !e.notFound) throw e;
         return null;
     }
 }

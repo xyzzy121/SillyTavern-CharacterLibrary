@@ -58,7 +58,7 @@ export function openModal(chars) {
 }
 
 function analyzeSelectedTags(characters) {
-    const tagCounts = {};
+    const tagCounts = Object.create(null);
     const totalChars = characters.length;
     
     for (const char of characters) {

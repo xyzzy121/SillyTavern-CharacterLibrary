@@ -907,6 +907,13 @@ function injectExtensionSettings() {
             const mode = e.target.value;
             setDisplayMode(mode);
 
+            // Unset preferences inherit from the current mode. Reflect those new
+            // defaults so an unchecked control cannot silently behave as enabled.
+            const topbarInput = document.getElementById('charlib-show-topbar');
+            const exclusiveInput = document.getElementById('charlib-exclusive-panes');
+            if (topbarInput) topbarInput.checked = getShowTopBar();
+            if (exclusiveInput) exclusiveInput.checked = getExclusivePanes();
+
             // Show/hide embedded-specific options
             const embeddedOpts = document.getElementById('charlib-embedded-options');
             if (embeddedOpts) embeddedOpts.style.display = mode === 'embedded' ? '' : 'none';

@@ -4,6 +4,8 @@ A powerful SillyTavern extension for discovering, organizing, and managing your 
 
 > **Note:** This is a hobby project but things mostly work. Expect bugs, use at your own risk.
 
+**7.3.2 maintenance update:** fixes card-save and linking races, failed storage writes, snapshot and playlist preservation, lorebook and CSS editing, provider update error handling, and launcher settings. Tested with a disposable SillyTavern 1.19.0 instance on desktop and mobile browser layouts. See the [regression and integration validation record](tests/README.md) for coverage, test commands, and remaining live-service checks. The bundled helper remains 1.13.0 and the optional Datacat companion remains 1.0.1.
+
 ## Screenshots
 
 ![Main Gallery View](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_Main.jpg)

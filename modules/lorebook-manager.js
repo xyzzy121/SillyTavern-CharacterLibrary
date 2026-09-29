@@ -177,6 +177,8 @@ let workingWorld = null;      // deep-cloned working copy { entries: {...}, ... 
 let originalSnapshot = '';    // JSON of workingWorld at load/save, for dirty compare
 let diskSnapshot = '';        // JSON of the file AS LOADED (pre-repair), for the save divergence guard
 let dirty = false;
+let worldLoadToken = 0;
+let worldSaveInProgress = false;
 
 let worldSearch = '';
 let worldSort = 'name';
@@ -381,6 +383,7 @@ function closeModal() {
 }
 
 function forceClose() {
+    worldLoadToken++;
     document.getElementById('lorebookModal')?.classList.add('hidden');
     // Release the heavy buffers so a closed manager doesn't pin a full world file + string snapshot
     // + live char refs for the session (the back-to-list and delete paths already did; desktop close was the gap).
@@ -680,6 +683,7 @@ function renderEmptyContent() {
 }
 
 async function selectWorld(fileId) {
+    const loadToken = ++worldLoadToken;
     if (fileId === currentWorld) return;
     if (dirty) {
         const ok = await CoreAPI.showConfirm({
@@ -689,12 +693,13 @@ async function selectWorld(fileId) {
             cancelLabel: 'Keep Editing',
             danger: true,
         });
-        if (!ok) return;
+        if (!ok || loadToken !== worldLoadToken) return;
     }
 
     // No loader on switch: the load is sub-second, so the previous content simply stays until
     // the editor re-renders, which is smoother than flashing a spinner.
     const data = await CoreAPI.getWorldInfoData(fileId);
+    if (loadToken !== worldLoadToken) return;
     if (!data) {
         CoreAPI.showToast('Failed to load lorebook', 'error');
         renderEmptyContent();
@@ -1213,7 +1218,7 @@ function markDirty() {
 function updateSaveButton() {
     const btn = document.getElementById('lbSaveBtn');
     if (!btn) return;
-    btn.disabled = !dirty;
+    btn.disabled = !dirty || worldSaveInProgress;
     btn.classList.toggle('dirty', dirty);
     const label = btn.querySelector('span');
     if (label) label.textContent = dirty ? 'Save *' : 'Saved';
@@ -1313,7 +1318,9 @@ async function confirmDiskDivergence(name) {
 }
 
 async function saveWorld() {
-    if (!dirty || !currentWorld) return;
+    if (!dirty || !currentWorld || worldSaveInProgress) return;
+    const name = currentWorld;
+    const editor = workingWorld;
     // An entry with secondary keys is selective in the V2/V3 spec; keep the flag in sync on save.
     for (const e of Object.values(workingWorld.entries || {})) {
         if (e && Array.isArray(e.keysecondary) && e.keysecondary.length && !e.selective) {
@@ -1321,24 +1328,30 @@ async function saveWorld() {
         }
     }
     const btn = document.getElementById('lbSaveBtn');
+    worldSaveInProgress = true;
     if (btn) { btn.disabled = true; btn.classList.add('saving'); }
-    if (!(await confirmDiskDivergence(currentWorld))) {
-        if (btn) { btn.disabled = false; btn.classList.remove('saving'); }
-        return;
-    }
-    const ok = await CoreAPI.saveWorldInfoData(currentWorld, workingWorld);
-    if (btn) btn.classList.remove('saving');
-    if (ok) {
-        originalSnapshot = JSON.stringify(workingWorld);
-        diskSnapshot = originalSnapshot;
-        dirty = false;
-        entryCountCache.set(currentWorld, Object.keys(workingWorld.entries).length);
-        updateSaveButton();
-        renderWorldList();
+    try {
+        if (!(await confirmDiskDivergence(name))) return;
+        if (currentWorld !== name || workingWorld !== editor) return;
+        // Keep the exact submitted snapshot: typing during the request must remain unsaved.
+        const submitted = JSON.stringify(editor);
+        const ok = await CoreAPI.saveWorldInfoData(name, JSON.parse(submitted));
+        if (!ok) throw new Error('Lorebook write failed');
+        entryCountCache.set(name, Object.keys(JSON.parse(submitted).entries).length);
+        if (currentWorld === name && workingWorld === editor) {
+            originalSnapshot = submitted;
+            diskSnapshot = submitted;
+            dirty = JSON.stringify(editor) !== submitted;
+            renderWorldList();
+        }
         CoreAPI.showToast('Lorebook saved. Reload SillyTavern or re-select the character to apply.', 'success', 5000);
-    } else {
-        if (btn) btn.disabled = false;
+    } catch (err) {
+        console.error('[LorebookManager] Save failed:', err);
         CoreAPI.showToast('Failed to save lorebook', 'error');
+    } finally {
+        worldSaveInProgress = false;
+        if (btn) btn.classList.remove('saving');
+        updateSaveButton();
     }
 }
 
@@ -1406,7 +1419,12 @@ async function doRename(oldName, newName) {
     if (dirty) {
         if (!(await confirmDiskDivergence(oldName))) { renderEditor(); return; }
         const saved = await CoreAPI.saveWorldInfoData(oldName, workingWorld);
-        if (saved) { originalSnapshot = JSON.stringify(workingWorld); diskSnapshot = originalSnapshot; dirty = false; }
+        if (!saved) {
+            CoreAPI.showToast('Could not save pending edits. Lorebook was not renamed.', 'error');
+            renderEditor();
+            return;
+        }
+        originalSnapshot = JSON.stringify(workingWorld); diskSnapshot = originalSnapshot; dirty = false;
     }
     // Snapshot the characters linked to the OLD name before the rename, so we can
     // offer to re-point them (ST's own rename does this; copy+delete alone dangles them).
@@ -2757,6 +2775,7 @@ async function mobileBackToList() {
         });
         if (!ok) return;
     }
+    worldLoadToken++;
     currentWorld = null;
     workingWorld = null;
     dirty = false;

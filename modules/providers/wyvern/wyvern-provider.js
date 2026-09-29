@@ -162,8 +162,8 @@ class WyvernProvider extends ProviderBase {
 
     // ── Remote Data ─────────────────────────────────────────
 
-    async fetchMetadata(charId) {
-        return fetchWyvernMetadata(charId);
+    async fetchMetadata(charId, options = {}) {
+        return fetchWyvernMetadata(charId, options);
     }
 
     /**
@@ -175,14 +175,15 @@ class WyvernProvider extends ProviderBase {
         if (!charId) return null;
 
         try {
-            const metadata = await this.fetchMetadata(charId);
+            const metadata = await this.fetchMetadata(charId, { strict: true });
             if (!metadata) return null;
             const result = buildCharacterCardFromWyvern(metadata);
             if (result) result._listingName = this.getListingName(metadata);
             return result;
         } catch (e) {
             console.error('[WyvernProvider] fetchRemoteCard failed:', charId, e);
-            return null;
+            if (e.notFound) return null;
+            throw e;
         }
     }
 

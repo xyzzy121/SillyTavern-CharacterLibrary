@@ -270,7 +270,7 @@ class BotbooruProvider extends ProviderBase {
     async fetchRemoteCard(linkInfo) {
         if (!linkInfo?.id) return null;
         try {
-            const card = await fetchBotbooruCard(linkInfo.id);
+            const card = await fetchBotbooruCard(linkInfo.id, { strict: true });
             if (!card) return null;
             const post = await fetchBotbooruPost(linkInfo.id);
             const listingName = this.getListingName(post);
@@ -291,11 +291,16 @@ class BotbooruProvider extends ProviderBase {
                     ...(card.data.extensions.botbooru || {}),
                     tagline: post.tagline || null,
                 };
+            } else {
+                // Credit and tagline are enriched from the post during import. A transient
+                // post failure must not replace them with the reuploaded JSON's values.
+                card._unavailableFields = new Set(['creator', 'extensions.botbooru.tagline']);
             }
             return card;
         } catch (e) {
             console.error('[BotbooruProvider] fetchRemoteCard failed:', linkInfo.id, e);
-            return null;
+            if (e.notFound) return null;
+            throw e;
         }
     }
 

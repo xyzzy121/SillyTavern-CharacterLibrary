@@ -3020,7 +3020,10 @@ async function handleCreate() {
 
         await CoreAPI.fetchCharacters(true);
 
-        const newAvatar = result.file_name;
+        // ST's import endpoint returns the file stem, while library/bridge lookups use the PNG filename.
+        const newAvatar = result.file_name
+            ? (result.file_name.toLowerCase().endsWith('.png') ? result.file_name : `${result.file_name}.png`)
+            : null;
         if (newAvatar) CoreAPI.notifySTCharacterAdded(newAvatar);
 
         closeModal();
@@ -3364,11 +3367,11 @@ async function confirmSaveAs() {
         await CoreAPI.fetchCharacters(true);
         closeSaveAsDiff();
         closeModal();
+        saveAsTarget = null;
     } catch (err) {
         console.error('[Creator] Save-as failed:', err);
         CoreAPI.showToast(`Save failed: ${err.message}`, 'error');
     } finally {
-        saveAsTarget = null;
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Changes';
     }

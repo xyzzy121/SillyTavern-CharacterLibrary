@@ -898,7 +898,7 @@ async function addAsSnippet(messageIndex) {
     }
     const name = snippetNameFromCss(css);
     const body = stripTitleComment(css);
-    await createSnippet({ name, css: body, enabled: false });
+    if (!(await createSnippet({ name, css: body, enabled: false }))) return;
     try { renderCustomCssSidebar(); } catch { /* not rendered yet */ }
     try { setSnippetsDirty(true); } catch { /* ditto */ }
     CoreAPI.showToast?.(`Snippet "${name}" added`, 'success', 2000);
@@ -919,11 +919,18 @@ async function updateIterationSnippet(messageIndex) {
         return;
     }
     // Could have been deleted in another modal.
-    const data = await loadSnippets();
+    let data;
+    try {
+        data = await loadSnippets();
+    } catch (err) {
+        console.warn('[CSSAssistant] Could not load saved snippets:', err);
+        CoreAPI.showToast?.('Could not load saved snippets. Existing data is unchanged; try again.', 'error');
+        return;
+    }
     const snippet = data?.snippets?.find(s => s.id === iterationSnippetId);
     if (!snippet) {
         CoreAPI.showToast?.(`Snippet "${iterationSnippetName}" no longer exists. Saved as new instead.`, 'warning', 3000);
-        await createSnippet({ name: iterationSnippetName || snippetNameFromCss(css), css: stripTitleComment(css), enabled: false });
+        if (!(await createSnippet({ name: iterationSnippetName || snippetNameFromCss(css), css: stripTitleComment(css), enabled: false }))) return;
         iterationSnippetId = null;
         iterationSnippetName = '';
         renderChat();
@@ -932,7 +939,7 @@ async function updateIterationSnippet(messageIndex) {
         return;
     }
     if (!window.confirm(`Replace the CSS in "${snippet.name || 'Untitled'}" with this new version? The previous CSS will be overwritten.`)) return;
-    await updateSnippet(iterationSnippetId, { css: stripTitleComment(css) });
+    if (!(await updateSnippet(iterationSnippetId, { css: stripTitleComment(css) }))) return;
     try { renderCustomCssSidebar(); } catch { /* ignore */ }
     try { setSnippetsDirty(true); } catch { /* ignore */ }
     try {

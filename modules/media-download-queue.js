@@ -49,15 +49,10 @@ async function fileUpload(name, data) {
 }
 
 async function fileRead(name) {
-    try {
-        const resp = await fetch(`/user/files/${name}`, { cache: 'no-store' });
-        if (!resp.ok) return null;
-        const text = await resp.text();
-        if (!text || !text.trim()) return null;
-        return JSON.parse(text);
-    } catch {
-        return null;
-    }
+    const resp = await fetch(`/user/files/${name}`, { cache: 'no-store' });
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error(`Could not read media queue (HTTP ${resp.status})`);
+    return JSON.parse(await resp.text());
 }
 
 // ========================================
@@ -67,10 +62,14 @@ async function fileRead(name) {
 // ========================================
 
 function serializeQueue() {
+    // The boot read can finish before character recovery. Keep those jobs on disk
+    // until resumePersistedJobs has actually examined them, even if a new import saves first.
+    const pending = jobs.filter(j => j.state === 'pending' || j.state === 'active');
+    const known = new Set(jobs.map(j => j.avatar));
+    const waiting = (_persistedEntries || []).filter(j => !known.has(canonicalAvatar(j.avatar)));
     return {
         version: STORAGE_VERSION,
-        jobs: jobs
-            .filter(j => j.state === 'pending' || j.state === 'active')
+        jobs: [...waiting, ...pending]
             .map(j => ({ avatar: j.avatar, name: j.name, folderName: j.folderName, phases: j.phases })),
     };
 }
@@ -78,7 +77,13 @@ function serializeQueue() {
 async function saveQueueFile() {
     // First write may land before the boot read finished; complete the read
     // first so we never clobber a file we havent seen
-    if (!loaded) await loadQueueFile();
+    if (!loaded) {
+        try { await loadQueueFile(); }
+        catch (e) {
+            console.error('[MediaDLQueue] Queue was not saved because its existing data could not be read:', e.message);
+            return;
+        }
+    }
     if (saving) {
         saveQueued = true;
         return;
@@ -106,11 +111,13 @@ async function loadQueueFile() {
     if (_loadingPromise) return _loadingPromise;
     _loadingPromise = (async () => {
         const data = await fileRead(QUEUE_FILE);
+        if (data !== null && (data?.version !== STORAGE_VERSION || !Array.isArray(data.jobs))) {
+            throw new Error('Invalid media queue; existing data was not changed');
+        }
         loaded = true;
-        _loadingPromise = null;
         _persistedEntries = (data && data.version === STORAGE_VERSION && Array.isArray(data.jobs)) ? data.jobs : [];
         return _persistedEntries;
-    })();
+    })().finally(() => { _loadingPromise = null; });
     return _loadingPromise;
 }
 
@@ -307,7 +314,14 @@ async function runNext() {
 // ========================================
 
 async function resumePersistedJobs() {
-    const persisted = await loadQueueFile();
+    let persisted;
+    try { persisted = await loadQueueFile(); }
+    catch (e) {
+        console.error('[MediaDLQueue] Could not resume saved queue:', e.message);
+        CoreAPI.showToast('Could not read the saved media queue. Reload after resolving the connection or file error.', 'error');
+        return;
+    }
+    _persistedEntries = [];
     CoreAPI.debugLog(`[MediaDLQueue] Resume check: ${persisted.length} persisted entr${persisted.length === 1 ? 'y' : 'ies'}`);
     if (!persisted.length) return;
     const completed = CoreAPI.getCompletedMediaLocalizations() || new Set();
@@ -481,7 +495,7 @@ function init() {
 
     // Read the persisted file immediately so saves are never gated on the
     // resume timing below (an import can land before characters finish loading)
-    loadQueueFile();
+    loadQueueFile().catch(e => console.error('[MediaDLQueue] Initial queue read failed:', e.message));
 
     // Resume needs data.extensions intact (provider gallery discovery reads the
     // link), so under ST lazy loading wait for recovery, not just the char list

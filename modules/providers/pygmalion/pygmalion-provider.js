@@ -255,15 +255,17 @@ class PygmalionProvider extends ProviderBase {
         if (!linkInfo?.id) return null;
         try {
             const data = await fetchCharacterDetail(linkInfo.id, undefined, this.getToken());
-            if (data?.character) {
+            if (data?.character && !Array.isArray(data.character) && data.character.personality
+                && typeof data.character.personality === 'object' && !Array.isArray(data.character.personality)) {
                 const result = buildV2FromDetail(data.character);
                 if (result) result._listingName = this.getListingName(data.character);
                 return result;
             }
-            return null;
+            throw new Error('Pygmalion returned an invalid character detail response');
         } catch (e) {
             console.error('[PygmalionProvider] fetchRemoteCard failed:', linkInfo.id, e);
-            return null;
+            if (e.notFound) return null;
+            throw e;
         }
     }
 
