@@ -13,6 +13,14 @@ function checkCancelled(signal) {
     if (signal?.aborted) throw new DOMException('Datacat export cancelled', 'AbortError');
 }
 
+function variantContent(variant) {
+    let content = variant?.content;
+    if (typeof content === 'string') {
+        try { content = JSON.parse(content); } catch { return null; }
+    }
+    return content && typeof content === 'object' && !Array.isArray(content) ? content : null;
+}
+
 /**
  * Metadata enriches a successful export; it can never replace a denied export.
  * Browser verification happens in Datacat's own session and returns a card,
@@ -28,10 +36,9 @@ export async function acquireDatacatExport(characterId, options = {}) {
     const definitionSource = normalizeDefinitionSource(requestedDefinition);
     checkCancelled(signal);
     const supplied = options.character;
-    let character = supplied?._fullCharacter || (supplied && (
-        supplied.chara_card_v2_json || Array.isArray(supplied.content_variants)
-        || Array.isArray(supplied.scripts) || Object.hasOwn(supplied, 'personality')
-    ) ? supplied : null);
+    // Feed summaries can carry empty/partial versions of detail fields. Only the
+    // explicit detail handoff proves that the caller has already fetched metadata.
+    let character = supplied?._fullCharacter || null;
     let sourceKind = normalizeDatacatSourceKind(options.sourceKind)
         || getDatacatSourceKind(character || options.character, null);
     let metadataUnavailable = false;
@@ -51,6 +58,7 @@ export async function acquireDatacatExport(characterId, options = {}) {
         throw new DatacatError('Datacat returned metadata for a different character or source', { code: 'invalid_response' });
     }
     sourceKind = sourceKind || metadataSource;
+    let selectedVariant = null;
     if (character) {
         const available = getDatacatDefinitionOptions(character);
         if (!available[definitionSource]) {
@@ -59,8 +67,14 @@ export async function acquireDatacatExport(characterId, options = {}) {
         if (variantId && Array.isArray(character.content_variants)) {
             // A top-level Reimagination may belong to an ordinary source variant;
             // it need not be duplicated inside that variant's content object.
-            if (!character.content_variants.some(variant => String(variant?.id || variant?.variantId || '') === String(variantId))) {
+            selectedVariant = character.content_variants.find(variant => String(variant?.id || variant?.variantId || '') === String(variantId));
+            if (!selectedVariant) {
                 throw new DatacatError('The selected Datacat variant is no longer available. Open the Datacat preview to choose an available version.', { code: 'selection_unavailable' });
+            }
+            if (definitionSource === 'reimagination'
+                && !available.variants.some(variant => String(variant.id || '') === String(variantId))
+                && !getDatacatDefinitionOptions({ ...character, content_variants: [] }).reimagination) {
+                throw new DatacatError('Reimagination is unavailable for the selected Datacat variant. Open the Datacat preview to choose an available version.', { code: 'selection_unavailable' });
             }
         }
     }
@@ -100,11 +114,24 @@ export async function acquireDatacatExport(characterId, options = {}) {
     }
     sourceKind = sourceKind || getDatacatSourceKind(download?.data?.extensions?.datacat, null);
     const hasExportedLorebook = Object.hasOwn(download?.data || download || {}, 'character_book');
-    if (character && definitionSource === 'source' && !hasExportedLorebook) {
-        await hydrateDatacatScripts(character, { signal });
+    let enrichmentCharacter = character;
+    let variantLorebookUnavailable = false;
+    if (definitionSource === 'source' && variantId) {
+        const content = variantContent(selectedVariant);
+        if (content && Object.hasOwn(content, 'scripts')) {
+            enrichmentCharacter = { ...character, scripts: content.scripts };
+        } else if (!selectedVariant?.isPrimary && !selectedVariant?.is_primary) {
+            // The row's scripts belong to its primary definition. A different
+            // selected variant must not inherit that book when its export omits it.
+            enrichmentCharacter = { ...character, scripts: undefined };
+            variantLorebookUnavailable = true;
+        }
+    }
+    if (enrichmentCharacter && definitionSource === 'source' && !hasExportedLorebook) {
+        await hydrateDatacatScripts(enrichmentCharacter, { signal });
     }
     checkCancelled(signal);
-    const card = buildV2FromDownload(download, character, { id, sourceKind, definitionSource, variantId });
+    const card = buildV2FromDownload(download, enrichmentCharacter, { id, sourceKind, definitionSource, variantId });
     if (!card?.data || typeof card.data.name !== 'string') {
         throw new DatacatError('Datacat returned an invalid character card', { code: 'invalid_response' });
     }
@@ -125,7 +152,7 @@ export async function acquireDatacatExport(characterId, options = {}) {
     };
     card._listingName = character?.name || existing.pageName || null;
     // Unknown lorebook data must not be compared as a deletion.
-    if (!hasExportedLorebook && (hasUnfetchedLorebook(character)
+    if (!hasExportedLorebook && (definitionSource === 'source' && (variantLorebookUnavailable || hasUnfetchedLorebook(enrichmentCharacter))
         || (!card.data.character_book && (metadataUnavailable || !character)))) {
         card._lorebookUnavailable = true;
     }

@@ -6,6 +6,19 @@ const root = new URL('../../modules/providers/datacat/', import.meta.url);
 const contractText = await readFile(new URL('datacat-contract.js', root), 'utf8');
 const contractUrl = `data:text/javascript;base64,${Buffer.from(contractText).toString('base64')}`;
 const contract = await import(contractUrl);
+// Compose the acquisition path with the production card/lorebook builders. Only
+// the external modules and request boundary are stubbed, as in api.test.mjs.
+let apiSource = await readFile(new URL('datacat-api.js', root), 'utf8');
+apiSource = apiSource.replace(/^import[\s\S]*?;\r?\n/gm, '').replace(/^export \* from .*;\r?\n/gm, '');
+const apiNames = ['DatacatError', 'classifyDatacatError', 'normalizeDatacatCharacter', 'normalizeDatacatPage', 'normalizeDatacatSourceKind', 'getDatacatSourceKind', 'getDatacatCharacterId', 'normalizeDatacatAvatar', 'normalizeDefinitionSource', 'normalizeRetrievalStatus'];
+const apiPrefix = `import {${apiNames.join(',')}} from '${contractUrl}';
+const CoreAPI = { isUrlSafeForDownload: () => ({ok:true}) };
+const CL_HELPER_PLUGIN_BASE = '/plugins/cl-helper';
+const slugify = x => x, stripHtml = x => x, JANNY_TAG_MAP = {};
+const readJsonClassified = r => r.json(), classifyErrorPage = () => null;
+const meiliMultiSearch = () => {}, isJanitorBridgeAvailable = () => false, janitorBridgeFetch = () => {};
+`;
+const productionApi = await import(`data:text/javascript;base64,${Buffer.from(apiPrefix + apiSource).toString('base64')}`);
 const id = '11111111-2222-3333-4444-555555555555';
 const otherId = '11111111-2222-3333-4444-666666666666';
 const rawExport = definition => ({ spec: 'chara_card_v2', data: {
@@ -212,4 +225,129 @@ test('verified PNG selection is bound by the companion even when uploaded-card s
     const result = await acquire(id, { interactive: true, definitionSource: 'reimagination', variantId: 'janitor_core' });
     assert.equal(result.card.data.extensions.datacat.definitionSource, 'reimagination');
     assert.equal(result.card.data.extensions.datacat.variantId, 'janitor_core');
+});
+
+test('summary fields cannot masquerade as full detail and hide an available definition', async () => {
+    const { acquire, calls } = await acquisition();
+    const result = await acquire(id, {
+        character: { character_id: id, personality: '', scripts: [], content_variants: [] },
+        definitionSource: 'reimagination',
+    });
+    assert.equal(calls[0], 'detail');
+    assert.equal(result.card.data.description, 'reimagination');
+});
+
+test('a saved variant cannot borrow Reimagination availability from another variant', async () => {
+    const { acquire, calls } = await acquisition({ fetchDatacatCharacter: async () => ({
+        character_id: id,
+        content_variants: [
+            { id: 'janitor_core', isPrimary: true, content: { personality: 'Source only' } },
+            { id: 'janny_recovery', content: { datacat_reimagination: { outputText: 'Another version' } } },
+        ],
+    }) });
+    await assert.rejects(acquire(id, { definitionSource: 'reimagination', variantId: 'janitor_core' }), { code: 'selection_unavailable' });
+    assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'download'), false);
+});
+
+test('Source variant enrichment uses only that variant lorebook metadata', async () => {
+    const primary = [{ type: 'lorebook', is_public: true, script: '[{"content":"Primary"}]' }];
+    const selected = [{ type: 'lorebook', is_public: true, script: '[{"content":"Selected"}]' }];
+    const seen = [];
+    for (const variantScripts of [selected, undefined]) {
+        const { acquire } = await acquisition({
+            fetchDatacatCharacter: async () => ({
+                character_id: id, scripts: primary,
+                content_variants: [
+                    { id: 'primary', isPrimary: true, content: {} },
+                    { id: 'selected', content: JSON.stringify(variantScripts ? { scripts: variantScripts } : {}) },
+                ],
+            }),
+            hydrateDatacatScripts: async character => { seen.push(['hydrate', character.scripts]); },
+            buildV2FromDownload: (download, character) => {
+                seen.push(['build', character.scripts]);
+                return structuredClone(download);
+            },
+        });
+        const result = await acquire(id, { variantId: 'selected' });
+        assert.deepEqual(seen.at(-1), ['build', variantScripts]);
+        assert.equal(result.card._lorebookUnavailable, variantScripts ? undefined : true);
+    }
+    assert.equal(seen.some(([, scripts]) => scripts === primary), false);
+});
+
+test('Reimagination export lorebook absence is not obscured by unrelated Source script stubs', async () => {
+    const { acquire, calls } = await acquisition({ hasUnfetchedLorebook: () => true });
+    const result = await acquire(id, { definitionSource: 'reimagination' });
+    assert.equal(result.card._lorebookUnavailable, undefined);
+    assert.equal(calls.includes('scripts'), false);
+});
+
+test('unknown selected-variant metadata cannot borrow the primary lorebook', async () => {
+    let enrichedScripts;
+    const { acquire } = await acquisition({
+        fetchDatacatCharacter: async () => ({ character_id: id, scripts: [{ type: 'lorebook', is_public: true, script: '[{"content":"Primary"}]' }] }),
+        buildV2FromDownload: (download, character) => { enrichedScripts = character.scripts; return structuredClone(download); },
+    });
+    const result = await acquire(id, { variantId: 'saved-version' });
+    assert.equal(enrichedScripts, undefined);
+    assert.equal(result.card._lorebookUnavailable, true);
+});
+
+test('an explicit selected variant export book stays authoritative even when variant metadata is missing', async () => {
+    for (const character_book of [null, { entries: [{ content: 'Selected export book' }] }]) {
+        const { acquire, calls } = await acquisition({
+            fetchDatacatCharacter: async () => ({ character_id: id, scripts: [{ type: 'lorebook', is_public: true }] }),
+            fetchDatacatDownload: async () => ({ ...rawExport('Source'), data: { ...rawExport('Source').data, character_book } }),
+        });
+        const result = await acquire(id, { variantId: 'saved-version' });
+        assert.deepEqual(result.card.data.character_book, character_book);
+        assert.equal(result.card._lorebookUnavailable, undefined);
+        assert.equal(calls.includes('scripts'), false);
+    }
+});
+
+test('production acquisition and lorebook builders never compare malformed or partial books as removals', async () => {
+    const validScript = { type: 'lorebook', is_public: true, script: '[{"id":0,"content":"Known entry"}]' };
+    for (const scripts of [
+        [{ type: 'lorebook', is_public: true, script: '{broken' }],
+        [validScript, { type: 'lorebook', is_public: true, script: '[null]' }],
+    ]) {
+        const { acquire } = await acquisition({
+            fetchDatacatCharacter: async () => ({ character_id: id, scripts }),
+            buildV2FromDownload: productionApi.buildV2FromDownload,
+            hydrateDatacatScripts: productionApi.hydrateDatacatScripts,
+            hasUnfetchedLorebook: productionApi.hasUnfetchedLorebook,
+        });
+        const result = await acquire(id);
+        assert.equal(result.card._lorebookUnavailable, true);
+        assert.equal(result.card.data.character_book?.entries?.length || 0, scripts.length - 1);
+    }
+});
+
+test('production acquisition composes selected Source and Reimagination books without mixing definitions', async () => {
+    const sourceScript = content => [{ type: 'lorebook', is_public: true, script: JSON.stringify([{ id: 0, content }]) }];
+    const character = {
+        character_id: id, scripts: sourceScript('Primary source book'),
+        content_variants: [
+            { id: 'primary', isPrimary: true, content: {} },
+            { id: 'selected', content: { scripts: sourceScript('Selected source book'), datacat_reimagination: { outputText: 'Reimagined body' } } },
+        ],
+    };
+    for (const definitionSource of ['source', 'reimagination']) {
+        const { acquire } = await acquisition({
+            fetchDatacatCharacter: async () => character,
+            buildV2FromDownload: productionApi.buildV2FromDownload,
+            hydrateDatacatScripts: productionApi.hydrateDatacatScripts,
+            hasUnfetchedLorebook: productionApi.hasUnfetchedLorebook,
+            fetchDatacatDownload: async () => {
+                const card = rawExport(definitionSource);
+                if (definitionSource === 'reimagination') card.data.character_book = { entries: [{ content: 'Reimagined book' }] };
+                return card;
+            },
+        });
+        const result = await acquire(id, { definitionSource, variantId: 'selected' });
+        assert.equal(result.card.data.description, definitionSource);
+        assert.deepEqual(result.card.data.character_book.entries.map(entry => entry.content), [definitionSource === 'source' ? 'Selected source book' : 'Reimagined book']);
+        assert.equal(result.card._lorebookUnavailable, undefined);
+    }
 });

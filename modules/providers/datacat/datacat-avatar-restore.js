@@ -22,7 +22,7 @@ const MODERATION_PLACEHOLDER_HASHES = new Set([
 let injected = false;
 let running = false;      // scan or apply in flight
 let opToken = 0;          // bumping cancels whichever loop is running
-let candidates = [];      // { avatar, name, localUrl, localW, localH, remoteUrl, remoteW, remoteH, checked, applied }
+let candidates = [];      // { avatar, name, localUrl, localW, localH, remoteUrl, remoteHash, remoteW, remoteH, checked, applied }
 let counts = null;
 
 function byId(id) { return document.getElementById(id); }
@@ -182,6 +182,7 @@ async function scanOne(char, token) {
         const buf = await resp.arrayBuffer();
         if (token !== opToken) return;
         const hash = await CoreAPI.calculateHash(buf);
+        if (token !== opToken) return;
         if (MODERATION_PLACEHOLDER_HASHES.has(hash)) { counts.sanitized++; return; }
 
         const localUrl = CoreAPI.getCharacterAvatarUrl(char.avatar);
@@ -194,7 +195,7 @@ async function scanOne(char, token) {
                 avatar: char.avatar,
                 name: char.name || char.avatar,
                 localUrl, localW: localDims.w, localH: localDims.h,
-                remoteUrl, remoteW: remoteDims.w, remoteH: remoteDims.h,
+                remoteUrl, remoteHash: hash, remoteW: remoteDims.w, remoteH: remoteDims.h,
                 checked: true, applied: null,
             });
             counts.candidates++;
@@ -202,6 +203,7 @@ async function scanOne(char, token) {
             counts.fine++;
         }
     } catch (e) {
+        if (token !== opToken) return;
         console.warn('[DatacatAvatarRestore] scan failed:', char?.avatar, e.message);
         counts.failed++;
     }
@@ -321,6 +323,13 @@ async function applySelected() {
             if (!resp.ok) throw new Error(`image fetch HTTP ${resp.status}`);
             const buf = await resp.arrayBuffer();
             if (token !== opToken) return;
+            // The source may replace an image at the same URL after review (including
+            // moderation placeholders). Only write the artwork the user reviewed.
+            const hash = await CoreAPI.calculateHash(buf);
+            if (token !== opToken) return;
+            if (!c.remoteHash || hash !== c.remoteHash) {
+                throw new Error('The source avatar changed after review. Close this window and scan again.');
+            }
 
             const formData = new FormData();
             // edit-avatar re-encodes as PNG and re-embeds the existing card JSON, so the
@@ -338,10 +347,14 @@ async function applySelected() {
             upgraded++;
             CoreAPI.bumpAvatarCacheBust(c.avatar);
             CoreAPI.notifySTCharacterEdited(c.avatar);
+            // A confirmed write still needs its cache refresh, but its old row may
+            // have been replaced by a new scan while the server handled the upload.
+            if (token !== opToken) return;
             setRowStatus(i, '<i class="fa-solid fa-circle-check" style="color: var(--cl-success-bright);"></i>');
             const row = byId('datacatRestoreBody')?.querySelector(`.datacat-restore-row[data-idx="${i}"]`);
             row?.querySelector('input[type="checkbox"]')?.setAttribute('disabled', '');
         } catch (e) {
+            if (token !== opToken) return;
             console.error('[DatacatAvatarRestore] apply failed:', c.avatar, e);
             c.applied = false;
             failed++;

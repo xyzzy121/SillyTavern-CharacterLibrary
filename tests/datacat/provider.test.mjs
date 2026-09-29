@@ -61,6 +61,39 @@ test('relinking preserves creator metadata, definition and unrelated namespaces'
     assert.equal(char.data.extensions.datacat.linkedAt, 'yesterday');
 });
 
+test('linking another Datacat character resets metadata tied to the previous target', async () => {
+    const { provider } = await loadProvider();
+    const previous = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const char = { data: { extensions: { custom: { keep: true }, datacat: {
+        id: previous, sourceKind: 'saucepan', creatorId: 'previous-creator', creatorName: 'Previous creator',
+        pageName: 'Previous listing', avatar: 'previous-avatar', linkedAt: 'yesterday',
+        definitionSource: 'reimagination', variantId: 'previous-variant', custom: true,
+    } } } };
+    provider.setLinkInfo(char, { fullPath: id, sourceUrl: `https://datacat.run/characters/recent/direct/${id}` });
+    const link = char.data.extensions.datacat;
+    assert.equal(link.id, id);
+    assert.equal(link.sourceKind, 'direct_upload');
+    assert.equal(link.definitionSource, 'source');
+    assert.equal(link.variantId, '');
+    assert.equal(link.pageName, null);
+    assert.equal(link.creatorId, undefined);
+    assert.equal(link.creatorName, undefined);
+    assert.equal(link.avatar, undefined);
+    assert.notEqual(link.linkedAt, 'yesterday');
+    assert.equal(link.custom, true);
+    assert.deepEqual(char.data.extensions.custom, { keep: true });
+});
+
+test('a new Datacat target keeps its explicit selection and does not inherit an old source hint', async () => {
+    const { provider } = await loadProvider();
+    const char = { data: { extensions: { datacat: { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', sourceKind: 'saucepan' } } } };
+    provider.setLinkInfo(char, { id, definitionSource: 'reimagination', variantId: 'new-version', pageName: 'New listing' });
+    assert.equal(provider.getLinkInfo(char).sourceKind, null);
+    assert.equal(provider.getLinkInfo(char).definitionSource, 'reimagination');
+    assert.equal(provider.getLinkInfo(char).variantId, 'new-version');
+    assert.equal(char.data.extensions.datacat.pageName, 'New listing');
+});
+
 test('single updates opt into interaction while default batch behavior remains noninteractive', async () => {
     const { provider, calls } = await loadProvider();
     const link = { id, sourceKind: 'janitor', definitionSource: 'reimagination', variantId: 'core' };

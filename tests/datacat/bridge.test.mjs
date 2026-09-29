@@ -238,6 +238,20 @@ test('cancellation prevents a late native export result from being delivered', a
     assert.equal(harness.sent.some(item => item.data.type === 'card'), false);
 });
 
+test('oversized native PNG payloads are rejected before allocating a second copy', async () => {
+    const bytes = new ArrayBuffer(bridge.DATACAT_EXPORT_MAX_BYTES + 1);
+    let copied = false;
+    bytes.slice = () => { copied = true; throw new Error('Unexpected copy'); };
+    for (const pngBytes of [bytes, new Uint8Array(bytes)]) {
+        const harness = companionHarness({ nativeExport: () => ({ pngBytes, cardData: { data: { name: 'Oversized' } } }) });
+        harness.send();
+        await harness.button().events.click({ isTrusted: true });
+        assert.equal(copied, false);
+        assert.equal(harness.sent.at(-1).data.type, 'error');
+        assert.match(harness.sent.at(-1).data.message, /32 MB/);
+    }
+});
+
 function panelHarness() {
     const posts = [];
     const nodes = new Map();

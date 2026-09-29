@@ -10,6 +10,26 @@ These use Node's built-in test runner, with no build system or package installat
 
 Coverage includes current helper routes and visibility fields, explicit export parameters, source and UUID normalization, source-qualified links, native media, nested pagination metadata, clamped and duplicate pages, retrieval correlation and terminal failures, structured errors, authoritative exports, definition persistence, cancellation, and the companion message/PNG contract. Browser and provider tests exercise the actual source modules with their external dependencies replaced.
 
+## 7.3.4 second audit — 2026-09-28
+
+Added **31 regressions**: **164 Datacat tests** and **296 tests across the extension** pass. All 73 non-vendor JavaScript files pass syntax checks, and the diff passes whitespace checks. Helper remains **1.13.1**; companion is **1.0.2**.
+
+Confirmed fixes cover:
+
+- Malformed lorebook content remains unavailable for destructive comparisons; merged books receive unique entry IDs; cancelled hydration stops immediately.
+- Full metadata is fetched instead of inferred from partial feed fields. Reimagination availability belongs to the selected variant. Nonprimary Source exports cannot inherit the primary definition's book, and Source stubs cannot suppress Reimagination book comparison.
+- Relinking a different UUID resets the previous target's source, definition, variant, creator, listing name, avatar and timestamp. Same-target and unrelated metadata remain preserved.
+- Detail responses require the requested UUID, list rows require a UUID, and Fresh responses require their requested windows. Invalid rows still count toward server pagination offsets.
+- Retrieval failures override stale success/lifecycle flags. Idle or unrecognized history requires explicit completion evidence, and records for another character cannot complete a request.
+- Search survives Recent/Meili/Hampter changes, Clear resets all queries, NSFW changes restart server-filtered results, and text search exits a creator catalog. Following refresh/unfollow/deactivation invalidates old requests.
+- Cancelled avatar scans cannot affect newer scans. Avatar restore validates the reviewed image digest immediately before writing and isolates late upload UI updates. The companion rejects oversized native buffers before allocating a duplicate.
+
+The production API and helper handlers passed another live read-only probe: anonymous session initialization, recent pagination, Fresh windows, source-qualified detail, verification denial, and retrieval status. No session tokens were persisted or retrieval jobs submitted.
+
+Desktop/mobile browser fixtures passed the full application imports and definition previews, with real sort/search/clear/NSFW controls producing the expected Meili/Hampter requests. Companion fixtures passed both definitions, serial reuse, cancellation, Reload, Escape/Back and oversized-buffer rejection on localhost and an insecure HTTP LAN-style origin. There were no browser JavaScript exceptions. Local fixture servers and browsers stopped after testing; no temporary SillyTavern clone was needed for this pass.
+
+These tests do **not** verify successful human challenges, authenticated live exports, physical mobile userscript installation, or the remote effects of retrieval. API/card-builder composition tests cover variant-specific and malformed lorebook preservation; browser upstream responses use controlled fixtures.
+
 ## 7.3.3 focused audit — 2026-09-28
 
 The audit checked the published Datacat frontend, current native export module, and official SillyTavern bridge. The companion's explicit `buildPngPayload(..., { definitionSource })` call remains current; the official bridge still omits the choice. This release bundles helper **1.13.1**, requires it for Datacat, and leaves the companion at **1.0.1**.
@@ -58,4 +78,4 @@ These browser runs used external API fixtures and did not write to a live SillyT
 | Live retrieval execution and visibility effects | Not performed: no retrieval jobs were submitted during validation. Endpoint, payload, queue/status, cancellation, and timeout handling were checked with fixtures. |
 | Physical mobile browser and userscript manager installation | Not performed. Chromium mobile emulation does not verify every mobile browser or userscript manager. |
 
-The repository update does not install the extension or helper into a running SillyTavern instance. For deployment, update cl-helper to 1.13.1 and restart SillyTavern. Install or update the optional Datacat Export Companion to 1.0.1 for exports that require browser verification. Setup and troubleshooting instructions are in the root README.
+The repository update does not install the extension or helper into a running SillyTavern instance. For deployment, update cl-helper to 1.13.1 and restart SillyTavern if using an older helper. Install or update the optional Datacat Export Companion to 1.0.2 for exports that require browser verification. Setup and troubleshooting instructions are in the root README.

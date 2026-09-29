@@ -115,6 +115,7 @@ let datacatViewMode = 'browse';
 let datacatFollowedCreators = [];
 let datacatFollowingCharacters = [];
 let datacatFollowingLoading = false;
+let datacatFollowingLoadToken = 0;
 let datacatFollowingSort = 'newest';
 let datacatFollowingDisplayLimit = 60;
 let datacatFollowingFiltered = [];
@@ -1264,30 +1265,21 @@ function updateSearchPlaceholder() {
     input.placeholder = 'Search characters or paste a URL...';
 }
 
+function setDatacatSearchQuery(query) {
+    // One input drives all three browse backends. Keep the submitted query when
+    // changing sort, and clear every backend so a hidden old query cannot return.
+    datacatSearchQuery = query;
+    meiliSearchQuery = query;
+    hampterSearchQuery = query;
+}
+
 function doSearch() {
     const input = document.getElementById('datacatSearchInput');
     const val = (input?.value || '').trim();
     if (!val) {
-        // Clear MeiliSearch query if in janny mode and search is emptied
-        if (isJannySortMode(datacatSortMode) && meiliSearchQuery) {
-            meiliSearchQuery = '';
-            meiliCurrentPage = 1;
-            datacatCurrentOffset = 0;
-            loadCharacters(false);
-        }
-        // Clear Hampter query if in hampter mode and search is emptied
-        if (isHampterSortMode(datacatSortMode) && hampterSearchQuery) {
-            hampterSearchQuery = '';
-            hampterCurrentPage = 1;
-            loadCharacters(false);
-        }
-        // Clear native feed query if search is emptied
-        if (!isJannySortMode(datacatSortMode) && !isHampterSortMode(datacatSortMode)
-            && datacatSearchQuery) {
-            datacatSearchQuery = '';
-            datacatCurrentOffset = 0;
-            loadCharacters(false);
-        }
+        const hadQuery = !!(datacatSearchQuery || meiliSearchQuery || hampterSearchQuery);
+        setDatacatSearchQuery('');
+        if (hadQuery) loadCharacters(false);
         return;
     }
 
@@ -1333,26 +1325,12 @@ function doSearch() {
         }
     } catch { /* not a URL */ }
 
-    // Text search in Hampter mode
-    if (isHampterSortMode(datacatSortMode)) {
-        hampterSearchQuery = val;
-        hampterCurrentPage = 1;
-        loadCharacters(false);
+    setDatacatSearchQuery(val);
+    if (datacatBrowseMode === 'creator') {
+        _returnToFollowing = false;
+        clearCreatorFilter();
         return;
     }
-
-    // Text search in MeiliSearch mode
-    if (isJannySortMode(datacatSortMode)) {
-        meiliSearchQuery = val;
-        meiliCurrentPage = 1;
-        datacatCurrentOffset = 0;
-        loadCharacters(false);
-        return;
-    }
-
-    // Native text search on the DataCat feed (covers character and creator names)
-    datacatSearchQuery = val;
-    datacatCurrentOffset = 0;
     loadCharacters(false);
 }
 
@@ -1895,6 +1873,7 @@ function followCreator(creatorId, creatorName, source = 'datacat') {
     if (isCreatorFollowed(creatorId, source)) return;
     datacatFollowedCreators.push({ id: creatorId, name: creatorName || creatorId, source });
     saveFollowedCreators();
+    invalidateDatacatFollowing();
     updateFollowButton(creatorId, source);
     showToast(`Followed ${creatorName || 'creator'}`, 'success');
 }
@@ -1905,6 +1884,7 @@ function unfollowCreator(creatorId, source = 'datacat') {
     const name = datacatFollowedCreators[idx].name;
     datacatFollowedCreators.splice(idx, 1);
     saveFollowedCreators();
+    invalidateDatacatFollowing();
     updateFollowButton(creatorId, source);
     showToast(`Unfollowed ${name || 'creator'}`, 'info');
 }
@@ -1972,8 +1952,18 @@ async function switchDatacatViewMode(mode) {
     }
 }
 
+function invalidateDatacatFollowing(reload = true) {
+    datacatFollowingLoadToken++;
+    datacatFollowingLoading = false;
+    datacatFollowingCharacters = [];
+    datacatFollowingFiltered = [];
+    datacatFollowingDisplayLimit = 60;
+    if (reload && datacatViewMode === 'following') loadFollowingCharacters(true);
+}
+
 async function loadFollowingCharacters(forceRefresh = false) {
-    if (datacatFollowingLoading) return;
+    if (datacatFollowingLoading && !forceRefresh) return;
+    const token = ++datacatFollowingLoadToken;
     datacatFollowingLoading = true;
 
     const grid = document.getElementById('datacatFollowingGrid');
@@ -1984,8 +1974,9 @@ async function loadFollowingCharacters(forceRefresh = false) {
     }
 
     loadFollowedCreators();
+    const creators = datacatFollowedCreators.map(creator => ({ ...creator }));
 
-    if (datacatFollowedCreators.length === 0) {
+    if (creators.length === 0) {
         renderFollowingEmpty('no_follows');
         datacatFollowingLoading = false;
         return;
@@ -1999,8 +1990,9 @@ async function loadFollowingCharacters(forceRefresh = false) {
         const existingIds = new Set(datacatFollowingCharacters.map(c => getCharId(c)));
         const BATCH_SIZE = 3;
 
-        for (let i = 0; i < datacatFollowedCreators.length; i += BATCH_SIZE) {
-            const batch = datacatFollowedCreators.slice(i, i + BATCH_SIZE);
+        for (let i = 0; i < creators.length; i += BATCH_SIZE) {
+            if (token !== datacatFollowingLoadToken) return;
+            const batch = creators.slice(i, i + BATCH_SIZE);
             const promises = batch.map(async (creator) => {
                 try {
                     const allChars = [];
@@ -2010,6 +2002,7 @@ async function loadFollowingCharacters(forceRefresh = false) {
                         const handle = creator.name; // saucepan handle is stored as name
                         if (!handle) return [];
                         const data = await fetchSaucepanCompanionsOfUser(handle);
+                        if (token !== datacatFollowingLoadToken) return [];
                         for (const c of (data?.characters || [])) {
                             allChars.push({
                                 ...c,
@@ -2033,6 +2026,7 @@ async function loadFollowingCharacters(forceRefresh = false) {
                             sortBy: 'newest',
                             sourceKind: source === 'direct_upload' ? 'direct_upload' : undefined,
                         }).catch(() => null);
+                        if (token !== datacatFollowingLoadToken) return [];
                         if (!data) break;
                         const list = data.list || [];
                         for (const c of list) {
@@ -2058,6 +2052,7 @@ async function loadFollowingCharacters(forceRefresh = false) {
             });
 
             const results = await Promise.all(promises);
+            if (token !== datacatFollowingLoadToken) return;
             for (const chars of results) {
                 for (const c of chars) {
                     const id = getCharId(c);
@@ -2080,6 +2075,7 @@ async function loadFollowingCharacters(forceRefresh = false) {
         renderFollowing();
 
     } catch (err) {
+        if (token !== datacatFollowingLoadToken) return;
         console.error('[DatacatFollowing] Error loading timeline:', err);
         if (grid) {
             renderBrowseError(grid, {
@@ -2092,7 +2088,7 @@ async function loadFollowingCharacters(forceRefresh = false) {
             });
         }
     } finally {
-        datacatFollowingLoading = false;
+        if (token === datacatFollowingLoadToken) datacatFollowingLoading = false;
     }
 }
 
@@ -2523,7 +2519,7 @@ async function fetchAndPopulateDetails(hit, token) {
             && String(cached.variantId || '') === String(hit.variantId || '') ? cached
             : await acquireDatacatExport(charId, {
                 sourceKind: hitSource, definitionSource: selected, variantId: hit.variantId,
-                character, interactive: false,
+                character: { _fullCharacter: character }, interactive: false,
             });
         if (token !== datacatDetailFetchToken) return;
         hit._acquiredExport = acquisition;
@@ -2847,7 +2843,7 @@ async function importCharacter(charData) {
             && String(cached.variantId || '') === String(variantId || '') ? cached
             : await acquireDatacatExport(charId, {
                 sourceKind, definitionSource: selected,
-                variantId, character: charData._fullCharacter, signal,
+                variantId, character: charData._fullCharacter ? { _fullCharacter: charData._fullCharacter } : undefined, signal,
                 interactive: true, onStatus: message => { if (importBtn && !signal.aborted && isCurrentPreview()) importBtn.textContent = message; },
             });
         checkCancelled();
@@ -3097,24 +3093,10 @@ function initDatacatView() {
         const clearBtn = document.getElementById('datacatClearSearchBtn');
         if (input) input.value = '';
         if (clearBtn) clearBtn.classList.add('hidden');
+        const hadQuery = !!(datacatSearchQuery || meiliSearchQuery || hampterSearchQuery);
+        setDatacatSearchQuery('');
         if (datacatBrowseMode === 'creator') clearCreatorFilter();
-        if (isHampterSortMode(datacatSortMode) && hampterSearchQuery) {
-            hampterSearchQuery = '';
-            hampterCurrentPage = 1;
-            loadCharacters(false);
-        }
-        if (isJannySortMode(datacatSortMode) && meiliSearchQuery) {
-            meiliSearchQuery = '';
-            meiliCurrentPage = 1;
-            datacatCurrentOffset = 0;
-            loadCharacters(false);
-        }
-        if (!isJannySortMode(datacatSortMode) && !isHampterSortMode(datacatSortMode)
-            && datacatSearchQuery) {
-            datacatSearchQuery = '';
-            datacatCurrentOffset = 0;
-            loadCharacters(false);
-        }
+        else if (hadQuery) loadCharacters(false);
     });
 
     // Load More
@@ -3136,6 +3118,11 @@ function initDatacatView() {
         updateNsfwToggle();
         if (datacatViewMode === 'following') {
             renderFollowing();
+        } else if (datacatBrowseMode !== 'creator'
+            && (isJannySortMode(datacatSortMode) || isHampterSortMode(datacatSortMode))) {
+            // These backends filter before pagination. A cached SFW page cannot
+            // supply the omitted NSFW rows; start a new result set at page one.
+            loadCharacters(false);
         } else {
             renderGrid(datacatCharacters, false);
         }
@@ -3191,7 +3178,6 @@ function initDatacatView() {
             datacatFreshOffsetWeek = 0;
             meiliCurrentPage = 1;
             hampterCurrentPage = 1;
-            hampterSearchQuery = '';
         }
         datacatCurrentOffset = 0;
         updateSearchPlaceholder();
@@ -4028,11 +4014,12 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
 
     activate(container, options = {}) {
         if (options.domRecreated) {
+            invalidateDatacatFollowing(false);
             datacatBrowseMode = 'recent';
             datacatSelectedChar = null;
             datacatCharacters = [];
             datacatCurrentOffset = 0;
-            datacatSearchQuery = '';
+            setDatacatSearchQuery('');
             datacatFreshOffset24 = 0;
             datacatFreshOffsetWeek = 0;
             datacatHasMore = true;
@@ -4077,6 +4064,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
 
     deactivate() {
         beginDatacatNavigation();
+        if (datacatFollowingLoading) invalidateDatacatFollowing(false);
         datacatDetailFetchToken++;
         delegatesInitialized = false;
         clearExtractionState();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Character Library - Datacat Export Companion
 // @namespace    https://github.com/Sillyanonymous/SillyTavern-CharacterLibrary
-// @version      1.0.1
+// @version      1.0.2
 // @description  Export a selected Datacat character to Character Library after your click and Datacat's normal verification. No account credentials are shared.
 // @author       Sillyanonymous
 // @match        https://datacat.run/*
@@ -137,9 +137,14 @@
                 );
                 if (request.cancelled || current !== request) return;
                 const bytes = payload?.pngBytes;
+                // Enforce the transfer limit before duplicating the native buffer;
+                // otherwise a rejected export can still exhaust a mobile tab's memory.
+                if (!(bytes instanceof ArrayBuffer || ArrayBuffer.isView(bytes))
+                    || bytes.byteLength < 20 || bytes.byteLength > MAX_BYTES) {
+                    throw new Error('Datacat returned an invalid PNG, or the card exceeds the 32 MB limit.');
+                }
                 const png = bytes instanceof ArrayBuffer ? bytes.slice(0)
-                    : ArrayBuffer.isView(bytes) ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : null;
-                if (!png || png.byteLength < 20 || png.byteLength > MAX_BYTES) throw new Error('Datacat returned an invalid PNG, or the card exceeds the 32 MB limit.');
+                    : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
                 if (!payload?.cardData?.data || JSON.stringify(payload.cardData).length > MAX_BYTES) throw new Error('Datacat returned an invalid character card.');
                 send(request, 'card', { png, cardData: payload.cardData }, [png]);
                 request.cancelled = true;

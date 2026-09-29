@@ -32,6 +32,7 @@ function harness(overrides = {}) {
     const document = { getElementById: name => elements.get(name) || null, createElement: () => new Element(), querySelector: () => null, querySelectorAll: () => [] };
     const noop = () => {};
     const core = new Proxy({
+        onElement: (id, event, listener) => (elements.get(id) || make(id)).addEventListener(event, listener),
         getSetting: () => false, getProvider: () => ({ importCharacter: async (_id, _character, options) => { calls.push(['import', options]); return { success: true, characterName: 'Character' }; } }),
         checkCharacterForDuplicatesAsync: async () => [{ char: { name: 'Previous' } }],
         showPreImportDuplicateWarning: async () => ({ choice: 'replace' }),
@@ -50,6 +51,7 @@ function harness(overrides = {}) {
         _setScrollIndicator() {}
         deactivate() {}
         disconnectImageObserver() {}
+        _registerDropdownDismiss() {}
     }
     const context = vm.createContext({ ...contract, CoreAPI: core, BrowseView, document, window: {},
         JANNY_TAG_MAP: {}, IMG_PLACEHOLDER: '', BROWSE_PURIFY_CONFIG: {},
@@ -71,6 +73,8 @@ function harness(overrides = {}) {
         globalThis.testApi = {
             preview: fetchAndPopulateDetails, import: importCharacter, selector: renderDatacatDefinitionSelector,
             close: closePreviewModal,
+            init: initDatacatView,
+            search: doSearch,
             deactivate: () => view.deactivate(),
             creator: browseCreator, clearCreator: clearCreatorFilter,
             lookup: fetchCharacterAndOpenPreview, externalLookup: lookupExternalCharacter,
@@ -80,13 +84,16 @@ function harness(overrides = {}) {
             setupRetrieval(requestId, submittedAt) { extractionRequestId = requestId; extractionStartTime = submittedAt; },
             retrievalRequestId: () => extractionRequestId,
             follow: query => view.followCreator(query),
+            unfollow: unfollowCreator,
+            loadFollowing: loadFollowingCharacters,
+            followingIds: () => datacatFollowingCharacters.map(getCharId),
             creatorReference: parseDatacatCreatorReference, creatorCatalogSource: getCreatorCatalogSource,
             followed: () => datacatFollowedCreators,
             setPreviewToken(value) { datacatDetailFetchToken = value; },
             previewToken: () => datacatDetailFetchToken,
             load: loadCharacters, advance: advanceDatacatPage,
             configure(options = {}) {
-                delegatesInitialized = true; datacatViewMode = 'following';
+                delegatesInitialized = true; datacatViewMode = options.view || 'following';
                 datacatSortMode = options.sort || 'recent'; datacatBrowseMode = options.creator ? 'creator' : 'recent';
                 datacatCreatorId = options.creator || null; datacatCreatorSource = options.source || 'datacat';
                 datacatSearchQuery = options.search || '';
@@ -309,6 +316,115 @@ test('creator download continues after an entirely duplicated intermediate page'
     const cards = await h.adapter.fetchAll({ _cdRef: { creatorId: id, source: 'direct_upload' } });
     assert.deepEqual(h.calls.filter(call => call[0] === 'page').map(call => call[1]), [0, 1, 2]);
     assert.equal(cards.length, 2);
+});
+
+test('enabling NSFW reloads Meili and Hampter from page one and rejects an old filtered page', async () => {
+    for (const sort of ['janny_newest', 'hampter_latest']) {
+        const requests = [];
+        let resolveOld;
+        const page = { characters: Array.from({ length: 80 }, (_, i) => ({ ...full, character_id: '11111111-2222-3333-4444-' + String(i).padStart(12, '0') })), totalPages: 2, total: 160, pageSize: 80 };
+        const fetchPage = options => {
+            requests.push(options);
+            if (requests.length === 2) return new Promise(resolve => { resolveOld = resolve; });
+            return Promise.resolve(requests.length === 1 ? page : { ...page, characters: [{ ...full, character_id: id2 }], totalPages: 1, total: 1 });
+        };
+        const h = harness({ dependencies: { searchMeiliJanny: fetchPage, fetchHampterCharacters: fetchPage } });
+        h.api.init(); h.api.configure({ sort, view: 'browse' });
+        await h.api.load(false);
+        const oldPage = h.api.advance();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        h.elements.get('datacatNsfwToggle').events.click();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        assert.deepEqual(requests.map(({ page, nsfw }) => [page, nsfw]), [[1, false], [2, false], [1, true]]);
+        resolveOld(page); await oldPage;
+        assert.deepEqual(Array.from(h.api.state().ids), [id2]);
+    }
+});
+
+test('changing browse sort preserves the submitted text query across all search backends', async () => {
+    const requests = [];
+    const h = harness({ dependencies: {
+        fetchRecentPublic: async options => { requests.push(['recent', options.search]); return { characters: [] }; },
+        searchMeiliJanny: async options => { requests.push(['meili', options.search]); return { characters: [] }; },
+        fetchHampterCharacters: async options => { requests.push(['hampter', options.search]); return { characters: [] }; },
+    } });
+    h.api.init(); h.api.configure({ view: 'browse' });
+    const input = h.elements.get('datacatSearchInput');
+    input.value = 'Moon Knight'; h.api.search();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const sort of ['janny_newest', 'hampter_latest', 'recent']) {
+        const select = h.elements.get('datacatSortSelect'); select.value = sort; select.events.change();
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    assert.deepEqual(requests, [['recent', 'Moon Knight'], ['meili', 'Moon Knight'], ['hampter', 'Moon Knight'], ['recent', 'Moon Knight']]);
+    h.elements.get('datacatClearSearchBtn').events.click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const select = h.elements.get('datacatSortSelect'); select.value = 'janny_newest'; select.events.change();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(requests.at(-1)[1], '');
+});
+
+test('submitting a text search leaves the creator catalog and clears its download target', async () => {
+    const requests = [];
+    const h = harness({ dependencies: {
+        fetchRecentPublic: async options => { requests.push(['recent', options.search]); return { characters: [] }; },
+        fetchDatacatCreatorCharacters: async () => { requests.push(['creator']); return { list: [] }; },
+    } });
+    h.api.init(); h.api.configure({ creator: id, view: 'browse' });
+    h.elements.get('datacatSearchInput').value = 'Other character'; h.api.search();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(requests, [['recent', 'Other character']]);
+    assert.equal(h.api.creatorDownloadReference(), null);
+});
+
+test('unfollowing during a timeline load cannot restore the removed creator characters', async () => {
+    let follows = [{ id, name: 'Creator', source: 'datacat' }];
+    let resolvePage;
+    const h = harness({ core: {
+        getSetting: name => name === 'datacatFollowedCreators' ? follows : false,
+        setSetting: (name, value) => { if (name === 'datacatFollowedCreators') follows = value; },
+    }, dependencies: { fetchDatacatCreatorCharacters: () => new Promise(resolve => { resolvePage = resolve; }) } });
+    h.api.configure();
+    const loading = h.api.loadFollowing();
+    h.api.unfollow(id);
+    resolvePage({ list: [full], total: 1 }); await loading;
+    assert.equal(follows.length, 0);
+    assert.deepEqual(Array.from(h.api.followingIds()), []);
+});
+
+test('refreshing Following supersedes a pending load and retains only the fresh response', async () => {
+    let resolveOld;
+    let calls = 0;
+    const h = harness({ core: { getSetting: name => name === 'datacatFollowedCreators' ? [{ id, name: 'Creator', source: 'datacat' }] : false },
+        dependencies: { fetchDatacatCreatorCharacters: async () => ++calls === 1
+            ? new Promise(resolve => { resolveOld = resolve; })
+            : { list: [{ ...full, character_id: id2 }], total: 1 } },
+    });
+    const old = h.api.loadFollowing();
+    await h.api.loadFollowing(true);
+    assert.equal(calls, 2);
+    resolveOld({ list: [full], total: 1 }); await old;
+    assert.deepEqual(Array.from(h.api.followingIds()), [id2]);
+});
+
+test('deactivating stops a pending Following page and permits a clean reload', async () => {
+    const requests = [];
+    let resolveOld;
+    const h = harness({ core: { getSetting: name => name === 'datacatFollowedCreators' ? [{ id, name: 'Creator', source: 'datacat' }] : false },
+        dependencies: { fetchDatacatCreatorCharacters: async (_id, options) => {
+            requests.push(options.offset);
+            if (requests.length === 1) return new Promise(resolve => { resolveOld = resolve; });
+            return { list: [{ ...full, character_id: id2 }], total: 1 };
+        } },
+    });
+    const old = h.api.loadFollowing();
+    h.api.deactivate();
+    resolveOld({ list: [full], total: 100, nextOffset: 1, hasMore: true }); await old;
+    assert.deepEqual(requests, [0]);
+    assert.deepEqual(Array.from(h.api.followingIds()), []);
+    await h.api.loadFollowing();
+    assert.deepEqual(requests, [0, 0]);
+    assert.deepEqual(Array.from(h.api.followingIds()), [id2]);
 });
 
 test('closing the shared verification panel cancels remaining creator downloads', async () => {

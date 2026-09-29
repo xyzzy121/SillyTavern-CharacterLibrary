@@ -152,3 +152,48 @@ test('aborted responses retain cancellation and never initialize a replacement s
     api.setApiRequest(async () => ({ ok: true, status: 200, text: async () => { throw new DOMException('Cancelled', 'AbortError'); } }));
     await assert.rejects(api.fetchDatacatDownload(id), { name: 'AbortError' });
 });
+
+test('detail rejects metadata without the requested UUID instead of offering a wrong or empty card', async () => {
+    for (const character of [{}, { id: 42, name: 'Database row' }, { characterId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }]) {
+        api.setApiRequest(async () => json({ character }));
+        await assert.rejects(api.fetchDatacatCharacter(id), { code: 'invalid_response' });
+    }
+});
+
+test('Fresh requires the requested window envelopes instead of treating malformed data as an empty feed', async () => {
+    for (const payload of [{}, { windows: null }, { windows: { last24h: { characters: [] } } }]) {
+        api.setApiRequest(async () => json(payload));
+        await assert.rejects(api.fetchFreshCharacters(), { code: 'invalid_response' });
+    }
+    api.setApiRequest(async () => json({ windows: { last24h: { characters: [] } } }));
+    assert.deepEqual((await api.fetchFreshCharacters({ limitWeek: 0 })).thisWeek, []);
+});
+
+test('malformed advertised lorebooks remain unavailable for destructive update comparisons', () => {
+    for (const script of ['not json', '{}', '[null]', '[{}]', '[{"content":null}]', '[{"content":"ok"},42]']) {
+        const character = { scripts: [{ type: 'lorebook', is_public: true, script }] };
+        assert.equal(api.hasUnfetchedLorebook(character), true, script);
+    }
+    assert.equal(api.hasUnfetchedLorebook({ scripts: [{ type: 'lorebook', is_public: true, script: '[]' }] }), false, 'known empty is different from unreadable');
+});
+
+test('multiple lorebooks preserve every entry with unique V2 IDs', () => {
+    const scripts = [0, 1].map(n => ({ type: 'lorebook', is_public: true,
+        script: JSON.stringify([{ id: 0, key: ['key' + n], content: 'entry' + n }, { id: 1, key: ['extra' + n], content: 'extra' + n }]) }));
+    const book = api.extractCharacterBookFromScripts({ scripts });
+    assert.equal(book.entries.length, 4);
+    assert.equal(new Set(book.entries.map(entry => entry.id)).size, 4);
+    assert.deepEqual(book.entries.map(entry => entry.content), ['entry0', 'extra0', 'entry1', 'extra1']);
+});
+
+test('cancelled lorebook hydration stops before requesting later scripts', async () => {
+    const savedFetch = globalThis.fetch;
+    const controller = new AbortController();
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; controller.abort(); throw new DOMException('Cancelled', 'AbortError'); };
+    try {
+        const scripts = [0, 1].map(() => ({ type: 'lorebook', is_public: true, api_path: '/hampter/script/' + id }));
+        await assert.rejects(api.hydrateDatacatScripts({ scripts }, { signal: controller.signal }), { name: 'AbortError' });
+        assert.equal(requests, 1);
+    } finally { globalThis.fetch = savedFetch; }
+});

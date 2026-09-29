@@ -119,10 +119,17 @@ class DatacatProvider extends ProviderBase {
         if (!char.data.extensions) char.data.extensions = { ...char.extensions };
 
         if (linkInfo) {
-            const existing = char.data.extensions.datacat || {};
+            const existing = { ...char.data.extensions.datacat };
             const parsed = parseDatacatUrl(linkInfo.sourceUrl || linkInfo.fullPath || '');
             const id = getDatacatCharacterId(linkInfo.id) || parsed?.id || getDatacatCharacterId(linkInfo.fullPath);
             if (!id) throw new Error('A valid Datacat character ID is required');
+            if (getDatacatCharacterId(existing.id) !== id) {
+                // A replacement link starts a new target. Its old creator/source
+                // and selected variant cannot describe the newly linked character.
+                for (const key of ['sourceKind', 'definitionSource', 'variantId', 'linkedAt', 'pageName', 'creatorId', 'creatorName', 'avatar']) {
+                    delete existing[key];
+                }
+            }
             char.data.extensions.datacat = {
                 ...existing,
                 id,

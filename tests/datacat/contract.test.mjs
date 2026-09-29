@@ -184,3 +184,26 @@ test('current idle job placeholders do not appear as active retrievals', () => {
     assert.equal(c.normalizeRetrievalStatus({ inProgress: { requestId: 'legacy-active' } }).inProgress.requestId, 'legacy-active');
     assert.equal(c.normalizeRetrievalStatus({ job: { lifecycle: 'running', status: 'new-upstream-phase', requestId: 'running' } }).inProgress.requestId, 'running');
 });
+
+test('retrieval terminal failures win over stale lifecycle/success flags and error objects', () => {
+    for (const entry of [
+        { requestId: 'current', lifecycle: 'running', terminalStatus: 'failed', success: true },
+        { requestId: 'current', lifecycle: 'terminal', success: true, error: { code: 'RETRIEVAL_FAILED', message: 'Source unavailable' } },
+        { requestId: 'current', status: 'completed', success: true, result: { success: false } },
+    ]) assert.equal(c.matchRetrievalStatus({ job: entry }, { requestId: 'current' })?.success, false);
+});
+
+test('retrieval history does not promote idle or unidentified records into successful completions', () => {
+    for (const entry of [{ requestId: 'current', status: 'idle' }, { requestId: 'current', status: 'future-phase' }, { requestId: 'current' }]) {
+        assert.equal(c.matchRetrievalStatus({ history: [entry] }, { requestId: 'current' }), null);
+    }
+    assert.equal(c.matchRetrievalStatus({ history: [{ requestId: 'current', success: true }] }, { requestId: 'current' }).success, true, 'legacy explicit success is terminal evidence');
+    assert.equal(c.matchRetrievalStatus({ history: [{ requestId: 'current', status: 'complete', characterId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }] }, { requestId: 'current', characterId: id }), null);
+});
+
+test('invalid list rows cannot use database row IDs as character UUIDs; offsets count all returned rows', () => {
+    const page = c.normalizeDatacatPage({ characters: [{ id: 42 }, {}, null, { characterId: id }], hasMore: true }, { offset: 8 });
+    assert.deepEqual(page.characters.map(row => row.character_id), [id]);
+    assert.equal(page.nextOffset, 12);
+    assert.equal(page.hasMore, true);
+});

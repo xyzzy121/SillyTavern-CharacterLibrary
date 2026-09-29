@@ -428,7 +428,9 @@ export async function fetchDatacatCharacter(characterId, sourceKind = null, opti
         const data = await readDcJson(await dcFetch(path, options), { allow404: true });
         if (data === null) continue;
         const character = normalizeDatacatCharacter(data.character || (getDatacatCharacterId(data) ? data : null));
-        if (!character) throw new DatacatError('DataCat returned invalid character metadata', { code: 'invalid_response' });
+        if (!character || getDatacatCharacterId(character) !== getDatacatCharacterId(characterId)) {
+            throw new DatacatError('DataCat returned invalid or mismatched character metadata', { code: 'invalid_response' });
+        }
         return character;
     }
     return null;
@@ -536,7 +538,11 @@ export async function fetchFreshCharacters(opts = {}) {
     const params = new URLSearchParams({ summary: 1, sortBy, limit24, limitWeek, offset24, offsetWeek });
     const response = await dcFetch(`/api/characters/fresh?${params}`, opts);
     const data = await readDcJson(response);
-    const w = data.windows || {};
+    const w = data.windows;
+    if (!w || typeof w !== 'object' || Array.isArray(w)
+        || Number(limit24) > 0 && !w.last24h || Number(limitWeek) > 0 && !w.thisWeek) {
+        throw new DatacatError('DataCat returned invalid Fresh feed windows', { code: 'invalid_response' });
+    }
     const day = normalizeDatacatPage(w.last24h || { characters: [], hasMore: false }, { limit: limit24, offset: offset24 });
     const week = normalizeDatacatPage(w.thisWeek || { characters: [], hasMore: false }, { limit: limitWeek, offset: offsetWeek });
     return {
@@ -623,11 +629,19 @@ export function stripDatacatMarkers(text) {
 
 const HAMPTER_SCRIPT_PATH_RE = /^\/hampter\/script\/[a-f0-9-]{36}$/i;
 
+function readLorebookEntries(script) {
+    try {
+        const entries = typeof script === 'string' ? JSON.parse(script) : script;
+        return Array.isArray(entries) && entries.every(entry => entry && typeof entry === 'object'
+            && !Array.isArray(entry) && typeof entry.content === 'string') ? entries : null;
+    } catch { return null; }
+}
+
 /** True when the row advertises a public lorebook whose content wasnt obtained. */
 export function hasUnfetchedLorebook(character) {
     const scripts = character?.scripts;
     if (!Array.isArray(scripts)) return false;
-    return scripts.some(s => s && s.type === 'lorebook' && s.is_public && !s.script);
+    return scripts.some(s => s && s.type === 'lorebook' && s.is_public && readLorebookEntries(s.script) === null);
 }
 
 /**
@@ -642,10 +656,12 @@ export function hasUnfetchedLorebook(character) {
  * @returns {Promise<boolean>} true when no public lorebook is left unfetched
  */
 export async function hydrateDatacatScripts(character, { signal } = {}) {
+    signal?.throwIfAborted();
     const scripts = character?.scripts;
     if (!Array.isArray(scripts) || !scripts.length) return true;
     for (const s of scripts) {
-        if (!s || s.type !== 'lorebook' || !s.is_public || s.script) continue;
+        signal?.throwIfAborted();
+        if (!s || s.type !== 'lorebook' || !s.is_public || readLorebookEntries(s.script) !== null) continue;
         // Listed publicly but the creator locked the content; hampter serves metadata only.
         if (s.is_code_public === false) continue;
         if (typeof s.api_path !== 'string' || !HAMPTER_SCRIPT_PATH_RE.test(s.api_path)) continue;
@@ -654,18 +670,21 @@ export async function hydrateDatacatScripts(character, { signal } = {}) {
                 signal,
                 headers: { 'Accept': 'application/json' },
             });
+            signal?.throwIfAborted();
             if (!resp.ok) {
                 console.warn('[DataCat] script hydration got HTTP', resp.status, 'for', s.api_path);
                 continue;
             }
             const full = await resp.json();
-            if (typeof full?.script === 'string' && full.script) {
+            signal?.throwIfAborted();
+            if (typeof full?.script === 'string' && readLorebookEntries(full.script) !== null) {
                 s.script = full.script;
                 if (!s.settings && typeof full.settings === 'string') s.settings = full.settings;
             } else {
                 console.warn('[DataCat] script hydration returned no content for', s.api_path);
             }
         } catch (e) {
+            if (e?.name === 'AbortError' || signal?.aborted) throw e;
             // leave unfetched; consumers flag it via hasUnfetchedLorebook
             console.warn('[DataCat] script hydration failed for', s.api_path, e?.message || e);
         }
@@ -683,12 +702,17 @@ export function extractCharacterBookFromScripts(character) {
     if (!usable.length) return null;
 
     const allEntries = [];
+    const usedIds = new Set();
     for (const s of usable) {
-        let parsed;
-        try { parsed = JSON.parse(s.script); } catch { continue; }
-        if (!Array.isArray(parsed)) continue;
+        const parsed = readLorebookEntries(s.script);
+        if (parsed === null) continue;
         for (const e of parsed) {
-            if (!e || typeof e !== 'object') continue;
+            let entryId = e.id ?? allEntries.length;
+            if (usedIds.has(String(entryId))) {
+                entryId = allEntries.length;
+                while (usedIds.has(String(entryId))) entryId++;
+            }
+            usedIds.add(String(entryId));
             const keys = Array.isArray(e.key)
                 ? e.key
                 : (e.keysRaw ? String(e.keysRaw).split(/,\s*/).filter(Boolean) : []);
@@ -702,7 +726,7 @@ export function extractCharacterBookFromScripts(character) {
                 case_sensitive: false,
                 name: e.name || '',
                 priority: typeof e.priority === 'number' ? e.priority : 10,
-                id: e.id ?? allEntries.length,
+                id: entryId,
                 comment: '',
                 selective: false,
                 constant: e.constant === true,

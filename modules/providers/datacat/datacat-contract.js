@@ -189,7 +189,7 @@ export function getDatacatPageState(pageInfo, offset, rowCount, total = null) {
 export function normalizeDatacatPage(payload, { offset = 0, limit = 24, listKey = 'characters' } = {}) {
     const list = payload?.[listKey] ?? payload?.characters ?? payload?.list;
     if (!Array.isArray(list)) throw new DatacatError('DataCat returned an invalid character list', { code: 'invalid_response' });
-    const rows = list.map(normalizeDatacatCharacter).filter(Boolean);
+    const rows = list.map(normalizeDatacatCharacter).filter(row => getDatacatCharacterId(row));
     const pageInfo = { ...payload, ...payload.pagination, ...payload.paging };
     const totalValue = pageInfo.totalCount ?? pageInfo.total;
     const total = Number.isFinite(Number(totalValue)) && totalValue != null ? Number(totalValue) : null;
@@ -202,7 +202,7 @@ const terminalStates = new Set(['complete', 'completed', 'success', 'succeeded',
 const activeStates = new Set(['pending', 'queued', 'running', 'processing', 'in_progress', 'opening_page', 'preparing', 'initiating', 'pulling', 'post_extract']);
 const statusOf = entry => String(entry?.terminalStatus || entry?.status || entry?.state || entry?.phase || entry?.lifecycle || '').toLowerCase().replace(/-/g, '_');
 const isTerminal = entry => terminalStates.has(statusOf(entry)) || terminalStates.has(String(entry?.lifecycle || '').toLowerCase());
-const isActive = entry => entry?.lifecycle === 'running' || (entry?.lifecycle !== 'terminal' && activeStates.has(statusOf(entry)));
+const isActive = entry => !isTerminal(entry) && (entry?.lifecycle === 'running' || activeStates.has(statusOf(entry)));
 const retrievalErrorText = value => typeof value === 'string' ? value : value?.message || value?.code || null;
 export function normalizeRetrievalStatus(payload) {
     const data = payload && typeof payload === 'object' ? payload : {};
@@ -216,19 +216,24 @@ export function normalizeRetrievalStatus(payload) {
         characterId: entry.characterId || entry.character_id || entry.companionId || entry.result?.characterId || entry.task?.characterId
             || (entry.targetType === 'character' ? entry.targetId : null) || null,
         error: retrievalErrorText(entry.error || entry.errorMessage || entry.contractError),
-        success: failureStates.has(statusOf(entry)) ? false : entry.success ?? entry.result?.success ?? (!entry.error && !entry.errorMessage && !entry.contractError),
+        success: failureStates.has(statusOf(entry)) || entry.success === false || entry.result?.success === false
+            || !!(entry.error || entry.errorMessage || entry.contractError) ? false : entry.success ?? entry.result?.success ?? true,
     });
     const active = [data.inProgress, data.run, data.job, data.task].find(item => item && !isTerminal(item)
         && !['idle', 'none'].includes(statusOf(item)) && (isActive(item)
             || item.requestId || item.request_id || item.characterId || item.character_id));
     const queue = Array.isArray(data.queue) ? data.queue : [];
-    return { ...data, inProgress: active ? normalize(active) : null, queue, queueLength: data.queueLength ?? queue.length, history: entries.filter(entry => !isActive(entry)).map(normalize) };
+    const finished = entries.filter(entry => !isActive(entry) && !['idle', 'none'].includes(statusOf(entry))
+        && (isTerminal(entry) || typeof entry.success === 'boolean' || typeof entry.result?.success === 'boolean'
+            || entry.error || entry.errorMessage || entry.contractError));
+    return { ...data, inProgress: active ? normalize(active) : null, queue, queueLength: data.queueLength ?? queue.length, history: finished.map(normalize) };
 }
 
 export function matchRetrievalStatus(payload, { requestId, characterId, submittedAt } = {}) {
     const entries = normalizeRetrievalStatus(payload).history;
     const expectedTime = typeof submittedAt === 'number' ? submittedAt : Date.parse(submittedAt);
     return entries.find(entry => {
+        if (characterId && entry.characterId && String(entry.characterId).toLowerCase() !== String(characterId).toLowerCase()) return false;
         if (requestId && entry.requestId) return entry.requestId === requestId;
         if (!characterId || String(entry.characterId).toLowerCase() !== String(characterId).toLowerCase()) return false;
         const rawTime = entry.submittedAt || entry.createdAt || entry.startedAt || entry.completedAt || entry.finishedAt
