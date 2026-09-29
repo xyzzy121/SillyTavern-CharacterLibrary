@@ -20,6 +20,7 @@ async function loadProvider(overrides = {}) {
         acquireDatacatExport: async (_id, options) => { calls.push(['acquire', _id, options]); return exportCard(options.sourceKind || 'janitor', options.definitionSource || 'source'); },
         closeDatacatExportPanel() { calls.push(['close']); },
         checkDcPluginAvailable: async () => true, validateDcSession: async () => ({ valid: true }),
+        setTimeout: callback => queueMicrotask(callback),
         submitExtraction: async () => { calls.push(['retrieve']); return { success: true, collected: true, characterId: id }; },
         fetchDatacatCharacter: async () => ({ characterId: id, primary_content_source_kind: 'direct_upload' }),
         assignGalleryId() {}, resolveDatacatAvatarUrl: () => null, slugify: name => name,
@@ -30,7 +31,7 @@ async function loadProvider(overrides = {}) {
     globalThis[key] = mocks;
     const code = await readFile(new URL('datacat-provider.js', root), 'utf8');
     const body = code.slice(code.indexOf('let api = null;'), code.indexOf('const datacatProvider ='));
-    const prefix = `import {getDatacatCharacterId,getDatacatSourceKind,normalizeDatacatSourceKind,normalizeDefinitionSource,parseDatacatUrl,buildDatacatUrl,matchRetrievalStatus,isRetrievalShortcut} from '${contractUrl}';\nclass ProviderBase { init(){} getListingName(row) { return row?.name || ''; } }\nconst {${Object.keys(mocks).join(',')}} = globalThis.${key};\n`;
+    const prefix = `import {getDatacatCharacterId,getDatacatSourceKind,normalizeDatacatSourceKind,normalizeDefinitionSource,parseDatacatUrl,buildDatacatUrl,matchRetrievalStatus,normalizeRetrievalSubmission} from '${contractUrl}';\nclass ProviderBase { init(){} getListingName(row) { return row?.name || ''; } }\nconst {${Object.keys(mocks).join(',')}} = globalThis.${key};\n`;
     const module = await import(`data:text/javascript;base64,${Buffer.from(prefix + body + '\nexport { DatacatProvider };').toString('base64')}`);
     delete globalThis[key];
     const provider = new module.DatacatProvider();
@@ -168,4 +169,64 @@ test('invalid replacement links cannot erase a valid link', async () => {
     assert.throws(() => provider.setLinkInfo(char, { id: 456, fullPath: 'not-a-uuid' }), /valid.*ID/i);
     assert.equal(provider.getLinkInfo(char)?.id, id);
     assert.equal(provider.getLinkInfo(char)?.definitionSource, 'reimagination');
+});
+
+test('direct imports prefer the selected export artwork over unrelated listing artwork', async () => {
+    const downloaded = [];
+    const { provider, calls } = await loadProvider({
+        resolveDatacatAvatarUrl: row => row?.avatar || null,
+        fetchWithProxy: async url => { downloaded.push(url); return { ok: true, arrayBuffer: async () => new ArrayBuffer(10) }; },
+    });
+    const exported = exportCard();
+    exported.imageBuffer = null;
+    exported.card.data.avatar = 'https://datacat.run/media/selected-variant.png';
+    exported.character.avatar = 'https://datacat.run/media/listing.png';
+    const result = await provider.importCharacter(id, null, { acquiredExport: exported });
+    assert.equal(result.success, true);
+    assert.deepEqual(downloaded, ['https://datacat.run/media/selected-variant.png']);
+    assert.equal(calls.find(call => call[0] === 'import')[1].avatarUrl, downloaded[0]);
+});
+
+test('imported-file enrichment accepts only a canonical Datacat UUID', async () => {
+    const { provider } = await loadProvider();
+    assert.equal(await provider.enrichLocalImport({ data: { extensions: { datacat: { id: 412 } } } }), null);
+    const uppercase = id.toUpperCase();
+    const result = await provider.enrichLocalImport({ data: { extensions: { datacat: { id: uppercase } } } });
+    assert.equal(result.providerInfo.charId, id);
+    assert.equal(result.providerInfo.fullPath, id);
+});
+
+test('retrieval updates follow a status-only submission and correlate its request_id', async () => {
+    const statuses = [];
+    let polls = 0;
+    const { provider } = await loadProvider({
+        CoreAPI: { getSetting: name => name === 'datacatReextractOnUpdate' },
+        submitExtraction: async () => ({ status: 'queued', request_id: 'current' }),
+        fetchExtractionStatus: async () => {
+            polls++;
+            return { history: [
+                { request_id: 'stale', character_id: id, status: 'failed', timestamp: Date.now(), message: 'Stale job failed' },
+                ...(polls === 2 ? [{ request_id: 'current', character_id: id, status: 'completed' }] : []),
+            ] };
+        },
+    });
+    await provider.refreshRemoteData({ id, sourceKind: 'janitor' }, { onStatus: text => statuses.push(text) });
+    assert.equal(polls, 2);
+    assert.equal(statuses.at(-1), 'Retrieval complete');
+    assert.equal(statuses.includes('Stale job failed'), false);
+});
+
+test('terminal or malformed retrieval submission results never enter the polling loop', async () => {
+    for (const status of ['completed', 'failed', 'cancelled', 'timed_out', 'invalid']) {
+        const statuses = [];
+        let polls = 0;
+        const { provider } = await loadProvider({
+            CoreAPI: { getSetting: name => name === 'datacatReextractOnUpdate' },
+            submitExtraction: async () => ({ success: true, status, requestId: 'current' }),
+            fetchExtractionStatus: async () => { polls++; return { history: [] }; },
+        });
+        await provider.refreshRemoteData({ id, sourceKind: 'janitor' }, { onStatus: text => statuses.push(text) });
+        assert.equal(polls, 0, `must not poll ${status}`);
+        assert.match(statuses.at(-1), status === 'completed' ? /complete|available/i : /failed|cancelled|timed out|could not|invalid/i);
+    }
 });

@@ -5,7 +5,7 @@ import {
 } from './datacat-api.js';
 import {
     DatacatError, getDatacatCharacterId, getDatacatSourceKind,
-    normalizeDatacatSourceKind, normalizeDefinitionSource,
+    normalizeDatacatSourceKind, normalizeDefinitionSource, getDatacatDefinitionOptions,
 } from './datacat-contract.js';
 import { requestDatacatBrowserExport } from './datacat-export-bridge.js';
 
@@ -45,13 +45,38 @@ export async function acquireDatacatExport(characterId, options = {}) {
         }
     }
     checkCancelled(signal);
-    sourceKind = sourceKind || getDatacatSourceKind(character, null);
+    const metadataId = getDatacatCharacterId(character);
+    const metadataSource = getDatacatSourceKind(character, null);
+    if ((metadataId && metadataId !== id) || (sourceKind && metadataSource && sourceKind !== metadataSource)) {
+        throw new DatacatError('Datacat returned metadata for a different character or source', { code: 'invalid_response' });
+    }
+    sourceKind = sourceKind || metadataSource;
+    if (character) {
+        const available = getDatacatDefinitionOptions(character);
+        if (!available[definitionSource]) {
+            throw new DatacatError(`The selected ${definitionSource === 'source' ? 'Source' : 'Reimagination'} definition is unavailable. Open the Datacat preview to choose an available definition.`, { code: 'selection_unavailable' });
+        }
+        if (variantId && Array.isArray(character.content_variants)) {
+            // A top-level Reimagination may belong to an ordinary source variant;
+            // it need not be duplicated inside that variant's content object.
+            if (!character.content_variants.some(variant => String(variant?.id || variant?.variantId || '') === String(variantId))) {
+                throw new DatacatError('The selected Datacat variant is no longer available. Open the Datacat preview to choose an available version.', { code: 'selection_unavailable' });
+            }
+        }
+    }
     let download;
     let imageBuffer = null;
     try {
         onStatus?.('Fetching Datacat export...');
         download = await fetchDatacatDownload(id, sourceKind, { definitionSource, variantId, signal });
         if (!download) throw new DatacatError('Character export is unavailable on Datacat', { code: 'not_found', status: 404 });
+        // Explicit direct-response selection must agree before enrichment can stamp
+        // link metadata. Native PNGs instead bind selection through the companion.
+        const returnedSelection = download.data?.extensions?.datacat;
+        if (returnedSelection?.definitionSource && returnedSelection.definitionSource !== definitionSource
+            || variantId && returnedSelection?.variantId != null && String(returnedSelection.variantId) !== String(variantId)) {
+            throw new DatacatError('Datacat returned a different definition or variant selection', { code: 'invalid_response' });
+        }
     } catch (error) {
         checkCancelled(signal);
         if (error.code !== 'verification_required' || !interactive) throw error;

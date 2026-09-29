@@ -16,7 +16,7 @@ const rawExport = definition => ({ spec: 'chara_card_v2', data: {
 async function acquisition(overrides = {}) {
     const calls = [];
     const mocks = {
-        fetchDatacatCharacter: async () => { calls.push('detail'); return { character_id: id, name: 'Listing', primary_content_source_kind: 'janitor' }; },
+        fetchDatacatCharacter: async () => { calls.push('detail'); return { character_id: id, name: 'Listing', primary_content_source_kind: 'janitor', content_variants: [{ id: 'janitor_core', content: { datacat_reimagination: { outputText: 'Reimagined definition' } } }] }; },
         fetchDatacatDownload: async (_id, _source, options) => { calls.push(['download', options]); return rawExport(options.definitionSource); },
         buildV2FromDownload: download => { calls.push('build'); return structuredClone(download); },
         hydrateDatacatScripts: async () => { calls.push('scripts'); }, hasUnfetchedLorebook: () => false,
@@ -27,7 +27,7 @@ async function acquisition(overrides = {}) {
     globalThis[key] = mocks;
     let source = await readFile(new URL('datacat-export.js', root), 'utf8');
     source = source.replace(/^import[\s\S]*?;\r?\n/gm, '');
-    const prefix = `import {DatacatError,getDatacatCharacterId,getDatacatSourceKind,normalizeDatacatSourceKind,normalizeDefinitionSource} from '${contractUrl}';\nconst {${Object.keys(mocks).join(',')}} = globalThis.${key};\n`;
+    const prefix = `import {DatacatError,getDatacatCharacterId,getDatacatSourceKind,normalizeDatacatSourceKind,normalizeDefinitionSource,getDatacatDefinitionOptions} from '${contractUrl}';\nconst {${Object.keys(mocks).join(',')}} = globalThis.${key};\n`;
     const module = await import(`data:text/javascript;base64,${Buffer.from(prefix + source).toString('base64')}`);
     delete globalThis[key];
     return { acquire: module.acquireDatacatExport, calls };
@@ -129,4 +129,87 @@ test('a browser export with a different selected definition is refused', async (
         requestDatacatBrowserExport: async () => ({ card: rawExport('Wrong'), definitionSource: 'reimagination' }),
     });
     await assert.rejects(acquire(id, { interactive: true }), { code: 'invalid_response' });
+});
+
+test('an unavailable selected definition cannot be silently exported as Source', async () => {
+    for (const [definitionSource, character] of [
+        ['reimagination', { character_id: id, content_variants: [], primary_content_source_kind: 'janitor' }],
+        ['source', { character_id: id, has_source_definition: false }],
+    ]) {
+        const { acquire, calls } = await acquisition({ fetchDatacatCharacter: async () => character });
+        await assert.rejects(acquire(id, { definitionSource }), { code: 'selection_unavailable' });
+        assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'download'), false);
+    }
+});
+
+test('a missing saved variant cannot silently use the current default variant', async () => {
+    const character = { character_id: id, content_variants: [{ id: 'current', content: { datacat_reimagination: { outputText: 'New version' } } }] };
+    const { acquire, calls } = await acquisition({ fetchDatacatCharacter: async () => character });
+    await assert.rejects(acquire(id, { definitionSource: 'reimagination', variantId: 'removed' }), { code: 'selection_unavailable' });
+    assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'download'), false);
+});
+
+test('top-level Reimagination can be exported for its existing source variant', async () => {
+    const character = { character_id: id, datacat_reimagination: { outputText: 'Reimagined definition' }, content_variants: [{ id: 'janitor_core', content: { personality: 'Source definition' } }] };
+    const { acquire } = await acquisition({ fetchDatacatCharacter: async () => character });
+    const result = await acquire(id, { definitionSource: 'reimagination', variantId: 'janitor_core' });
+    assert.equal(result.card.data.extensions.datacat.variantId, 'janitor_core');
+    assert.equal(result.card.data.extensions.datacat.definitionSource, 'reimagination');
+});
+
+test('stale full metadata from another character is rejected before it can enrich an export', async () => {
+    const { acquire, calls } = await acquisition();
+    await assert.rejects(acquire(id, { character: { _fullCharacter: { character_id: otherId, personality: 'Wrong card', creator_name: 'Wrong creator' } } }), { code: 'invalid_response' });
+    assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'download'), false);
+});
+
+test('metadata for a different source cannot be attached to an explicitly selected source', async () => {
+    const { acquire, calls } = await acquisition({ fetchDatacatCharacter: async () => ({ character_id: id, primary_content_source_kind: 'saucepan' }) });
+    await assert.rejects(acquire(id, { sourceKind: 'janitor' }), { code: 'invalid_response' });
+    assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'download'), false);
+});
+
+test('explicit direct-export definition and variant mismatches cannot be relabelled as the requested selection', async () => {
+    for (const [requested, returned] of [
+        [{ definitionSource: 'source' }, { definitionSource: 'reimagination' }],
+        [{ definitionSource: 'reimagination' }, { definitionSource: 'source' }],
+        [{ definitionSource: 'reimagination', variantId: 'janitor_core' }, { definitionSource: 'reimagination', variantId: 'different-version' }],
+        [{ definitionSource: 'reimagination', variantId: 'janitor_core' }, { definitionSource: 'reimagination', variantId: '' }],
+    ]) {
+        const { acquire, calls } = await acquisition({ fetchDatacatDownload: async () => {
+            const card = rawExport('Different selected content');
+            card.data.extensions.datacat = { id, ...returned };
+            return card;
+        } });
+        await assert.rejects(acquire(id, requested), { code: 'invalid_response' });
+        assert.equal(calls.includes('build'), false);
+        assert.equal(calls.includes('scripts'), false);
+    }
+});
+
+test('legacy exports without selection fields retain explicit requested choice and original-origin metadata', async () => {
+    const { acquire } = await acquisition({ fetchDatacatDownload: async () => {
+        const card = rawExport('Legacy selected content');
+        card.data.extensions.datacat = { id, source: 'saucepan' };
+        return card;
+    } });
+    const result = await acquire(id, { sourceKind: 'janitor', definitionSource: 'reimagination', variantId: 'janitor_core' });
+    assert.equal(result.card.data.extensions.datacat.definitionSource, 'reimagination');
+    assert.equal(result.card.data.extensions.datacat.variantId, 'janitor_core');
+    assert.equal(result.card.data.extensions.datacat.sourceKind, 'janitor');
+    assert.equal(result.card.data.extensions.datacat.source, 'saucepan');
+});
+
+test('verified PNG selection is bound by the companion even when uploaded-card selection metadata is stale', async () => {
+    const { acquire } = await acquisition({
+        fetchDatacatDownload: async () => { throw new contract.DatacatError('Verify', { code: 'verification_required' }); },
+        requestDatacatBrowserExport: async () => {
+            const card = rawExport('Verified selected content');
+            card.data.extensions.datacat = { id, definitionSource: 'source', variantId: 'old-uploaded-version' };
+            return { card, definitionSource: 'reimagination', imageBuffer: new ArrayBuffer(8) };
+        },
+    });
+    const result = await acquire(id, { interactive: true, definitionSource: 'reimagination', variantId: 'janitor_core' });
+    assert.equal(result.card.data.extensions.datacat.definitionSource, 'reimagination');
+    assert.equal(result.card.data.extensions.datacat.variantId, 'janitor_core');
 });

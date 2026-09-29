@@ -10,6 +10,24 @@ These use Node's built-in test runner, with no build system or package installat
 
 Coverage includes current helper routes and visibility fields, explicit export parameters, source and UUID normalization, source-qualified links, native media, nested pagination metadata, clamped and duplicate pages, retrieval correlation and terminal failures, structured errors, authoritative exports, definition persistence, cancellation, and the companion message/PNG contract. Browser and provider tests exercise the actual source modules with their external dependencies replaced.
 
+## 7.3.3 focused audit — 2026-09-28
+
+The audit checked the published Datacat frontend, current native export module, and official SillyTavern bridge. The companion's explicit `buildPngPayload(..., { definitionSource })` call remains current; the official bridge still omits the choice. This release bundles helper **1.13.1**, requires it for Datacat, and leaves the companion at **1.0.1**.
+
+New regressions cover current route aliases; slow creator/search responses; stale Saucepan creator caches; overlapping and failed Meili/Hampter pagination; retrieval submission aliases and terminal outcomes; idle status placeholders; malformed helper responses; cancellation during requests; strict missing-card classification; confirmed-session-only retries; unavailable or mismatched exported definitions/variants; metadata identity; selected artwork; and rejection of numeric file-link IDs.
+
+| Check | Result |
+| --- | --- |
+| Node tests | 133 Datacat tests passed; the whole extension suite passed 265 tests. |
+| Live recent, next page, Fresh windows, tags, features, detail, creator profile and catalog | Passed with an ephemeral anonymous session. A separate integration probe ran the production API module through the production helper route handlers, including automatic session initialization. No tokens were saved. |
+| Live native owner profile and bots endpoint | Passed with an empty sampled catalog; this does not verify a native-card import. |
+| Live missing UUID, authentication, download denial, status projection and legacy status | Passed. Missing details return `not_found`; gated downloads remain `verification_required` even for a nonexistent UUID. No retrieval jobs were submitted. |
+| Current native export call and definition parameters | Confirmed against the published frontend. A bounded Fresh sample had no Reimagination records, so a successful live comparison of both definitions remains unverified. |
+| Full application at desktop 1280×900 and mobile 390×844 | Passed with local API fixtures and production HTML/modules: all nine providers initialized, both definition previews, actual import controls, V2 PNG upload, selection/link preservation, and preview cancellation before replacement. Desktop scenarios also covered overlapping creator lookups, cancelled retrieval submissions without polling, and a late URL lookup superseded by a search. No page errors. |
+| Browser companion at desktop/mobile sizes and insecure HTTP LAN-style origin | Passed: trusted export clicks, both definitions, PNG delivery, serial reuse, Reload, parent/iframe Escape, mobile Back, native cancellation and creator restrictions. Simulated Datacat responses; no page errors. |
+
+Human verification, authenticated exports, physical mobile userscript installation, and the remote effects of retrieval/public-feed visibility remain unverified. Browser fixtures exercise production UI and import code but do not establish that a live challenge can be completed. The 7.3.2 disposable-SillyTavern integration record remains in [the full validation report](../README.md).
+
 ## 7.3.1 regression pass — 2026-09-23
 
 The follow-up bug test added regression coverage for current nested Reimagination variants, native artwork aliases, abandoned retrieval jobs, pagination resets, encoded Saucepan creator catalogs, cancellation before replacement, late preview results, source-qualified and legacy URL linking, definition preservation after metadata failures, and partial lorebooks. Companion coverage now includes HTTP LAN nonce generation, stale replies after Reload, repeated readiness diagnostics, native verification cancellation, creator restrictions, and canonical V2 card validation.
@@ -40,4 +58,4 @@ These browser runs used external API fixtures and did not write to a live SillyT
 | Live retrieval execution and visibility effects | Not performed: no retrieval jobs were submitted during validation. Endpoint, payload, queue/status, cancellation, and timeout handling were checked with fixtures. |
 | Physical mobile browser and userscript manager installation | Not performed. Chromium mobile emulation does not verify every mobile browser or userscript manager. |
 
-The repository update does not install the extension or helper into a running SillyTavern instance. For deployment, update cl-helper to 1.13.0 and restart SillyTavern. Install or update the optional Datacat Export Companion to 1.0.1 for exports that require browser verification. Setup and troubleshooting instructions are in the root README.
+The repository update does not install the extension or helper into a running SillyTavern instance. For deployment, update cl-helper to 1.13.1 and restart SillyTavern. Install or update the optional Datacat Export Companion to 1.0.1 for exports that require browser verification. Setup and troubleshooting instructions are in the root README.

@@ -28,7 +28,7 @@ import {
 } from './datacat-api.js';
 import { getDatacatCharacterId, getDatacatSourceKind, parseDatacatUrl, buildDatacatUrl,
     normalizeDefinitionSource, getDatacatDefinitionOptions, normalizeRetrievalStatus,
-    matchRetrievalStatus, isRetrievalShortcut, getDatacatPageState } from './datacat-contract.js';
+    matchRetrievalStatus, normalizeRetrievalSubmission, getDatacatPageState } from './datacat-contract.js';
 import { acquireDatacatExport } from './datacat-export.js';
 // Saucepan lives in its own provider now; DataCat only needs these two for its
 // saucepan-SOURCED rows (creator listing + open_definition lock state).
@@ -66,6 +66,7 @@ let datacatCurrentOffset = 0;
 let datacatHasMore = true;
 let datacatIsLoading = false;
 let datacatLoadToken = 0;
+let datacatNavigationToken = 0;
 let datacatSelectedChar = null;
 let datacatGridRenderedCount = 0;
 
@@ -333,19 +334,12 @@ function observeNewCards() {
 let datacatAutoTopUps = 0; // chained top-up fetches since the last user-initiated load
 let datacatTopUpVisible = 0; // visible cards accumulated across those chained fetches
 
-// Single owner of the per-mode pagination advance; the Load More button, infinite scroll,
-// and the thin-page top-up chain all route through here. Offset modes (creator + the default
-// recents) have no pre-increment: their offset advances at response time by the rows the server
-// actually returned, because datacat clamps limit server-side (asked 80, returns 50) and a fixed
-// PAGE_SIZE stride was silently skipping the 30 rows between clamp and stride on every page.
+// Load More, infinite scroll, and thin-page top-ups all route through here.
+// Pagination commits only after a current response succeeds, so errors and
+// navigation cannot skip an unfetched page. Offset modes advance by actual rows
+// because the server can clamp PAGE_SIZE to a smaller value.
 function advanceDatacatPage() {
-    if (datacatBrowseMode === 'creator') {
-        // response-time offset advance
-    } else if (isHampterSortMode(datacatSortMode)) {
-        hampterCurrentPage++;
-    } else if (isJannySortMode(datacatSortMode)) {
-        meiliCurrentPage++;
-    }
+    if (datacatIsLoading) return;
     return loadCharacters(true);
 }
 
@@ -407,6 +401,7 @@ function updateLoadMore() {
 async function loadCharacters(append = false) {
     if (append && datacatIsLoading) return;
     if (!append) {
+        beginDatacatNavigation();
         datacatAutoTopUps = 0;
         datacatTopUpVisible = 0;
         // Clearing a search or tag filter can return to Fresh without going through
@@ -444,6 +439,7 @@ async function loadCharacters(append = false) {
                     let full = _saucepanCreatorFullList;
                     if (!full || full.length === 0) {
                         const data = await fetchSaucepanCompanionsOfUser(saucepanCreatorHandle);
+                        if (thisToken !== datacatLoadToken) return;
                         full = data?.characters || [];
                     } else {
                         // Re-sort the cached list (sortCreatorResults mutates in place)
@@ -473,24 +469,26 @@ async function loadCharacters(append = false) {
                 sortCreatorResults(list, datacatCreatorSortMode);
             }
         } else if (isJannySortMode(datacatSortMode)) {
-            if (!append) meiliCurrentPage = 1;
+            const nextPage = append ? meiliCurrentPage + 1 : 1;
             const data = await searchMeiliJanny({
                 search: meiliSearchQuery,
-                page: meiliCurrentPage,
+                page: nextPage,
                 limit: PAGE_SIZE,
                 sort: datacatSortMode,
                 nsfw: datacatNsfwEnabled,
                 includeTags: jannyActiveTagIds,
             });
+            if (thisToken !== datacatLoadToken) return;
+            meiliCurrentPage = nextPage;
             list = data?.characters || [];
             total = data?.totalHits || 0;
             meiliTotalPages = data?.totalPages || 0;
         } else if (isHampterSortMode(datacatSortMode)) {
-            if (!append) hampterCurrentPage = 1;
+            const nextPage = append ? hampterCurrentPage + 1 : 1;
             const hampterSort = datacatSortMode.replace('hampter_', '');
             const fetchOpts = {
                 sort: hampterSort,
-                page: hampterCurrentPage,
+                page: nextPage,
                 search: hampterSearchQuery,
                 nsfw: datacatNsfwEnabled,
                 authToken: (await window.datacatJanitoraiGetToken?.()) || '',
@@ -513,6 +511,8 @@ async function loadCharacters(append = false) {
                     throw err;
                 }
             }
+            if (thisToken !== datacatLoadToken) return;
+            hampterCurrentPage = nextPage;
             list = data?.characters || [];
             total = data?.total || 0;
             hampterTotalPages = total > 0 ? Math.ceil(total / (data?.pageSize || 34)) : 0;
@@ -651,7 +651,6 @@ async function loadCharacters(append = false) {
         if (isHampterTokenExpired) {
             // Stale JanitorAI token: stop cleanly on load-more, prompt a re-paste on a fresh load.
             if (append) {
-                hampterCurrentPage = Math.max(1, hampterCurrentPage - 1);
                 hampterTotalPages = hampterCurrentPage;
                 datacatHasMore = false;
                 updateLoadMore();
@@ -661,7 +660,6 @@ async function loadCharacters(append = false) {
         }
         if (isHampterLoginGated && append) {
             // JanitorAI login-gates page 2+ anonymously; end pagination cleanly instead of erroring.
-            hampterCurrentPage = Math.max(1, hampterCurrentPage - 1);
             hampterTotalPages = hampterCurrentPage;
             datacatHasMore = false;
             updateLoadMore();
@@ -669,8 +667,7 @@ async function loadCharacters(append = false) {
             return;
         }
         if (isHampterBlocked && append) {
-            // Cloudflare block; roll the page back so the next Load More refetches it.
-            hampterCurrentPage = Math.max(1, hampterCurrentPage - 1);
+            // The page counter remains at the last successful response for retry.
             showToast(isJanitorBridgeAvailable()
                 ? 'Cloudflare blocked this page load. Your janitorai.com Cloudflare pass is missing or expired: open janitorai.com in this browser, let it load, then retry.'
                 : 'Cloudflare blocked this page load. Install the companion userscript for reliable access to these sorts.', 'warning', 6000);
@@ -1157,8 +1154,25 @@ function getCreatorCatalogSource(creatorId, source) {
     return ['saucepan', 'direct_upload'].includes(source) ? source : 'datacat';
 }
 
+// Catalog/detail lookups begin before loadCharacters. Invalidate both those
+// lookups and any old page immediately, so late responses cannot change the
+// active creator, reopen a preview, or repaint a retrieval panel.
+function beginDatacatNavigation() {
+    datacatLoadToken++;
+    datacatIsLoading = false;
+    const loadMoreBtn = document.getElementById('datacatLoadMoreBtn');
+    if (loadMoreBtn) {
+        loadMoreBtn.disabled = false;
+        loadMoreBtn.innerHTML = '<i class="fa-solid fa-plus"></i> Load More';
+    }
+    clearExtractionState();
+    return ++datacatNavigationToken;
+}
+
 async function browseCreator(creatorId, opts = {}) {
     if (!creatorId) return;
+    const navigationToken = beginDatacatNavigation();
+    view._cdRef = null;
     const source = getCreatorCatalogSource(creatorId, opts.source);
     datacatBrowseMode = 'creator';
     datacatCreatorId = creatorId;
@@ -1181,6 +1195,7 @@ async function browseCreator(creatorId, opts = {}) {
             debugLog('[DatacatBrowse] Creator metadata unavailable:', error.message);
             return null;
         });
+        if (navigationToken !== datacatNavigationToken) return;
         if (creator) {
             datacatCreatorName = creator.name || creator.userName || creator.username || opts.name || creatorId;
         } else {
@@ -1207,6 +1222,8 @@ async function browseCreator(creatorId, opts = {}) {
 }
 
 function clearCreatorFilter() {
+    beginDatacatNavigation();
+    view._cdRef = null;
     datacatBrowseMode = 'recent';
     datacatCreatorId = null;
     datacatCreatorName = '';
@@ -1362,6 +1379,7 @@ async function performDatacatCreatorSearch() {
         return;
     }
     input.value = '';
+    const navigationToken = beginDatacatNavigation();
 
     // URL detection
     try {
@@ -1421,12 +1439,14 @@ async function performDatacatCreatorSearch() {
 
     // Server-side: the feed search covers creator names, so unloaded creators resolve too
     const feedHit = await resolveCreatorFromFeed(query);
+    if (navigationToken !== datacatNavigationToken) return;
     if (feedHit && routeFromHit(feedHit)) return;
 
     showToast('Creator not found. Try pasting a DataCat creator URL instead.', 'warning');
 }
 
 async function fetchCharacterAndOpenPreview(characterId, sourceKind) {
+    const navigationToken = beginDatacatNavigation();
     const grid = document.getElementById('datacatGrid');
     if (grid) {
         renderLoadingState(grid, 'Looking up character...', 'browse-loading');
@@ -1434,6 +1454,7 @@ async function fetchCharacterAndOpenPreview(characterId, sourceKind) {
 
     try {
         const character = await fetchDatacatCharacter(characterId, sourceKind);
+        if (navigationToken !== datacatNavigationToken) return;
         if (character) {
             openPreviewModal(character);
         } else {
@@ -1441,6 +1462,7 @@ async function fetchCharacterAndOpenPreview(characterId, sourceKind) {
         }
         clearCreatorFilter();
     } catch (e) {
+        if (navigationToken !== datacatNavigationToken) return;
         showToast(`Failed to look up character: ${e.message}`, 'error');
         clearCreatorFilter();
     }
@@ -1466,6 +1488,7 @@ const EXTRACT_SOURCES = {
 };
 
 async function lookupExternalCharacter(charId, originalUrl, source = 'janitor') {
+    const navigationToken = beginDatacatNavigation();
     const grid = document.getElementById('datacatGrid');
     if (grid) {
         renderLoadingState(grid, 'Looking up character on DataCat...', 'browse-loading');
@@ -1479,12 +1502,14 @@ async function lookupExternalCharacter(charId, originalUrl, source = 'janitor') 
 
     try {
         const character = await fetchDatacatCharacter(charId, source);
+        if (navigationToken !== datacatNavigationToken) return;
         if (character) {
             openPreviewModal(character);
             clearCreatorFilter();
             return;
         }
     } catch (error) {
+        if (navigationToken !== datacatNavigationToken) return;
         if (error?.code !== 'not_found') {
             showToast('DataCat lookup failed: ' + error.message, 'error');
             if (grid) renderBrowseError(grid, { message: error.message });
@@ -1541,6 +1566,8 @@ async function startExtraction(janitorUrl, janitorId, source = 'janitor') {
     const extractBtn = document.getElementById('datacatExtractBtn');
     const progressEl = document.getElementById('datacatExtractProgress');
     if (!extractBtn || !progressEl) return;
+    clearExtractionState();
+    const generation = extractionPollGeneration;
 
     extractBtn.disabled = true;
     extractBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Submitting...';
@@ -1555,36 +1582,32 @@ async function startExtraction(janitorUrl, janitorId, source = 'janitor') {
     extractionTargetUrl = janitorUrl;
     extractionTargetId = janitorId;
     extractionStartTime = Date.now();
-    const submittedAt = extractionStartTime;
 
     try {
         const result = await submitExtraction(janitorUrl, { publicFeed: getSetting('datacatPublicFeed') === true });
-        if (extractionStartTime !== submittedAt) return;
+        if (generation !== extractionPollGeneration) return;
 
-        extractionRequestId = result.requestId || result.request_id || result.job?.requestId || result.task?.requestId || null;
-        if (isRetrievalShortcut(result)) {
-            updateExtractionProgress('success', 'Character already retrieved. Loading...');
+        const submission = normalizeRetrievalSubmission(result);
+        extractionRequestId = submission.requestId;
+        if (submission.state === 'existing' || submission.state === 'completed') {
+            updateExtractionProgress('success', 'Character retrieved. Loading...');
             await fetchExtractedCharacter(janitorId, source);
-        } else if (result.queued || result.started || extractionRequestId || ['queued', 'running', 'pending'].includes(result.status)) {
+        } else if (submission.state === 'queued' || submission.state === 'running') {
             extractBtn.innerHTML = '<i class="fa-solid fa-hourglass-half"></i> Retrieving...';
             const position = result.queued ? ` (queue position: ${result.queuePosition || 1})` : '';
             updateExtractionProgress('pending', result.queued ? `Queued for retrieval${position}` : 'Retrieval started, waiting for completion...');
             startExtractionPolling(janitorId, source);
-        } else if (result.requiresLogin) {
+        } else if (result?.requiresLogin) {
             extractBtn.disabled = false;
             extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retrieve Character';
             updateExtractionProgress('error', 'DataCat has no valid session. The retrieval service may be temporarily unavailable.');
-        } else if (result.error || result.errorCode) {
-            extractBtn.disabled = false;
-            extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-            updateExtractionProgress('error', result.message || result.error || 'Retrieval failed');
         } else {
             extractBtn.disabled = false;
             extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-            updateExtractionProgress('error', 'Unexpected response from DataCat');
+            updateExtractionProgress('error', humanizeExtractionError(submission.error || `Retrieval ${submission.state}`));
         }
     } catch (e) {
-        if (extractionStartTime !== submittedAt) return;
+        if (generation !== extractionPollGeneration) return;
         extractBtn.disabled = false;
         extractBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
         updateExtractionProgress('error', `Failed to submit: ${e.message}`);
@@ -1782,6 +1805,8 @@ function updateInlineExtractionCTA(state, detail) {
 async function startModalExtraction(charId, source = 'janitor') {
     const importBtn = document.getElementById('datacatImportBtn');
     if (!importBtn) return;
+    clearExtractionState();
+    const generation = extractionPollGeneration;
 
     const cfg = EXTRACT_SOURCES[source] || EXTRACT_SOURCES.janitor;
     const sourceUrl = `${cfg.urlBase}${charId}`;
@@ -1793,22 +1818,22 @@ async function startModalExtraction(charId, source = 'janitor') {
     extractionTargetUrl = sourceUrl;
     extractionTargetId = charId;
     extractionStartTime = Date.now();
-    const submittedAt = extractionStartTime;
 
     try {
         const result = await submitExtraction(sourceUrl, { publicFeed: getSetting('datacatPublicFeed') === true });
-        if (extractionStartTime !== submittedAt) return;
+        if (generation !== extractionPollGeneration) return;
 
-        extractionRequestId = result.requestId || result.request_id || result.job?.requestId || result.task?.requestId || null;
-        if (isRetrievalShortcut(result)) {
+        const submission = normalizeRetrievalSubmission(result);
+        extractionRequestId = submission.requestId;
+        if (submission.state === 'existing' || submission.state === 'completed') {
             updateInlineExtractionCTA('done');
             await fetchExtractedCharacter(charId, source);
-        } else if (result.queued || result.started || extractionRequestId || ['queued', 'running', 'pending'].includes(result.status)) {
+        } else if (submission.state === 'queued' || submission.state === 'running') {
             importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Retrieving...';
             const position = result.queued ? ` (${result.queuePosition || 1})` : '';
             updateInlineExtractionCTA('extracting', position.trim() ? `Queue position${position}` : '');
             startModalExtractionPolling(charId, source);
-        } else if (result.requiresLogin) {
+        } else if (result?.requiresLogin) {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Extract';
             updateInlineExtractionCTA('error', 'Session unavailable');
@@ -1816,11 +1841,12 @@ async function startModalExtraction(charId, source = 'janitor') {
         } else {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
-            updateInlineExtractionCTA('error', result.message || result.error || 'Retrieval failed');
-            showToast(result.message || result.error || 'Retrieval failed', 'error');
+            const message = humanizeExtractionError(submission.error || `Retrieval ${submission.state}`);
+            updateInlineExtractionCTA('error', message);
+            showToast(message, 'error');
         }
     } catch (e) {
-        if (extractionStartTime !== submittedAt) return;
+        if (generation !== extractionPollGeneration) return;
         importBtn.disabled = false;
         importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Retry';
         updateInlineExtractionCTA('error', e.message);
@@ -1903,6 +1929,7 @@ function updateFollowButton(creatorId, source = datacatCreatorSource) {
 }
 
 async function switchDatacatViewMode(mode) {
+    beginDatacatNavigation();
     datacatViewMode = mode;
 
     document.querySelectorAll('.datacat-view-btn').forEach(btn => {
@@ -2218,6 +2245,7 @@ let datacatLastCreatorNotes = '';
 let datacatImportController = null;
 
 function openPreviewModal(hit) {
+    datacatNavigationToken++;
     datacatImportController?.abort();
     clearExtractionState();
     datacatSelectedChar = hit;
@@ -2765,6 +2793,7 @@ function cleanupDatacatCharModal() {
 }
 
 function closePreviewModal() {
+    datacatNavigationToken++;
     datacatImportController?.abort();
     datacatDetailFetchToken++;
     datacatDetailFetchPromise = null;
@@ -4047,6 +4076,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
     }
 
     deactivate() {
+        beginDatacatNavigation();
         datacatDetailFetchToken++;
         delegatesInitialized = false;
         clearExtractionState();

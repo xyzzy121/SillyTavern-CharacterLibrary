@@ -987,6 +987,12 @@ function registerDataCatRoutes(router) {
                 }
                 // Restrictions and outages are not evidence that the token expired.
                 if (check.status !== 401) return res.json({ ok: false, reason: `Session check returned ${check.status}` });
+                const failure = await check.json();
+                const sessionError = [failure?.code, failure?.errorCode, failure?.error?.code, failure?.error?.message,
+                    typeof failure?.error === 'string' ? failure.error : '', failure?.message].filter(Boolean).join(' ');
+                if (!/(?:SESSION|TOKEN).*(?:INVALID|EXPIRED|REQUIRED|MISSING)|(?:INVALID|EXPIRED|MISSING|NO).*(?:SESSION|TOKEN)/i.test(sessionError)) {
+                    return res.json({ ok: false, reason: 'Authentication failed; the existing session was preserved' });
+                }
             } catch (error) { return res.json({ ok: false, reason: 'Could not validate the existing DataCat session' }); }
             dcSessionToken = null;
         }
@@ -1168,8 +1174,19 @@ function registerDataCatRoutes(router) {
             catch {
                 return res.status(response.ok ? 502 : response.status).json({ error: 'DataCat returned an invalid retrieval response', code: 'INVALID_RESPONSE' });
             }
-            // Preserve upstream classifications; expose our correlation ID if upstream omits it.
-            res.status(response.status).json({ ...data, requestId: data.requestId || requestId });
+            // Do not turn a malformed successful response into an apparently queued job
+            // simply by adding our locally generated correlation ID.
+            const fields = ['success', 'error', 'errorCode', 'requestId', 'request_id', 'idempotencyKey',
+                'status', 'state', 'phase', 'lifecycle', 'job', 'run', 'task', 'queued', 'started',
+                'alreadyExists', 'alreadyRetrieved', 'cached', 'skipped', 'skippedExtraction', 'reused', 'shortcut'];
+            if (!data || typeof data !== 'object' || Array.isArray(data) || (response.ok && !fields.some(key => Object.hasOwn(data, key)))) {
+                return res.status(response.ok ? 502 : response.status).json({ error: 'DataCat returned an invalid retrieval response', code: 'INVALID_RESPONSE' });
+            }
+            const job = data.job || data.run || data.task;
+            const upstreamRequestId = data.requestId || data.request_id || data.idempotencyKey
+                || job?.requestId || job?.request_id || job?.idempotencyKey || job?.id;
+            // Preserve upstream classifications and request aliases before using our sent ID.
+            res.status(response.status).json({ ...data, requestId: upstreamRequestId || requestId });
         } catch (err) {
             console.error('[cl-helper] DC extract error:', err.message);
             res.status(502).json({ error: 'Failed to reach DataCat' });

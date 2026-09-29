@@ -10,7 +10,7 @@ node --test tests/**/*.test.mjs
 
 The suite requires no frontend build system, npm installation, credentials, or running SillyTavern server. It executes production functions and modules with controlled network, DOM, and persistence boundaries. Tests cover failure cases as well as successful operations.
 
-Final 7.3.2 result: **231 tests passed**, including **132 new regressions** alongside the existing 99 Datacat tests. All **73 non-vendor JavaScript files** and the optional integration harness passed syntax checks; `git diff --check` passed.
+Final 7.3.3 result: **265 tests passed**, including **133 Datacat tests** and **132 tests for other extension behavior**. The focused Datacat audit added 34 regressions to the 7.3.2 suite. Current live-service and browser results are in the [Datacat validation record](datacat/README.md). All **73 non-vendor JavaScript files** and the optional integration harness passed syntax checks; `git diff --check` passed.
 
 ## 7.3.2 integration record — 2026-09-28
 

@@ -28,7 +28,7 @@ function harness(overrides = {}) {
         querySelectorAll() { return []; }
     }
     const make = name => { const element = new Element(name); elements.set(name, element); return element; };
-    for (const name of ['datacatGrid', 'datacatCharDefinitionLoading', 'datacatCharDescriptionSection', 'datacatCharDescription', 'datacatCharCreatorNotesSection', 'datacatCharCreatorNotes', 'datacatImportBtn']) make(name);
+    for (const name of ['datacatGrid', 'datacatCharDefinitionLoading', 'datacatCharDescriptionSection', 'datacatCharDescription', 'datacatCharCreatorNotesSection', 'datacatCharCreatorNotes', 'datacatImportBtn', 'datacatCreatorBannerName', 'datacatCreatorBanner', 'datacatExtractBtn', 'datacatExtractProgress']) make(name);
     const document = { getElementById: name => elements.get(name) || null, createElement: () => new Element(), querySelector: () => null, querySelectorAll: () => [] };
     const noop = () => {};
     const core = new Proxy({
@@ -48,6 +48,8 @@ function harness(overrides = {}) {
         isCharPossibleMatch() { return false; }
         updateLoadMoreVisibility() {}
         _setScrollIndicator() {}
+        deactivate() {}
+        disconnectImageObserver() {}
     }
     const context = vm.createContext({ ...contract, CoreAPI: core, BrowseView, document, window: {},
         JANNY_TAG_MAP: {}, IMG_PLACEHOLDER: '', BROWSE_PURIFY_CONFIG: {},
@@ -69,6 +71,14 @@ function harness(overrides = {}) {
         globalThis.testApi = {
             preview: fetchAndPopulateDetails, import: importCharacter, selector: renderDatacatDefinitionSelector,
             close: closePreviewModal,
+            deactivate: () => view.deactivate(),
+            creator: browseCreator, clearCreator: clearCreatorFilter,
+            lookup: fetchCharacterAndOpenPreview, externalLookup: lookupExternalCharacter,
+            creatorDownloadReference: () => view._cdRef,
+            extract: startExtraction, modalExtract: startModalExtraction,
+            pollRetrieval: pollDatacatRetrieval,
+            setupRetrieval(requestId, submittedAt) { extractionRequestId = requestId; extractionStartTime = submittedAt; },
+            retrievalRequestId: () => extractionRequestId,
             follow: query => view.followCreator(query),
             creatorReference: parseDatacatCreatorReference, creatorCatalogSource: getCreatorCatalogSource,
             followed: () => datacatFollowedCreators,
@@ -337,4 +347,242 @@ test('Following Manager resolves native-owner and encoded Saucepan Datacat URLs'
     assert.equal(h.api.creatorCatalogSource('saucepan:' + id, 'saucepan'), 'datacat');
     assert.equal(h.api.creatorCatalogSource(id, 'saucepan'), 'saucepan');
     assert.equal(h.api.creatorReference('https://example.com/creators/' + id), null);
+});
+
+test('late creator metadata cannot replace the selected creator download target', async () => {
+    let resolveFirst;
+    const requests = [];
+    const h = harness({ dependencies: {
+        fetchDatacatCreator: creatorId => creatorId === id
+            ? new Promise(resolve => { resolveFirst = resolve; }) : Promise.resolve({ name: 'Second creator' }),
+        fetchDatacatCreatorCharacters: async creatorId => { requests.push(creatorId); return { list: [], total: 0 }; },
+    } });
+    h.api.configure();
+    const first = h.api.creator(id);
+    await h.api.creator(id2);
+    resolveFirst({ name: 'First creator' });
+    await first;
+    assert.equal(h.api.creatorDownloadReference().creatorId, id2);
+    assert.equal(h.elements.get('datacatCreatorBannerName').textContent, 'Second creator');
+    assert.deepEqual(requests, [id2]);
+});
+
+test('clearing a creator before its metadata resolves does not restore the stale creator banner', async () => {
+    let resolveCreator;
+    const h = harness({ dependencies: { fetchDatacatCreator: () => new Promise(resolve => { resolveCreator = resolve; }) } });
+    h.api.configure();
+    const browsing = h.api.creator(id);
+    h.api.clearCreator();
+    resolveCreator({ name: 'Old creator' });
+    await browsing;
+    assert.equal(h.api.creatorDownloadReference(), null);
+    assert.notEqual(h.elements.get('datacatCreatorBannerName').textContent, 'Old creator');
+});
+
+test('late URL lookups cannot reopen a preview or offer retrieval after a replacement browse', async () => {
+    for (const external of [false, true]) {
+        for (const found of [false, true]) {
+            let resolveLookup;
+            const h = harness({ dependencies: { fetchDatacatCharacter: () => new Promise(resolve => { resolveLookup = resolve; }) } });
+            h.api.configure(); h.api.watchSelection();
+            const lookup = external ? h.api.externalLookup(id, 'https://janitorai.com/characters/' + id) : h.api.lookup(id);
+            await h.api.load(false);
+            const gridBefore = h.elements.get('datacatGrid').innerHTML;
+            resolveLookup(found ? full : null);
+            await lookup;
+            assert.equal(h.context.changedHit, undefined);
+            assert.equal(h.elements.get('datacatGrid').innerHTML, gridBefore);
+        }
+    }
+});
+
+test('failed Meili and Hampter load-more requests retry the failed page without skipping rows', async () => {
+    for (const sort of ['janny_newest', 'hampter_latest']) {
+        const requests = [];
+        const fetchPage = async options => {
+            requests.push(options.page);
+            if (requests.length === 2) throw new Error('Temporary service failure');
+            return { characters: [full], totalPages: 4, total: 136, pageSize: 34 };
+        };
+        const h = harness({ dependencies: { searchMeiliJanny: fetchPage, fetchHampterCharacters: fetchPage } });
+        h.api.configure({ sort });
+        await h.api.load(false); await h.api.advance(); await h.api.advance();
+        assert.deepEqual(requests, [1, 2, 2]);
+    }
+});
+
+test('a late Saucepan creator page cannot poison the newly selected creator cache', async () => {
+    let resolveFirst;
+    let callCount = 0;
+    const h = harness({ dependencies: { fetchSaucepanCompanionsOfUser: async () => {
+        if (++callCount === 1) return new Promise(resolve => { resolveFirst = resolve; });
+        return { characters: [...Array.from({ length: 80 }, () => full), { ...full, character_id: id2 }] };
+    } } });
+    h.api.configure({ creator: id, source: 'saucepan' });
+    const first = h.api.load(false);
+    h.api.configure({ creator: id2, source: 'saucepan' });
+    await h.api.load(false);
+    resolveFirst({ characters: [full] }); await first;
+    await h.api.advance();
+    assert.equal(h.api.state().ids.length, 2);
+    assert.equal(h.api.state().offset, 81);
+});
+
+test('concurrent load-more calls cannot skip a Meili or Hampter page', async () => {
+    for (const sort of ['janny_newest', 'hampter_latest']) {
+        const requests = [];
+        let resolveSecond;
+        const page = { characters: [full], totalPages: 4, total: 136, pageSize: 34 };
+        const fetchPage = async options => {
+            requests.push(options.page);
+            if (options.page === 2) return new Promise(resolve => { resolveSecond = resolve; });
+            return page;
+        };
+        const h = harness({ dependencies: { searchMeiliJanny: fetchPage, fetchHampterCharacters: fetchPage } });
+        h.api.configure({ sort }); await h.api.load(false);
+        const second = h.api.advance();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await h.api.advance();
+        resolveSecond(page); await second; await h.api.advance();
+        assert.deepEqual(requests, [1, 2, 3]);
+    }
+});
+
+test('deactivation cannot commit an unfinished Meili or Hampter page', async () => {
+    for (const sort of ['janny_newest', 'hampter_latest']) {
+        const requests = [];
+        let resolveSecond;
+        const page = { characters: [full], totalPages: 4, total: 136, pageSize: 34 };
+        const fetchPage = async options => {
+            requests.push(options.page);
+            if (requests.length === 2) return new Promise(resolve => { resolveSecond = resolve; });
+            return page;
+        };
+        const h = harness({ dependencies: { searchMeiliJanny: fetchPage, fetchHampterCharacters: fetchPage } });
+        h.api.configure({ sort }); await h.api.load(false);
+        const second = h.api.advance();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        h.api.deactivate(); resolveSecond(page); await second;
+        h.api.configure({ sort }); await h.api.advance();
+        assert.deepEqual(requests, [1, 2, 2]);
+    }
+});
+
+function retrievalClock() {
+    let now = 1800000000000;
+    let nextId = 0;
+    const tasks = new Map();
+    return {
+        Date: class extends Date { static now() { return now; } },
+        setTimeout(fn, delay) { const id = ++nextId; tasks.set(id, { fn, at: now + delay }); return id; },
+        clearTimeout(id) { tasks.delete(id); },
+        pending: () => tasks.size,
+        async tick() {
+            const task = [...tasks].sort((a, b) => a[1].at - b[1].at)[0];
+            assert.ok(task, 'a retrieval poll is scheduled');
+            tasks.delete(task[0]); now = task[1].at;
+            await task[1].fn();
+        },
+    };
+}
+
+test('grid and modal retrieval submissions stop immediately on terminal failures despite a request ID', async () => {
+    for (const modal of [false, true]) for (const status of ['failed', 'cancelled', 'timed_out']) {
+        const clock = retrievalClock();
+        const h = harness({ dependencies: { ...clock, submitExtraction: async () => ({ status, requestId: 'failed-job', message: 'Terminal ' + status }) } });
+        if (modal) await h.api.modalExtract(id); else await h.api.extract('https://janitorai.com/characters/' + id, id);
+        assert.equal(clock.pending(), 0);
+        const button = h.elements.get(modal ? 'datacatImportBtn' : 'datacatExtractBtn');
+        assert.equal(button.disabled, false);
+        assert.match(button.innerHTML, /Retry/);
+        if (!modal) assert.match(h.elements.get('datacatExtractProgress').innerHTML, /Terminal/);
+    }
+});
+
+test('retrieval submission completion and existing-card shortcuts load directly without polling', async () => {
+    for (const modal of [false, true]) for (const result of [
+        { run: { status: 'completed', request_id: 'done' } },
+        { skippedExtraction: true, collected: true, characterId: id },
+    ]) {
+        const clock = retrievalClock();
+        const h = harness({ dependencies: { ...clock, submitExtraction: async () => result } });
+        h.api.watchSelection();
+        if (modal) await h.api.modalExtract(id); else await h.api.extract('https://janitorai.com/characters/' + id, id);
+        assert.equal(clock.pending(), 0);
+        assert.equal(h.context.changedHit.character_id, id);
+    }
+});
+
+test('a superseded submission cannot reset a newer retrieval even with identical timestamps', async () => {
+    let resolveFirst;
+    let count = 0;
+    const clock = retrievalClock();
+    const h = harness({ dependencies: { ...clock, submitExtraction: () => ++count === 1
+        ? new Promise(resolve => { resolveFirst = resolve; }) : Promise.resolve({ run: { status: 'queued', request_id: 'second-job' } }) } });
+    const first = h.api.modalExtract(id);
+    await h.api.modalExtract(id2);
+    resolveFirst({ requestId: 'first-job', status: 'failed' }); await first;
+    assert.equal(h.api.retrievalRequestId(), 'second-job');
+    assert.equal(h.elements.get('datacatImportBtn').disabled, true);
+    assert.match(h.elements.get('datacatImportBtn').innerHTML, /Retrieving/);
+    assert.equal(clock.pending(), 1);
+    h.api.close(); assert.equal(clock.pending(), 0);
+});
+
+test('preview retrieval polling ignores stale/unrelated history and reports each terminal outcome', async () => {
+    for (const status of ['completed', 'failed', 'cancelled', 'timed_out']) {
+        const clock = retrievalClock();
+        const events = [];
+        let polls = 0;
+        const h = harness({ dependencies: { ...clock, fetchExtractionStatus: async () => ({ history: ++polls === 1 ? [
+            { requestId: 'old-job', characterId: id, status: 'completed' },
+            { requestId: 'other-job', characterId: id2, status: 'completed' },
+        ] : [{ requestId: 'current-job', characterId: id, status }] }) } });
+        h.api.setupRetrieval('current-job', clock.Date.now());
+        h.api.pollRetrieval(id, { progress: message => events.push(['progress', message]), complete: () => events.push(['complete']), failed: message => events.push(['failed', message]) });
+        await clock.tick(); assert.deepEqual(events.map(row => row[0]), ['progress']);
+        await clock.tick(); assert.equal(events.at(-1)[0], status === 'completed' ? 'complete' : 'failed');
+        assert.equal(clock.pending(), 0);
+    }
+});
+
+test('preview retrieval polling times out and cancellation ignores an in-flight status response', async () => {
+    const clock = retrievalClock();
+    const events = [];
+    const h = harness({ dependencies: { ...clock, fetchExtractionStatus: async () => ({ history: [] }) } });
+    h.api.setupRetrieval('job', clock.Date.now());
+    h.api.pollRetrieval(id, { progress() {}, complete: () => events.push('complete'), failed: message => events.push(message) });
+    while (clock.pending()) await clock.tick();
+    assert.equal(events.length, 1); assert.match(events[0], /timed out/);
+
+    let resolveStatus;
+    const cancelledClock = retrievalClock();
+    const cancelled = harness({ dependencies: { ...cancelledClock, fetchExtractionStatus: () => new Promise(resolve => { resolveStatus = resolve; }) } });
+    cancelled.api.setupRetrieval('job', cancelledClock.Date.now());
+    cancelled.api.pollRetrieval(id, { progress: () => assert.fail('cancelled'), complete: () => assert.fail('cancelled'), failed: () => assert.fail('cancelled') });
+    const pending = cancelledClock.tick(); cancelled.api.close();
+    resolveStatus({ history: [{ requestId: 'job', status: 'completed' }] }); await pending;
+    assert.equal(cancelledClock.pending(), 0);
+});
+
+test('creator downloads reject terminal or malformed submissions without waiting for status', async () => {
+    for (const submission of [{ status: 'failed', requestId: 'job' }, { run: { status: 'cancelled', request_id: 'job' } }, { task: { status: 'timed_out' } }, {}]) {
+        let polls = 0;
+        const h = bulkHarness({ submitExtraction: async () => submission, fetchExtractionStatus: async () => { polls++; return {}; }, setTimeout: () => assert.fail('terminal submission must not wait') });
+        await assert.rejects(h.retrieve({ _cdCancelled: false }, id, 'janitor'), /Retrieval/);
+        assert.equal(polls, 0);
+    }
+});
+
+test('creator downloads match nested submission IDs and ignore stale completed jobs', async () => {
+    let polls = 0;
+    const h = bulkHarness({ submitExtraction: async () => ({ run: { status: 'queued', request_id: 'current-job' } }),
+        setTimeout: fn => { fn(); return 1; },
+        fetchExtractionStatus: async () => ({ history: ++polls === 1
+            ? [{ requestId: 'old-job', characterId: id, status: 'completed', completedAt: Date.now() + 5000 }]
+            : [{ requestId: 'current-job', characterId: id, status: 'completed' }] }),
+    });
+    const result = await h.retrieve({ _cdCancelled: false }, id, 'janitor');
+    assert.equal(polls, 2);
+    assert.equal(result.character_id, id);
 });

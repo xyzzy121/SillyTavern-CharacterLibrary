@@ -73,7 +73,8 @@ test('verification, restrictions, and outages remain distinct from missing conte
     assert.equal(c.classifyDatacatError(429, {}).code, 'rate_limited');
     assert.equal(c.classifyDatacatError(429, { error: 'CHARACTER_DOWNLOAD_TURNSTILE_RATE_LIMITED' }).code, 'rate_limited');
     assert.equal(c.classifyDatacatError(503, { error: 'TURNSTILE_UNAVAILABLE' }).code, 'service_unavailable');
-    assert.equal(c.classifyDatacatError(404, {}).code, 'not_found');
+    assert.equal(c.classifyDatacatError(404, {}).code, 'request_failed');
+    assert.equal(c.classifyDatacatError(404, { error: 'Character not found' }).code, 'not_found');
 });
 
 test('retrieval correlation rejects stale history and matches current terminal jobs', () => {
@@ -148,4 +149,38 @@ test('abandoned retrievals are failures even when the terminal job omits an erro
     const result = c.matchRetrievalStatus({ latestTerminalJob: { requestId: 'abandoned-request', lifecycle: 'terminal', terminalStatus: 'abandoned' } }, { requestId: 'abandoned-request' });
     assert.equal(result.success, false);
     assert.equal(c.matchRetrievalStatus({ history: [{ requestId: 'abandoned-request', status: 'abandoned' }] }, { requestId: 'abandoned-request' }).success, false);
+});
+
+test('current top-level and legacy route aliases preserve source identity', () => {
+    for (const view of ['recent2', 'mine2', 'recent_v1', 'mine_v1', 'yours', 'basket']) {
+        for (const [source, sourceKind] of [['janitor', 'janitor'], ['sauce', 'saucepan'], ['direct', 'direct_upload']]) {
+            assert.deepEqual(c.parseDatacatUrl(`https://datacat.run/${view}/${source}/${id}_name`), { id, sourceKind });
+        }
+        assert.deepEqual(c.parseDatacatUrl(`https://datacat.run/${view}/${id}`), { id, sourceKind: null });
+    }
+    assert.equal(c.parseDatacatUrl(`https://datacat.run/settings/direct/${id}`), null);
+});
+
+test('retrieval submissions classify terminal failures before correlation IDs or success flags', () => {
+    for (const [status, state] of [['failed', 'failed'], ['cancelled', 'cancelled'], ['canceled', 'cancelled'],
+        ['abandoned', 'cancelled'], ['timeout', 'timed_out'], ['timed_out', 'timed_out']]) {
+        assert.equal(c.normalizeRetrievalSubmission({ success: true, requestId: 'job', status }).state, state);
+        assert.equal(c.isRetrievalShortcut({ status, alreadyExists: true }), false);
+    }
+    assert.equal(c.normalizeRetrievalSubmission({ status: 'queued', request_id: 'job' }).requestId, 'job');
+    assert.equal(c.normalizeRetrievalSubmission({ job: { status: 'running', request_id: 'job' } }).state, 'running');
+    assert.equal(c.normalizeRetrievalSubmission({ job: { status: 'running', request_id: 'job' } }).requestId, 'job');
+    assert.equal(c.normalizeRetrievalSubmission({ alreadyExists: true }).state, 'existing');
+    assert.equal(c.normalizeRetrievalSubmission({ status: 'completed', characterId: id }).state, 'completed');
+    assert.equal(c.normalizeRetrievalSubmission({ requestId: 'job', error: 'Restricted' }).state, 'failed');
+    assert.equal(c.normalizeRetrievalSubmission({ status: 'queued', job: { status: 'failed' } }).state, 'failed');
+    assert.equal(c.normalizeRetrievalSubmission({ error: { code: 'RESTRICTED', message: 'Creator restricted' } }).error, 'Creator restricted');
+    for (const raw of [{}, null, [], { success: true, status: 'unrecognized' }]) assert.equal(c.normalizeRetrievalSubmission(raw).state, 'invalid');
+});
+
+test('current idle job placeholders do not appear as active retrievals', () => {
+    assert.equal(c.normalizeRetrievalStatus({ inProgress: null, run: null, task: null, queueLength: 0,
+        job: { lifecycle: 'idle', status: 'idle', requestId: null, characterId: null } }).inProgress, null);
+    assert.equal(c.normalizeRetrievalStatus({ inProgress: { requestId: 'legacy-active' } }).inProgress.requestId, 'legacy-active');
+    assert.equal(c.normalizeRetrievalStatus({ job: { lifecycle: 'running', status: 'new-upstream-phase', requestId: 'running' } }).inProgress.requestId, 'running');
 });

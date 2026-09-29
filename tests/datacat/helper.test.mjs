@@ -76,3 +76,38 @@ test('retrieval preserves structured upstream restrictions and rejects invalid c
     assert.equal(response.status, 503);
     assert.equal(response.body.code, 'INVALID_RESPONSE');
 });
+
+test('retrieval keeps upstream request aliases and does not invent jobs from malformed JSON', async () => {
+    let payload;
+    const route = harness(async () => json(payload));
+    await route('POST', '/dc-set-token', { body: { token: 'fixture-token' } });
+    const req = { body: { url: `https://janitorai.com/characters/${id}` } };
+    for (const value of [{ status: 'queued', request_id: 'upstream-job' }, { job: { status: 'running', request_id: 'upstream-job' } }]) {
+        payload = value;
+        assert.equal((await route('POST', '/dc-extract', req)).body.requestId, 'upstream-job');
+    }
+    for (const value of [{}, null, [], 'accepted', { message: 'Unexpected' }, { code: 'UNKNOWN' }]) {
+        payload = value;
+        const result = await route('POST', '/dc-extract', req);
+        assert.equal(result.status, 502);
+        assert.equal(result.body.code, 'INVALID_RESPONSE');
+        assert.equal(result.body.requestId, undefined);
+    }
+});
+
+test('helper preserves a cached token on generic401 and refreshes only a confirmed expired session', async () => {
+    const requests = [];
+    let expired = false;
+    const route = harness(async url => {
+        requests.push(url);
+        if (url.endsWith('/identify')) return json({ success: true, sessionToken: 'new-fixture-token' });
+        return json({ error: expired ? 'Invalid session' : 'Authentication required' }, 401);
+    });
+    await route('POST', '/dc-set-token', { body: { token: 'fixture-token' } });
+    assert.equal((await route('POST', '/dc-init', { body: {} })).body.ok, false);
+    assert.equal((await route('GET', '/dc-session')).body.active, true);
+    assert.equal(requests.length, 1);
+    expired = true;
+    assert.equal((await route('POST', '/dc-init', { body: {} })).body.ok, true);
+    assert.equal(requests.filter(url => url.endsWith('/identify')).length, 1);
+});

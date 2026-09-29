@@ -4,7 +4,7 @@ A powerful SillyTavern extension for discovering, organizing, and managing your 
 
 > **Note:** This is a hobby project but things mostly work. Expect bugs, use at your own risk.
 
-**7.3.2 maintenance update:** fixes card-save and linking races, failed storage writes, snapshot and playlist preservation, lorebook and CSS editing, provider update error handling, and launcher settings. Tested with a disposable SillyTavern 1.19.0 instance on desktop and mobile browser layouts. See the [regression and integration validation record](tests/README.md) for coverage, test commands, and remaining live-service checks. The bundled helper remains 1.13.0 and the optional Datacat companion remains 1.0.1.
+**7.3.3 Datacat update:** fixes current Datacat links, stale creator/search results, pagination retries, retrieval failures and request correlation, saved definition/variant checks, and selected export artwork. Live browsing and API checks passed against current Datacat; verified exports are covered by browser fixtures, with human verification still a live-test limitation. Update the bundled **cl-helper to 1.13.1 and restart SillyTavern**. The optional Datacat companion remains **1.0.1**. See the [Datacat validation record](tests/datacat/README.md) and [whole-extension regression record](tests/README.md).
 
 ## Screenshots
 
@@ -692,7 +692,7 @@ CharacterTavern requires a session cookie for NSFW content. To set it up:
 <details>
 <summary><h3>DataCat (Experimental)</h3></summary>
 
-**Auth:** Browsing uses an anonymous session created by **cl-helper 1.13.0 or newer**. Datacat can require human verification before exporting a card; that happens in your browser on Datacat.
+**Auth:** Browsing uses an anonymous session created by **cl-helper 1.13.1 or newer**. Datacat can require human verification before exporting a card; that happens in your browser on Datacat.
 
 > **Experimental and disabled by default.** Enable it in Settings > Online > Providers. Existing provider preferences and card links are preserved when updating.
 
@@ -704,7 +704,7 @@ CharacterTavern requires a session cookie for NSFW content. To set it up:
 
 #### Setup and upgrading
 
-1. Install or update the bundled **cl-helper to 1.13.0**, then **restart SillyTavern**. Updating the extension alone does not reload a running server plugin. Settings > Info shows the helper's running version and update controls.
+1. Install or update the bundled **cl-helper to 1.13.1**, then **restart SillyTavern**. Updating the extension alone does not reload a running server plugin. Settings > Info shows the helper's running version and update controls.
 2. Enable DataCat in Settings > Online > Providers. Its browsing session initializes automatically.
 3. For downloads that request verification, install or update [the Datacat Export Companion to 1.0.1](extras/cl-datacat-bridge.user.js) in Tampermonkey or Violentmonkey on the browser where you use CharacterLibrary. Allow it on datacat.run, including frames. It needs page-context execution to call Datacat's export tools.
 4. Click Import or check a single linked card for updates. When the Datacat panel opens, click **Export to Character Library** inside it and complete Datacat's verification. The companion passes your selected Source/Reimagination choice to Datacat's own export function and returns the PNG card. Datacat account credentials stay on Datacat.
@@ -714,7 +714,7 @@ User-started bulk imports reuse one panel and export characters serially. Batch 
 
 The helper session and the embedded Datacat browser session are separate. Verifying an export in the browser does not unlock the helper's downloads or share a login token with CharacterLibrary. Creator download restrictions and redirects are reported instead of falling back to a reconstructed card.
 
-CharacterLibrary **7.3.1** fixes the export panel on HTTP local-network addresses, panel reload isolation, native verification cancellation, and creator restriction reporting. It also corrects current Reimagination detection and native artwork, feed and creator pagination, cancelled preview imports, URL linking, and incomplete-lorebook update comparisons. The helper requirement remains **1.13.0**. See the [validation record](tests/datacat/README.md) for automated coverage and live-test limitations.
+CharacterLibrary **7.3.3** also recognizes current Recent/Mine/Basket links and refuses an unavailable saved definition or variant. If Datacat removed the selected version, open the preview and explicitly choose an available one before importing or updating. Authentication, browser verification, creator restrictions, missing cards, and service failures stay distinct; a generic authentication failure does not replace an existing session. See the [validation record](tests/datacat/README.md) for automated coverage and live-test limitations.
 
 #### Retrieval
 

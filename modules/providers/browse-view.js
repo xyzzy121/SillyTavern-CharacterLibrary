@@ -7,7 +7,7 @@ import { BOTBOORU_BASE, fetchBotbooruUser } from './botbooru/botbooru-api.js';
 import { fetchCharactersByOwner, getCharacterPageUrl } from './pygmalion/pygmalion-api.js';
 import { WYVERN_API_BASE, WYVERN_SITE_BASE, getWyvernHeaders, getWyvernCharName } from './wyvern/wyvern-api.js';
 import { fetchDatacatCreatorCharacters, fetchDatacatCharacter, submitExtraction, fetchExtractionStatus } from './datacat/datacat-api.js';
-import { getDatacatCharacterId, getDatacatSourceKind, getDatacatPageState, buildDatacatUrl, normalizeRetrievalStatus, matchRetrievalStatus, isRetrievalShortcut } from './datacat/datacat-contract.js';
+import { getDatacatCharacterId, getDatacatSourceKind, getDatacatPageState, buildDatacatUrl, normalizeRetrievalStatus, matchRetrievalStatus, normalizeRetrievalSubmission } from './datacat/datacat-contract.js';
 import { closeDatacatExportPanel } from './datacat/datacat-export-bridge.js';
 import { fetchSaucepanCompanionsOfUser } from './saucepan/saucepan-api.js';
 import { fetchJanitoraiCharacters } from './janitorai/janitorai-api.js';
@@ -139,8 +139,12 @@ async function cdDatacatExtract(view, charId, sourceKind) {
         if (error.code === 'rate_limited') view._dcJammed = true;
         throw error;
     }
-    const requestId = submission.requestId || submission.request_id || submission.job?.requestId || submission.task?.requestId;
-    if (submission.error || submission.success === false) throw new Error(submission.message || submission.error || 'Retrieval failed');
+    if (view._cdCancelled || signal?.aborted) return null;
+    const result = normalizeRetrievalSubmission(submission);
+    const requestId = result.requestId;
+    if (!['existing', 'completed', 'queued', 'running'].includes(result.state)) {
+        throw new Error(result.error || 'Retrieval ' + result.state);
+    }
     const fetchResult = async () => {
         if (view._cdCancelled) return null;
         let character = await fetchDatacatCharacter(charId, sourceKind, { signal });
@@ -151,7 +155,7 @@ async function cdDatacatExtract(view, charId, sourceKind) {
         }
         return character;
     };
-    if (isRetrievalShortcut(submission)) return fetchResult();
+    if (result.state === 'existing' || result.state === 'completed') return fetchResult();
     const deadline = Date.now() + 180000;
     while (Date.now() < deadline) {
         if (view._cdCancelled) return null;

@@ -139,16 +139,22 @@ async function tryBootstrapSession() {
 
 /**
  * Fetch a DataCat API path through the cl-helper plugin proxy.
- * On 401, attempts to bootstrap a session once and retries.
+ * On a confirmed session failure, attempts to bootstrap a session once and retries.
  * @param {string} apiPath - Path relative to datacat.run (e.g. /api/characters/recent-public?...)
  * @returns {Promise<Response>}
  */
 async function dcFetch(apiPath, options = {}) {
     if (!_apiRequest) throw new Error('DataCat: apiRequest not bound (cl-helper required)');
+    options.signal?.throwIfAborted();
     let resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal: options.signal });
+    options.signal?.throwIfAborted();
     // A browser verification or creator-policy 403 cannot be repaired by replacing a session.
     if (resp.status === 401) {
-        if (await tryBootstrapSession()) {
+        let payload;
+        try { payload = await resp.clone().json(); } catch (error) { if (error.name === 'AbortError') throw error; }
+        options.signal?.throwIfAborted();
+        if (classifyDatacatError(resp.status, payload).code === 'session_required' && await tryBootstrapSession()) {
+            options.signal?.throwIfAborted();
             resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal: options.signal });
         }
     }
@@ -161,11 +167,16 @@ async function dcFetch(apiPath, options = {}) {
 }
 
 async function readDcJson(response, { allow404 = false } = {}) {
+    // Read once so an HTML challenge/maintenance page cannot masquerade as a missing card.
+    const text = await response.text();
     let data;
-    try { data = await response.json(); }
+    try { data = JSON.parse(text); }
     catch {
-        if (allow404 && response.status === 404) return null;
-        if (!response.ok) throw classifyDatacatError(response.status, null);
+        if (/Attention Required! \| Cloudflare|cf-error-details|Just a moment|__cf_chl/i.test(text.slice(0, 2000))) {
+            throw new DatacatError('DataCat requires browser verification. Open DataCat in your browser and retry.', { code: 'verification_required', status: response.status });
+        }
+        if (allow404 && response.status === 404 && /^not found[.!]?$/i.test(text.trim())) return null;
+        if (!response.ok && response.status !== 404) throw classifyDatacatError(response.status, null);
         throw new DatacatError('DataCat returned an invalid JSON response', { code: 'invalid_response', status: response.status });
     }
     if (!response.ok) {
@@ -174,6 +185,9 @@ async function readDcJson(response, { allow404 = false } = {}) {
         throw error;
     }
     if (data?.success === false || data?.error) throw classifyDatacatError(response.status, data);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new DatacatError('DataCat returned an invalid JSON response', { code: 'invalid_response', status: response.status });
+    }
     return data;
 }
 
@@ -891,9 +905,9 @@ export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysRe
  * @returns {Promise<{inProgress: Object|null, queueLength: number, queue: Array, history: Array}|null>}
  */
 export async function fetchExtractionStatus(options = {}) {
-    let resp = await dcFetch('/api/retrieval/status-projection', options);
-    if (resp.status === 404) resp = await dcFetch('/api/retrieval/status', options);
-    return normalizeRetrievalStatus(await readDcJson(resp));
+    let data = await readDcJson(await dcFetch('/api/retrieval/status-projection', options), { allow404: true });
+    if (data === null) data = await readDcJson(await dcFetch('/api/retrieval/status', options));
+    return normalizeRetrievalStatus(data);
 }
 
 // ========================================

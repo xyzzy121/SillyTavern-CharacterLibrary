@@ -15,7 +15,7 @@ import { closeDatacatExportPanel } from './datacat-export-bridge.js';
 import {
     getDatacatCharacterId, getDatacatSourceKind, normalizeDatacatSourceKind,
     normalizeDefinitionSource, parseDatacatUrl, buildDatacatUrl,
-    matchRetrievalStatus, isRetrievalShortcut,
+    matchRetrievalStatus, normalizeRetrievalSubmission,
 } from './datacat-contract.js';
 import {
     resolveDatacatAvatarUrl,
@@ -51,9 +51,9 @@ class DatacatProvider extends ProviderBase {
     get icon() { return 'fa-solid fa-cat'; }
     get iconUrl() { return 'https://datacat.run/catgif.gif'; }
     get beta() { return true; }
-    get enableWarning() { return 'Datacat is experimental. Browsing requires cl-helper 1.13.0; some downloads require the optional Datacat companion userscript and human verification.'; }
+    get enableWarning() { return 'Datacat is experimental. Browsing requires cl-helper 1.13.1; some downloads require the optional Datacat companion userscript and human verification.'; }
     get disabledByDefault() { return true; }
-    get minClHelperVersion() { return '1.13.0'; }
+    get minClHelperVersion() { return '1.13.1'; }
     get browseView() { return datacatBrowseView; }
 
     get linkStatFields() {
@@ -245,18 +245,24 @@ class DatacatProvider extends ProviderBase {
             const submittedAt = Date.now();
             const result = await submitExtraction(upstreamUrl, { publicFeed, alwaysReextract: true, signal });
             checkCancelled();
-            if (!result?.success && !result?.queued && !result?.started) {
-                api?.debugLog?.('[DatacatProvider] refreshRemoteData: extraction submit failed:', result?.error);
-                return;
-            }
-
-            const submitRequestId = result?.requestId || null;
-            if (isRetrievalShortcut(result)) {
+            const submission = normalizeRetrievalSubmission(result);
+            const submitRequestId = submission.requestId || null;
+            if (submission.state === 'existing') {
                 report?.('Character is already available');
                 return;
             }
+            if (submission.state === 'completed') {
+                report?.('Retrieval complete');
+                return;
+            }
+            if (!['queued', 'running'].includes(submission.state)) {
+                const message = { failed: 'Retrieval failed', cancelled: 'Retrieval cancelled', timed_out: 'Retrieval timed out', invalid: 'Could not confirm the retrieval request' }[submission.state];
+                report?.(`${submission.error || message || 'Could not confirm the retrieval request'}; using the available export`);
+                api?.debugLog?.('[DatacatProvider] refreshRemoteData: retrieval did not start:', submission.state);
+                return;
+            }
 
-            if (result?.queued) {
+            if (submission.state === 'queued') {
                 const pos = result.queuePosition ? ` (position ${result.queuePosition})` : '';
                 report?.(`Queued for retrieval${pos}...`);
             } else {
@@ -392,13 +398,14 @@ class DatacatProvider extends ProviderBase {
 
     async enrichLocalImport(cardData, _fileName) {
         const ext = cardData.data?.extensions?.datacat;
-        if (ext?.id) {
+        const id = getDatacatCharacterId(ext?.id);
+        if (id) {
             return {
                 cardData,
                 providerInfo: {
                     providerId: 'datacat',
-                    charId: ext.id,
-                    fullPath: String(ext.id),
+                    charId: id,
+                    fullPath: id,
                     hasGallery: false,
                     avatarUrl: null
                 }
@@ -470,7 +477,11 @@ class DatacatProvider extends ProviderBase {
                 linkedAt: new Date().toISOString(),
             };
             assignGalleryId(characterCard, options, api);
-            const avatarUrl = resolveDatacatAvatarUrl(character, { preferOriginal: true });
+            // The selected export can carry different artwork from the listing or
+            // another content variant. Both candidates use the shared safe resolver.
+            const avatarUrl = resolveDatacatAvatarUrl({
+                avatar: characterCard.data.avatar, primary_content_source_kind: exported.sourceKind,
+            }) || resolveDatacatAvatarUrl(character, { preferOriginal: true });
             let imageBuffer = exported.imageBuffer || null;
             if (!imageBuffer && avatarUrl) {
                 try {

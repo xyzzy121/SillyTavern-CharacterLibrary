@@ -66,14 +66,15 @@ export function parseDatacatUrl(value) {
         const url = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
         if (!/^(www\.)?datacat\.run$/i.test(url.hostname)) return null;
         const parts = url.pathname.split('/').filter(Boolean);
-        if (!['characters', 'character', 'recent', 'mine', 'vault', 'cart'].includes(parts[0])) return null;
+        const views = ['recent', 'recent2', 'recent_v1', 'mine', 'mine2', 'mine_v1', 'yours', 'vault', 'cart', 'basket'];
+        if (!['characters', 'character', ...views].includes(parts[0])) return null;
         const at = parts.findIndex(part => UUID.test(part.split('_')[0]));
         if (at < 1) return null;
         // Consume the route container and view mode before reading a source segment.
         // In /characters/vault/:uuid, "vault" is a collection, not direct-upload identity.
         const prefix = parts.slice(0, at);
         if (['characters', 'character'].includes(prefix[0])) prefix.shift();
-        if (['recent', 'mine', 'vault', 'cart'].includes(prefix[0])) prefix.shift();
+        if (views.includes(prefix[0])) prefix.shift();
         const sourceKind = normalizeDatacatSourceKind(url.searchParams.get('sourceKind'))
             || normalizeDatacatSourceKind(prefix.at(-1)) || null;
         return { id: parts[at].split('_')[0].toLowerCase(), sourceKind };
@@ -165,8 +166,10 @@ export function classifyDatacatError(status, payload) {
     else if (status === 429) code = 'rate_limited';
     else if (/TURNSTILE|VERIFICATION_REQUIRED/i.test(upstream)) code = 'verification_required';
     else if (upstream === 'CREATOR_REDIRECT_REQUIRED') code = 'creator_restricted';
-    else if (status === 404) code = 'not_found';
-    else if (status === 401 || /(?:SESSION|TOKEN).*(?:INVALID|EXPIRED|REQUIRED)/i.test(upstream)) code = 'session_required';
+    else if (/(?:SESSION|TOKEN).*(?:INVALID|EXPIRED|REQUIRED|MISSING)|(?:INVALID|EXPIRED|MISSING|NO).*(?:SESSION|TOKEN)/i.test(`${upstream} ${message}`)) code = 'session_required';
+    else if (status === 401 || /AUTH(?:ENTICATION)?_REQUIRED|LOGIN_REQUIRED/i.test(upstream)) code = 'authentication_required';
+    else if (status === 404 && (/^(?:CHARACTER_|RESOURCE_|ENDPOINT_)?NOT_FOUND$/i.test(upstream)
+        || /^(?:character|resource|endpoint|route)?\s*not found[.!]?$/i.test(message))) code = 'not_found';
     else if (status === 403) code = 'forbidden';
     return new DatacatError(text, { code, status, payload });
 }
@@ -200,6 +203,7 @@ const activeStates = new Set(['pending', 'queued', 'running', 'processing', 'in_
 const statusOf = entry => String(entry?.terminalStatus || entry?.status || entry?.state || entry?.phase || entry?.lifecycle || '').toLowerCase().replace(/-/g, '_');
 const isTerminal = entry => terminalStates.has(statusOf(entry)) || terminalStates.has(String(entry?.lifecycle || '').toLowerCase());
 const isActive = entry => entry?.lifecycle === 'running' || (entry?.lifecycle !== 'terminal' && activeStates.has(statusOf(entry)));
+const retrievalErrorText = value => typeof value === 'string' ? value : value?.message || value?.code || null;
 export function normalizeRetrievalStatus(payload) {
     const data = payload && typeof payload === 'object' ? payload : {};
     const entries = [data.latestTerminalJob, data.run?.latestTerminalJob, data.job?.latestTerminalJob,
@@ -211,10 +215,12 @@ export function normalizeRetrievalStatus(payload) {
         requestId: entry.requestId || entry.request_id || entry.idempotencyKey || entry.task?.requestId || entry.id || null,
         characterId: entry.characterId || entry.character_id || entry.companionId || entry.result?.characterId || entry.task?.characterId
             || (entry.targetType === 'character' ? entry.targetId : null) || null,
-        error: entry.error || entry.errorMessage || entry.contractError || null,
+        error: retrievalErrorText(entry.error || entry.errorMessage || entry.contractError),
         success: failureStates.has(statusOf(entry)) ? false : entry.success ?? entry.result?.success ?? (!entry.error && !entry.errorMessage && !entry.contractError),
     });
-    const active = [data.inProgress, data.run, data.job, data.task].find(item => item && !isTerminal(item));
+    const active = [data.inProgress, data.run, data.job, data.task].find(item => item && !isTerminal(item)
+        && !['idle', 'none'].includes(statusOf(item)) && (isActive(item)
+            || item.requestId || item.request_id || item.characterId || item.character_id));
     const queue = Array.isArray(data.queue) ? data.queue : [];
     return { ...data, inProgress: active ? normalize(active) : null, queue, queueLength: data.queueLength ?? queue.length, history: entries.filter(entry => !isActive(entry)).map(normalize) };
 }
@@ -233,7 +239,36 @@ export function matchRetrievalStatus(payload, { requestId, characterId, submitte
 }
 
 export function isRetrievalShortcut(result) {
-    return !!(result && (result.alreadyExists || result.alreadyRetrieved || result.cached || result.skipped
+    return !!(result && result.success !== false && !result.error && !result.errorCode && !failureStates.has(statusOf(result))
+        && (result.alreadyExists || result.alreadyRetrieved || result.cached || result.skipped
         || (result.skippedExtraction === true && result.collected === true && result.characterId)
         || result.reused || result.shortcut || ['already_exists', 'already_retrieved', 'cached', 'complete', 'completed'].includes(statusOf(result))));
+}
+
+/** Normalize the submit response before any caller decides to poll or use a cached card. */
+export function normalizeRetrievalSubmission(result) {
+    const raw = result;
+    const data = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
+    const job = data.job || data.run || data.task || {};
+    const status = [statusOf(data), statusOf(job)].find(value => failureStates.has(value)) || statusOf(data) || statusOf(job);
+    const requestId = data.requestId || data.request_id || data.idempotencyKey
+        || job.requestId || job.request_id || job.idempotencyKey || job.id || null;
+    const characterId = data.characterId || data.character_id || data.companionId
+        || data.result?.characterId || job.characterId || job.character_id || null;
+    const error = data.error || data.errorMessage || data.errorCode || data.contractError
+        || job.error || job.errorMessage || job.errorCode || job.contractError || null;
+    let state = 'invalid';
+    if (failureStates.has(status) || data.success === false || job.success === false || error) {
+        state = ['cancelled', 'canceled', 'abandoned'].includes(status) ? 'cancelled'
+            : ['timeout', 'timed_out', 'timedout', 'expired'].includes(status) ? 'timed_out' : 'failed';
+    } else if (isRetrievalShortcut(data)) {
+        state = ['complete', 'completed', 'success', 'succeeded'].includes(status) ? 'completed' : 'existing';
+    } else if (['complete', 'completed', 'success', 'succeeded'].includes(status)) {
+        state = 'completed';
+    } else if (data.started || ['running', 'processing', 'in_progress'].includes(status)) {
+        state = 'running';
+    } else if (data.queued || activeStates.has(status) || !status && (data.success === true || requestId)) {
+        state = 'queued';
+    }
+    return { state, requestId, characterId, error: retrievalErrorText(error) || data.message || job.message || null, raw };
 }

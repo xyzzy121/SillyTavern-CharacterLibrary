@@ -21,7 +21,7 @@ const json = (data, status = 200) => new Response(JSON.stringify(data), { status
 
 test('detail retries only actual missing endpoints and keeps source identity', async () => {
     const paths = [];
-    api.setApiRequest(async path => { paths.push(path); return paths.length < 3 ? json({}, 404) : json({ character: { characterId: id, primary_content_source_kind: 'direct' } }); });
+    api.setApiRequest(async path => { paths.push(path); return paths.length < 3 ? json({ error: 'Character not found' }, 404) : json({ character: { characterId: id, primary_content_source_kind: 'direct' } }); });
     assert.equal((await api.fetchDatacatCharacter(id, 'direct')).primary_content_source_kind, 'direct_upload');
     assert.equal(paths.length, 3);
     assert.match(paths[2], /recent-public\//);
@@ -97,4 +97,58 @@ test('original artwork uses native media aliases and original variants during im
     assert.equal(api.resolveDatacatAvatarUrl(native, { preferOriginal: true }), 'https://datacat.run/media/direct_upload/original.png');
     assert.equal(api.resolveDatacatAvatarUrl({ imageVariantUrls: { card: '/media/card.webp', original: '/media/original.png' } }, { preferOriginal: true }), 'https://datacat.run/media/original.png');
     assert.equal(api.resolveDatacatAvatarUrl({ charaCardV2Json: JSON.stringify({ data: { avatar: 'https://example.test/original.png' } }) }, { preferOriginal: true }), 'https://example.test/original.png');
+});
+
+test('only current confirmed session errors initialize once; generic authentication does not', async () => {
+    for (const error of [
+        { success: false, error: 'Authentication required', message: 'X-Session-Token header is required for all API requests' },
+        { success: false, error: 'Invalid session', message: 'Session token is invalid or expired' },
+    ]) {
+        const paths = [];
+        api.setSavedTokenGetter(() => null);
+        api.setApiRequest(async path => {
+            paths.push(path);
+            return path.endsWith('/dc-init') ? json({ ok: true, token: 'fixture-token' }) : json(error, 401);
+        });
+        await assert.rejects(api.fetchDatacatCharacter(id), error => error.code === 'session_required');
+        assert.equal(paths.filter(path => path.endsWith('/dc-init')).length, 1);
+        assert.equal(paths.length, 3, 'one retry only');
+    }
+    for (const response of [json({ error: 'Authentication required' }, 401), new Response('<html>Login required</html>', { status: 401 })]) {
+        const paths = [];
+        api.setApiRequest(async path => { paths.push(path); return response.clone(); });
+        await assert.rejects(api.fetchDatacatCharacter(id), error => error.code === 'authentication_required');
+        assert.equal(paths.length, 1);
+    }
+});
+
+test('unrecognized 404 responses and challenge pages never offer retrieval or status fallback', async () => {
+    for (const [response, code] of [
+        [new Response('<html>Just a moment... __cf_chl</html>', { status: 404 }), 'verification_required'],
+        [new Response('<html>Upstream maintenance</html>', { status: 404 }), 'invalid_response'],
+        [json({ error: 'SESSION_EXPIRED' }, 404), 'session_required'],
+        [json({ error: 'DATABASE_UNAVAILABLE' }, 404), 'request_failed'],
+        [json({}, 404), 'request_failed'],
+    ]) {
+        const paths = [];
+        api.setApiRequest(async path => { paths.push(path); return response.clone(); });
+        await assert.rejects(api.fetchDatacatCharacter(id), error => error.code === code);
+        await assert.rejects(api.fetchExtractionStatus(), error => error.code === code);
+        assert.equal(paths.length, 2, 'one request for detail, one for status');
+    }
+    const paths = [];
+    api.setApiRequest(async path => { paths.push(path); return paths.length === 1 ? json({ error: 'Not found' }, 404) : json({ history: [] }); });
+    assert.deepEqual((await api.fetchExtractionStatus()).history, []);
+    assert.equal(paths.length, 2);
+    assert.match(paths[1], /retrieval\/status$/);
+});
+
+test('aborted responses retain cancellation and never initialize a replacement session', async () => {
+    const controller = new AbortController();
+    const paths = [];
+    api.setApiRequest(async path => { paths.push(path); controller.abort(); return json({ error: 'Invalid session' }, 401); });
+    await assert.rejects(api.fetchDatacatCharacter(id, null, { signal: controller.signal }), { name: 'AbortError' });
+    assert.equal(paths.length, 1);
+    api.setApiRequest(async () => ({ ok: true, status: 200, text: async () => { throw new DOMException('Cancelled', 'AbortError'); } }));
+    await assert.rejects(api.fetchDatacatDownload(id), { name: 'AbortError' });
 });
