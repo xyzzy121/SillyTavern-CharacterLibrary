@@ -63,6 +63,32 @@ const SAUCEPAN_CW_EXTREME_TAGS = [
 let _apiRequest = null;
 let _getSaucepanToken = null;
 
+function waitForSaucepan(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+        const cleanup = () => signal.removeEventListener('abort', abort);
+        const abort = () => { cleanup(); reject(signal.reason); };
+        signal.addEventListener('abort', abort, { once: true });
+        Promise.resolve(promise).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
+}
+
+async function withSaucepanRead(parent, operation) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(parent.reason);
+    if (parent?.aborted) abort();
+    else parent?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(Object.assign(new DOMException('Saucepan request timed out', 'TimeoutError'), { codeName: 'timeout' })), 30000);
+    try {
+        controller.signal.throwIfAborted();
+        return await waitForSaucepan(Promise.resolve().then(() => operation(controller.signal)), controller.signal);
+    } finally {
+        clearTimeout(timer);
+        parent?.removeEventListener('abort', abort);
+    }
+}
+
 /**
  * Bind the CoreAPI.apiRequest function for proxied requests. Called from the
  * Saucepan provider's init().
@@ -104,32 +130,43 @@ let _tokenPushInFlight = null;
 // cl-helper holds the token in RAM only, so it is empty after every ST restart while
 // the client still has one persisted. Provider init pushes it fire-and-forget, so a
 // call made before that lands would 403; re-push once and retry rather than fail.
-async function tryPushSavedToken() {
-    if (_tokenPushInFlight) return _tokenPushInFlight;
+async function tryPushSavedToken(signal) {
     // Bail BEFORE storing anything: a path that returns without awaiting would finish
     // before the assignment lands, so clearing from inside would be overwritten and the
     // stale resolved promise would suppress every later retry for the whole session.
     const saved = _getSaucepanToken?.() ?? null;
     if (!saved) return false;
-    const attempt = (async () => {
-        try {
-            return !!(await pushSaucepanToken(saved))?.ok;
-        } catch {
-            return false;
+    if (!_tokenPushInFlight) {
+        const controller = new AbortController();
+        const entry = { controller, consumers: 0, settled: false, promise: null };
+        entry.promise = withSaucepanRead(controller.signal, async signal => {
+            try { return !!(await pushSaucepanToken(saved, { signal }))?.ok; }
+            catch (error) { signal.throwIfAborted(); return false; }
+        }).finally(() => {
+            entry.settled = true;
+            if (_tokenPushInFlight === entry) _tokenPushInFlight = null;
+        });
+        entry.promise.catch(() => {});
+        _tokenPushInFlight = entry;
+    }
+    const entry = _tokenPushInFlight;
+    entry.consumers++;
+    return waitForSaucepan(entry.promise, signal).finally(() => {
+        if (--entry.consumers === 0 && !entry.settled) {
+            entry.controller.abort(new DOMException('No active Saucepan consumers', 'AbortError'));
+            if (_tokenPushInFlight === entry) _tokenPushInFlight = null;
         }
-    })();
-    _tokenPushInFlight = attempt;
-    attempt.finally(() => { if (_tokenPushInFlight === attempt) _tokenPushInFlight = null; });
-    return attempt;
+    });
 }
 
-async function saucepanFetch(method, apiPath, body) {
+async function saucepanFetch(method, apiPath, body, { signal } = {}) {
     if (!_apiRequest) throw new Error('Saucepan: apiRequest not bound (cl-helper required)');
+    signal?.throwIfAborted();
     const url = `${SAUCEPAN_PROXY_BASE}${apiPath}`;
-    const send = () => (method === 'POST' ? _apiRequest(url, 'POST', body) : _apiRequest(url));
-    let resp = await send();
+    const send = () => _apiRequest(url, method, method === 'POST' ? body : null, { signal });
+    let resp = await waitForSaucepan(send(), signal);
     if (resp.status === 401 || resp.status === 403) {
-        if (await tryPushSavedToken()) resp = await send();
+        if (await tryPushSavedToken(signal)) { signal?.throwIfAborted(); resp = await waitForSaucepan(send(), signal); }
     }
     return resp;
 }
@@ -163,12 +200,13 @@ export async function saucepanLogin(handle, password) {
  * Push a Bearer token into cl-helper's in-memory store (proxy auth).
  * @returns {Promise<{ok: boolean, error?: string}>}
  */
-export async function pushSaucepanToken(token) {
+export async function pushSaucepanToken(token, { signal } = {}) {
     try {
-        const resp = await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/saucepan-set-token`, 'POST', { token });
+        const resp = await waitForSaucepan(_apiRequest(`${CL_HELPER_PLUGIN_BASE}/saucepan-set-token`, 'POST', { token }, { signal }), signal);
         if (!resp.ok) return { ok: false, error: await sessionError(resp) };
-        return await resp.json();
+        return await waitForSaucepan(resp.json(), signal);
     } catch (e) {
+        signal?.throwIfAborted();
         return { ok: false, error: e.message };
     }
 }
@@ -391,24 +429,29 @@ export function hitFromCompanion(companion, fallbackId) {
  * @param {string} handle - Saucepan author handle
  * @returns {Promise<{characters: Object[], totalCount: number}>}
  */
-export async function fetchSaucepanCompanionsOfUser(handle) {
+export async function fetchSaucepanCompanionsOfUser(handle, { signal: parentSignal } = {}) {
     if (!handle) return { characters: [], totalCount: 0 };
+    return withSaucepanRead(parentSignal, async signal => {
     let response;
     try {
         // Saucepan retired /api/v1/companions-of-user (bare 404 on every param shape); the
         // live route is v2, handle in the path. Search-side author filters are ignored, so
         // this is the only way to list one creator's companions.
-        response = await saucepanFetch('GET', `/api/v2/users/${encodeURIComponent(handle)}/companions`);
+        response = await saucepanFetch('GET', `/api/v2/users/${encodeURIComponent(handle)}/companions`, null, { signal });
     } catch (err) {
+        signal?.throwIfAborted();
+        if (err.name === 'AbortError') throw err;
         throw new Error(`Saucepan creator fetch failed: ${err.message}`);
     }
     if (!response.ok) throw new Error(`Saucepan HTTP ${response.status}`);
     const data = await response.json();
+    signal?.throwIfAborted();
     const companions = data?.companions || [];
     return {
         characters: companions.map(normalizeSaucepanHit),
         totalCount: data?.total_count ?? companions.length,
     };
+    });
 }
 
 // Short-lived cache so the burst of companion reads when a card opens (preview
@@ -424,32 +467,41 @@ const SAUCEPAN_COMPANION_CACHE_MAX = 50;
 // extraction leg needs ok/status to tell "companion leg failed" from "companion absent",
 // which is what keeps greetingsUnavailable honest. Only successful payloads stay cached,
 // so a failure always comes from a live request carrying its real status.
-async function fetchCompanionResult(id) {
+async function fetchCompanionResult(id, { signal } = {}) {
+    signal?.throwIfAborted();
     const cached = _saucepanCompanionCache.get(id);
-    if (cached && (Date.now() - cached.ts) < SAUCEPAN_COMPANION_TTL) return cached.promise;
+    if (cached && (Date.now() - cached.ts) < SAUCEPAN_COMPANION_TTL && (!signal || cached.value)) return cached.value || cached.promise;
     while (_saucepanCompanionCache.size >= SAUCEPAN_COMPANION_CACHE_MAX) {
         _saucepanCompanionCache.delete(_saucepanCompanionCache.keys().next().value);
     }
     // Companion detail lives at /api/v2/companions/<id> (Bearer-authed). The old
     // /api/v1/companion?id= form is a different endpoint and 405s on GET.
-    const promise = (async () => {
+    const promise = withSaucepanRead(signal, async signal => {
         try {
-            const response = await saucepanFetch('GET', `/api/v2/companions/${encodeURIComponent(id)}`);
+            const response = await saucepanFetch('GET', `/api/v2/companions/${encodeURIComponent(id)}`, null, { signal });
             const data = await readJsonClassified(response);
+            signal?.throwIfAborted();
             return { ok: response.ok, status: response.status, companion: data?.companion || null };
         } catch (error) {
+            signal?.throwIfAborted();
+            if (error.name === 'AbortError') throw error;
             return { ok: false, status: error.status || 0, companion: null, error };
         }
-    })();
+    });
     const entry = { promise, ts: Date.now() };
-    _saucepanCompanionCache.set(id, entry);
+    // Signal-owned work is never shared while pending: another consumer cannot inherit its abort.
+    if (!signal) _saucepanCompanionCache.set(id, entry);
     // Don't cache misses: failures and empty payloads drop on settle so the next call retries.
     // Identity-check first, or a slow miss from a superseded request would evict a newer entry.
     promise.then(result => {
+        if (signal && result.ok && result.companion) {
+            _saucepanCompanionCache.set(id, { promise: Promise.resolve(result), value: result, ts: Date.now() });
+        }
+        entry.value = result.ok && result.companion ? result : null;
         if (!(result.ok && result.companion) && _saucepanCompanionCache.get(id) === entry) {
             _saucepanCompanionCache.delete(id);
         }
-    });
+    }).catch(() => {});
     return promise;
 }
 
@@ -461,9 +513,9 @@ async function fetchCompanionResult(id) {
  * @param {string} id
  * @returns {Promise<Object|null>}
  */
-export async function fetchSaucepanCompanion(id, { strict = false } = {}) {
+export async function fetchSaucepanCompanion(id, { strict = false, signal } = {}) {
     if (!id) return null;
-    const result = await fetchCompanionResult(id);
+    const result = await fetchCompanionResult(id, { signal });
     if (strict && !result.companion && !result.error?.notFound) {
         throw result.error || new Error('Saucepan returned an invalid companion response');
     }

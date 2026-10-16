@@ -4460,6 +4460,11 @@ window.registerOverlay = window.registerOverlay || function(cfg) {
 
         // Use focusin (bubbles) on document to catch programmatic .focus() calls
         let suppressUntil = 0;
+        let deliberateDatacatFocus = null;
+        document.addEventListener('pointerdown', event => {
+            deliberateDatacatFocus = event.isTrusted && event.target.closest?.('#datacatTagsDropdown')
+                ? event.target.closest('input,textarea') : null;
+        }, true);
 
         // Observe class/attribute changes that signal a container opening
         const observer = new MutationObserver((mutations) => {
@@ -4503,6 +4508,10 @@ window.registerOverlay = window.registerOverlay || function(cfg) {
 
         // Intercept focus events during the suppression window
         document.addEventListener('focusin', (e) => {
+            if (e.target === deliberateDatacatFocus) {
+                deliberateDatacatFocus = null;
+                return;
+            }
             if (Date.now() > suppressUntil) return;
             const target = e.target;
             if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {

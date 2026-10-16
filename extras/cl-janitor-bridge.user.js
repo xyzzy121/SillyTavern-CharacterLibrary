@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Character Library - JanitorAI Bridge
 // @namespace    https://github.com/Sillyanonymous/SillyTavern-CharacterLibrary
-// @version      1.3.1
+// @version      1.3.2
 // @description  Lets Character Library reach Cloudflare-gated pages from your own browser: DataCat's JanitorAI Hampter sorts and JannyAI card definitions. Not used by the JanitorAI provider, which needs a real browser.
 // @author       Sillyanonymous
 // @match        *://*/*
@@ -179,11 +179,12 @@
         window.postMessage({
             source: SCRIPT_SRC,
             type: 'ready',
-            version: '1.3.0',
-            caps: { clearance: typeof GM_openInTab === 'function' },
+            version: '1.3.2',
+            caps: { clearance: typeof GM_openInTab === 'function', abort: true },
         }, location.origin);
     }
 
+    const activeRequests = new Map();
     window.addEventListener('message', (e) => {
         // Origin-guarded rather than e.source === window: under an Xray wrapper the sandbox window
         // is not identity-equal to the page window, so the identity check would drop every message.
@@ -199,6 +200,12 @@
             if (msg.id) refreshClearance(msg.id, msg.host);
             return;
         }
+        if (msg.type === 'cancel') {
+            const request = activeRequests.get(msg.id);
+            activeRequests.delete(msg.id);
+            try { request?.abort?.(); } catch { /* already completed */ }
+            return;
+        }
         if (msg.type !== 'fetch') return;
 
         const { id, url, authToken } = msg;
@@ -212,15 +219,19 @@
         // The Bearer is the JanitorAI session; it must never travel to the other host.
         if (rule.host === 'janitorai.com' && typeof authToken === 'string' && authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
-        gmRequest({
+        let settled = false;
+        const finish = (ok, status, body) => { settled = true; activeRequests.delete(id); reply(id, ok, status, body); };
+        const request = gmRequest({
             method: 'GET',
             url,
             headers,
             timeout: 20000,
-            onload: (r) => reply(id, r.status >= 200 && r.status < 300, r.status, r.responseText || ''),
-            onerror: () => reply(id, false, 0, 'Network error'),
-            ontimeout: () => reply(id, false, 0, 'Timed out'),
+            onload: (r) => finish(r.status >= 200 && r.status < 300, r.status, r.responseText || ''),
+            onerror: () => finish(false, 0, 'Network error'),
+            ontimeout: () => finish(false, 0, 'Timed out'),
+            onabort: () => finish(false, 0, 'Cancelled'),
         });
+        if (!settled) activeRequests.set(id, request);
     });
 
     // Announce on load; CL also pings, so the handshake works whichever side is ready first.

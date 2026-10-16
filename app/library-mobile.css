@@ -9,6 +9,28 @@
    ---------------------------------------- */
 
 /* --- Viewport lock --- */
+html.cl-mobile #datacatTagsDropdown button,
+html.cl-mobile #datacatTagsDropdown .browse-tag-state-btn,
+html.cl-mobile #datacatExportPanel button,
+html.cl-mobile #datacatCharModal .mobile-quick-import-btn,
+html.cl-mobile #datacatImportBtn {
+    min-width: 44px;
+    min-height: 44px;
+}
+html.cl-mobile #datacatTagsDropdown .browse-tag-state-btn {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+}
+html.cl-mobile #datacatTagsCloseBtn { align-self: flex-end; }
+html.cl-mobile #preImportDuplicateModal .pre-import-replace-choice {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+    padding: 4px 8px;
+}
+
 html.cl-mobile, html.cl-mobile body, html.cl-mobile .app-container {
     max-width: 100vw !important;
     overflow-x: hidden !important;

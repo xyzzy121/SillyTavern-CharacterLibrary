@@ -9,7 +9,7 @@ const id = '11111111-2222-3333-4444-555555555555';
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 function harness(fetcher) {
     const routes = new Map();
-    const context = vm.createContext({ URL, Buffer, randomUUID: () => 'request-new', fetch: fetcher,
+    const context = vm.createContext({ URL, Buffer, AbortController, DOMException, setTimeout, clearTimeout, randomUUID: () => 'request-new', fetch: fetcher,
         console: { log() {}, warn() {}, error() {} },
         router: { get: (path, fn) => routes.set(`GET ${path}`, fn), post: (path, fn) => routes.set(`POST ${path}`, fn) } });
     vm.runInContext(`${section}\nregisterDataCatRoutes(router);`, context);

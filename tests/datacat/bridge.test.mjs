@@ -5,7 +5,9 @@ import vm from 'node:vm';
 
 // A data import keeps these pure protocol tests independent of ST/browser globals.
 const moduleSource = await readFile(new URL('../../modules/providers/datacat/datacat-export-bridge.js', import.meta.url), 'utf8');
-const bridge = await import(`data:text/javascript;base64,${Buffer.from(moduleSource).toString('base64')}`);
+const focusSource = await readFile(new URL('../../modules/providers/focus-scope.js', import.meta.url), 'utf8');
+const bridgeSource = moduleSource.replace("'../focus-scope.js'", JSON.stringify(`data:text/javascript;base64,${Buffer.from(focusSource).toString('base64')}`));
+const bridge = await import(`data:text/javascript;base64,${Buffer.from(bridgeSource).toString('base64')}`);
 const companionSource = await readFile(new URL('../../extras/cl-datacat-bridge.user.js', import.meta.url), 'utf8');
 const characterId = '12345678-1234-1234-1234-123456789abc';
 const nonce = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -276,6 +278,7 @@ function panelHarness() {
     }
     const body = new Element('body');
     const context = {
+        createFocusScope: () => () => {},
         URL, ArrayBuffer, Uint8Array, DataView, DOMException, AbortController,
         crypto: { randomUUID: () => `aaaaaaaa-bbbb-cccc-dddd-${String(++sequence).padStart(12, '0')}` },
         document: { body, head: new Element('head'), createElement: tag => new Element(tag), getElementById: id => nodes.get(id) },
@@ -284,7 +287,7 @@ function panelHarness() {
         setTimeout: callback => { timers.add(callback); return callback; }, clearTimeout: callback => timers.delete(callback),
         decodeCard: () => ({ spec: 'chara_card_v2', data: { name: 'PNG canonical card' } }),
     };
-    const source = moduleSource.replaceAll('export ', '').replaceAll('import.meta.url', JSON.stringify('https://st.test/modules/providers/datacat/datacat-export-bridge.js'))
+    const source = moduleSource.replace(/^import .*?;\r?\n/gm, '').replaceAll('export ', '').replaceAll('import.meta.url', JSON.stringify('https://st.test/modules/providers/datacat/datacat-export-bridge.js'))
         .replace("await import('../../core-api.js')", '({default:{extractCharacterDataFromPng:globalThis.decodeCard}})');
     vm.runInNewContext(`${source}\nglobalThis.api = {requestDatacatBrowserExport, closeDatacatExportPanel};`, context);
     const root = () => nodes.get('datacatExportPanel');

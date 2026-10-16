@@ -8,7 +8,7 @@ import { meiliMultiSearch, TAG_MAP as JANNY_TAG_MAP } from '../janny/janny-api.j
 import { isJanitorBridgeAvailable, janitorBridgeFetch } from '../janitor-bridge.js';
 import { DatacatError, classifyDatacatError, normalizeDatacatCharacter, normalizeDatacatPage,
     normalizeDatacatSourceKind, getDatacatSourceKind, getDatacatCharacterId,
-    normalizeDatacatAvatar, normalizeDefinitionSource, normalizeRetrievalStatus } from './datacat-contract.js';
+    normalizeDatacatAvatar, normalizeDefinitionSource, normalizeRetrievalStatus, matchRetrievalStatus } from './datacat-contract.js';
 export * from './datacat-contract.js';
 
 export { slugify, stripHtml, JANNY_TAG_MAP };
@@ -101,6 +101,90 @@ const DC_PROXY_BASE = `${CL_HELPER_PLUGIN_BASE}/dc-proxy`;
 let _apiRequest = null;
 let _getSavedToken = null;
 let _bootstrapInFlight = null;
+let _sessionEpoch = 0;
+let _sessionToken = null;
+let _featuresCache = null;
+let _featuresInFlight = null;
+let _cooldownUntil = 0;
+const responseScopes = new WeakMap();
+
+function invalidateFeatures(preserve = null) {
+    _featuresCache = null;
+    if (preserve && _featuresInFlight === preserve) {
+        preserve.epoch = _sessionEpoch;
+        return;
+    }
+    _featuresInFlight?.scope.controller.abort(new DOMException('DataCat session changed', 'AbortError'));
+    _featuresCache = _featuresInFlight = null;
+}
+
+export function getDatacatCooldownUntil() { return _cooldownUntil; }
+
+function abortReason(signal) {
+    return signal.reason || new DOMException('DataCat request cancelled', 'AbortError');
+}
+
+// Some test transports and third-party bridges do not reject their own promise on abort.
+// Bound the consumer as well as supplying the signal to the actual transport.
+function withSignal(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(abortReason(signal));
+    return new Promise((resolve, reject) => {
+        const abort = () => { cleanup(); reject(abortReason(signal)); };
+        const cleanup = () => signal.removeEventListener('abort', abort);
+        signal.addEventListener('abort', abort, { once: true });
+        Promise.resolve(promise).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
+}
+
+function consumeShared(entry, signal) {
+    signal?.throwIfAborted();
+    entry.consumers++;
+    return withSignal(entry.promise, signal).finally(() => {
+        entry.consumers--;
+        if (!entry.settled && entry.consumers === 0) {
+            entry.scope.controller.abort(new DOMException('No active DataCat consumers', 'AbortError'));
+            entry.onEmpty?.();
+        }
+    });
+}
+
+function requestScope(parent, timeoutMs = 30000) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(abortReason(parent));
+    if (parent?.aborted) abort();
+    else parent?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new DatacatError('DataCat request timed out', { code: 'timeout' })), timeoutMs);
+    return { signal: controller.signal, controller, cleanup() { clearTimeout(timer); parent?.removeEventListener('abort', abort); } };
+}
+
+function wait(ms, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) return reject(abortReason(signal));
+        const cleanup = () => signal?.removeEventListener('abort', abort);
+        const timer = setTimeout(() => { cleanup(); resolve(); }, Math.max(0, ms));
+        const abort = () => { clearTimeout(timer); cleanup(); reject(abortReason(signal)); };
+        signal?.addEventListener('abort', abort, { once: true });
+    });
+}
+
+export async function waitForDatacatCooldown({ signal } = {}) {
+    while (_cooldownUntil > Date.now()) await wait(_cooldownUntil - Date.now(), signal);
+    signal?.throwIfAborted();
+}
+
+async function localJson(path, method = 'GET', body = null, { signal, timeoutMs = 30000 } = {}) {
+    const scope = requestScope(signal, timeoutMs);
+    try {
+        scope.signal.throwIfAborted();
+        const response = await withSignal(_apiRequest
+            ? _apiRequest(`${CL_HELPER_PLUGIN_BASE}${path}`, method, body, { signal: scope.signal })
+            : fetch(`/api${CL_HELPER_PLUGIN_BASE}${path}`, { method, signal: scope.signal,
+                ...(body == null ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }), scope.signal);
+        responseScopes.set(response, scope);
+        return await readDcJson(response);
+    } finally { scope.cleanup(); }
+}
 
 /**
  * Bind the CoreAPI.apiRequest function for use in proxied requests.
@@ -122,19 +206,13 @@ export function setSavedTokenGetter(fn) { _getSavedToken = fn; }
  * in-flight bootstrap promise so we never run more than one /dc-init at
  * a time. Reset on completion so a future 401 can re-arm.
  */
-async function tryBootstrapSession() {
-    if (_bootstrapInFlight) return _bootstrapInFlight;
-    _bootstrapInFlight = (async () => {
-        try {
-            const savedToken = _getSavedToken?.() ?? null;
-            return !!(await initDcSession(savedToken));
-        } catch {
-            return false;
-        } finally {
-            _bootstrapInFlight = null;
-        }
-    })();
-    return _bootstrapInFlight;
+async function tryBootstrapSession(signal, featureOwner = null) {
+    if (!_bootstrapInFlight && _sessionToken) {
+        _sessionToken = null;
+        _sessionEpoch++;
+        invalidateFeatures(featureOwner);
+    }
+    return !!(await initDcSession(_getSavedToken?.() ?? null, false, { signal, _featureOwner: featureOwner }));
 }
 
 /**
@@ -145,30 +223,38 @@ async function tryBootstrapSession() {
  */
 async function dcFetch(apiPath, options = {}) {
     if (!_apiRequest) throw new Error('DataCat: apiRequest not bound (cl-helper required)');
-    options.signal?.throwIfAborted();
-    let resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal: options.signal });
-    options.signal?.throwIfAborted();
+    const scope = requestScope(options.signal, options.timeoutMs);
+    const { signal } = scope;
+    try {
+    await waitForDatacatCooldown({ signal });
+    let resp = await withSignal(_apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal }), signal);
+    signal.throwIfAborted();
     // A browser verification or creator-policy 403 cannot be repaired by replacing a session.
     if (resp.status === 401) {
         let payload;
-        try { payload = await resp.clone().json(); } catch (error) { if (error.name === 'AbortError') throw error; }
-        options.signal?.throwIfAborted();
-        if (classifyDatacatError(resp.status, payload).code === 'session_required' && await tryBootstrapSession()) {
-            options.signal?.throwIfAborted();
-            resp = await _apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal: options.signal });
+        try { payload = await withSignal(resp.clone().json(), signal); } catch (error) { signal.throwIfAborted(); if (error.name === 'AbortError') throw error; }
+        signal.throwIfAborted();
+        if (classifyDatacatError(resp.status, payload).code === 'session_required' && await tryBootstrapSession(signal, options.featureOwner)) {
+            await waitForDatacatCooldown({ signal });
+            resp = await withSignal(_apiRequest(`${DC_PROXY_BASE}${apiPath}`, 'GET', null, { signal }), signal);
         }
     }
-    if (!resp.ok) {
-        let body = '';
-        try { body = await resp.clone().text(); } catch { /* ignore */ }
-        console.warn(`[DataCat] dcFetch ${resp.status} for ${apiPath}`, body.slice(0, 500));
-    }
+    responseScopes.set(resp, scope);
     return resp;
+    } catch (error) { scope.cleanup(); throw error; }
 }
 
 async function readDcJson(response, { allow404 = false } = {}) {
+    const scope = responseScopes.get(response);
+    try {
     // Read once so an HTML challenge/maintenance page cannot masquerade as a missing card.
-    const text = await response.text();
+    const text = await withSignal(response.text(), scope?.signal);
+    scope?.signal.throwIfAborted();
+    const failure = payload => {
+        const error = classifyDatacatError(response.status, payload, response.headers);
+        if (response.status === 429) _cooldownUntil = Math.max(_cooldownUntil, error.retryAt || Date.now() + 30000);
+        return error;
+    };
     let data;
     try { data = JSON.parse(text); }
     catch {
@@ -176,38 +262,70 @@ async function readDcJson(response, { allow404 = false } = {}) {
             throw new DatacatError('DataCat requires browser verification. Open DataCat in your browser and retry.', { code: 'verification_required', status: response.status });
         }
         if (allow404 && response.status === 404 && /^not found[.!]?$/i.test(text.trim())) return null;
-        if (!response.ok && response.status !== 404) throw classifyDatacatError(response.status, null);
+        if (!response.ok && response.status !== 404) throw failure(null);
         throw new DatacatError('DataCat returned an invalid JSON response', { code: 'invalid_response', status: response.status });
     }
     if (!response.ok) {
-        const error = classifyDatacatError(response.status, data);
+        const error = failure(data);
         if (allow404 && error.code === 'not_found') return null;
         throw error;
     }
-    if (data?.success === false || data?.error) throw classifyDatacatError(response.status, data);
+    if (data?.success === false || data?.error) throw failure(data);
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new DatacatError('DataCat returned an invalid JSON response', { code: 'invalid_response', status: response.status });
     }
     return data;
+    } finally { scope?.cleanup(); responseScopes.delete(response); }
 }
 
 export async function fetchDatacatFeatures(options = {}) {
-    return readDcJson(await dcFetch('/api/features', options));
+    options.signal?.throwIfAborted();
+    if (!options.force && _featuresCache?.epoch === _sessionEpoch && _featuresCache.expires > Date.now()) return _featuresCache.value;
+    if (!_featuresInFlight) {
+        const scope = requestScope(null, 30000);
+        const entry = { scope, epoch: _sessionEpoch, consumers: 0, settled: false, promise: null,
+            onEmpty: () => { if (_featuresInFlight === entry) _featuresInFlight = null; } };
+        entry.promise = (async () => {
+            try {
+                const value = await readDcJson(await dcFetch('/api/features', { signal: scope.signal, featureOwner: entry }));
+                if (entry.epoch === _sessionEpoch) _featuresCache = { epoch: entry.epoch, value, expires: Date.now() + 300000 };
+                return value;
+            } finally {
+                entry.settled = true;
+                scope.cleanup();
+                if (_featuresInFlight === entry) _featuresInFlight = null;
+            }
+        })();
+        _featuresInFlight = entry;
+        entry.promise.catch(() => {});
+    }
+    return consumeShared(_featuresInFlight, options.signal);
+}
+
+export function getDatacatCapabilities(features, sourceKind) {
+    const source = normalizeDatacatSourceKind(sourceKind);
+    if (source === 'direct_upload') return { known: true, contentDisabled: false, retrievalDisabled: true };
+    if (!features || !['janitor', 'saucepan'].includes(source)) return { known: false, contentDisabled: false, retrievalDisabled: false };
+    const disabled = key => typeof features[`${source}${key}ForViewer`] === 'boolean'
+        ? features[`${source}${key}ForViewer`] : features[`${source}${key}`] === true;
+    const contentDisabled = disabled('Disabled') || disabled('ContentDisabled');
+    return { known: ['Disabled', 'ContentDisabled', 'RetrievalDisabled'].some(key => typeof features[`${source}${key}`] === 'boolean' || typeof features[`${source}${key}ForViewer`] === 'boolean'),
+        contentDisabled, retrievalDisabled: contentDisabled || disabled('RetrievalDisabled') };
 }
 
 /**
  * Check if the cl-helper plugin is available.
  * @returns {Promise<boolean>}
  */
-export async function checkDcPluginAvailable() {
+export async function checkDcPluginAvailable({ signal, requireCapabilities = true } = {}) {
     try {
-        const resp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/health`)
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/health`);
-        if (!resp.ok) return false;
-        const data = await resp.json();
-        return data?.ok === true;
-    } catch {
+        const data = await localJson('/health', 'GET', null, { signal });
+        const version = String(data.version || '').split('.').map(Number);
+        const current = version.length === 3 && version.every(Number.isFinite)
+            && (version[0] > 1 || version[0] === 1 && (version[1] > 13 || version[1] === 13 && version[2] >= 2));
+        return data?.ok === true && (!requireCapabilities || current && data.capabilities?.datacatCancellation === true);
+    } catch (error) {
+        if (signal?.aborted || error.name === 'AbortError') throw error;
         return false;
     }
 }
@@ -218,25 +336,15 @@ export async function checkDcPluginAvailable() {
  * @param {string} savedToken - Previously saved session token
  * @returns {Promise<boolean>} true if the saved token is still valid
  */
-async function restoreSavedToken(savedToken) {
+async function restoreSavedToken(savedToken, signal) {
     if (!savedToken || typeof savedToken !== 'string') return false;
     try {
-        const setResp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-set-token`, 'POST', { token: savedToken })
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/dc-set-token`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token: savedToken }),
-            });
-        if (!setResp.ok) return false;
-
-        const valResp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-validate`)
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/dc-validate`);
-        if (!valResp.ok) return false;
-        const data = await valResp.json();
+        const set = await localJson('/dc-set-token', 'POST', { token: savedToken }, { signal });
+        if (!set.ok) return false;
+        const data = await localJson('/dc-validate', 'GET', null, { signal });
         return data?.valid === true;
-    } catch {
+    } catch (error) {
+        if (signal?.aborted || error.name === 'AbortError') throw error;
         return false;
     }
 }
@@ -250,42 +358,61 @@ async function restoreSavedToken(savedToken) {
  * @param {boolean} [force] - Force a new token even if one is cached
  * @returns {Promise<string|null>} The active session token, or null on failure
  */
-export async function initDcSession(savedToken, force = false) {
-    try {
-        // Try restoring a saved token first (unless forcing refresh)
-        if (savedToken && !force) {
-            const restored = await restoreSavedToken(savedToken);
-            if (restored) return savedToken;
-        }
-
-        const body = force ? JSON.stringify({ force: true }) : undefined;
-        const resp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-init`, 'POST', force ? { force: true } : undefined)
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/dc-init`, {
-                method: 'POST',
-                ...(force ? { headers: { 'Content-Type': 'application/json' }, body } : {}),
-            });
-        if (!resp.ok) return null;
-        const data = await resp.json();
-        if (data?.ok && data?.token) return data.token;
-        return null;
-    } catch {
-        return null;
+export async function initDcSession(savedToken, force = false, { signal, _featureOwner = null } = {}) {
+    signal?.throwIfAborted();
+    if (!force && _sessionToken && (!savedToken || savedToken === _sessionToken)) return _sessionToken;
+    if (force || _bootstrapInFlight && _bootstrapInFlight.savedToken !== savedToken || _sessionToken && savedToken && _sessionToken !== savedToken) {
+        _sessionEpoch++;
+        _bootstrapInFlight?.scope.controller.abort(new DOMException('DataCat session changed', 'AbortError'));
+        _bootstrapInFlight = null;
+        invalidateFeatures();
     }
+    if (!_bootstrapInFlight) {
+        const epoch = _sessionEpoch;
+        const scope = requestScope(null, 30000);
+        const entry = { savedToken, scope, promise: null, consumers: 0, settled: false, featureOwner: _featureOwner,
+            onEmpty: () => { if (_bootstrapInFlight === entry) _bootstrapInFlight = null; } };
+        entry.promise = (async () => {
+            try {
+                let token;
+                if (savedToken && !force && await restoreSavedToken(savedToken, scope.signal)) token = savedToken;
+                else {
+                    const data = await localJson('/dc-init', 'POST', force ? { force: true } : null, { signal: scope.signal });
+                    token = data?.ok ? data.token : null;
+                }
+                if (epoch !== _sessionEpoch) return null;
+                if (token && token !== _sessionToken) {
+                    _sessionEpoch++;
+                    _sessionToken = token;
+                    invalidateFeatures(entry.featureOwner);
+                }
+                return token || null;
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                return null;
+            } finally {
+                entry.settled = true;
+                scope.cleanup();
+                if (_bootstrapInFlight === entry) _bootstrapInFlight = null;
+            }
+        })();
+        // All consumers may leave while the shared operation is still completing.
+        entry.promise.catch(() => {});
+        _bootstrapInFlight = entry;
+    }
+    if (_featureOwner && _featuresInFlight === _featureOwner) _bootstrapInFlight.featureOwner = _featureOwner;
+    return consumeShared(_bootstrapInFlight, signal);
 }
 
 /**
  * Validate the current DataCat session on cl-helper.
  * @returns {Promise<{valid: boolean, reason?: string}>}
  */
-export async function validateDcSession() {
+export async function validateDcSession({ signal } = {}) {
     try {
-        const resp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-validate`)
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/dc-validate`);
-        if (!resp.ok) return { valid: false, reason: 'request failed' };
-        return await resp.json();
-    } catch {
+        return await localJson('/dc-validate', 'GET', null, { signal });
+    } catch (error) {
+        if (signal?.aborted || error.name === 'AbortError') throw error;
         return { valid: false, reason: 'network error' };
     }
 }
@@ -294,13 +421,16 @@ export async function validateDcSession() {
  * Clear the DataCat session token from cl-helper.
  * @returns {Promise<boolean>}
  */
-export async function clearDcSession() {
+export async function clearDcSession({ signal } = {}) {
+    _sessionEpoch++;
+    _sessionToken = null;
+    _bootstrapInFlight?.scope.controller.abort(new DOMException('DataCat session cleared', 'AbortError'));
+    _bootstrapInFlight = null;
+    invalidateFeatures();
     try {
-        const resp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-clear-token`, 'POST')
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/dc-clear-token`, { method: 'POST' });
-        return resp.ok;
-    } catch {
+        return !!(await localJson('/dc-clear-token', 'POST', null, { signal })).ok;
+    } catch (error) {
+        if (signal?.aborted || error.name === 'AbortError') throw error;
         return false;
     }
 }
@@ -920,8 +1050,22 @@ export function buildV2FromDownload(downloadData, character, context = {}) {
  */
 export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysReextract = false, signal } = {}) {
     if (!_apiRequest) throw new Error('DataCat: apiRequest not bound');
-    const resp = await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract }, { signal });
-    return readDcJson(resp);
+    const scope = requestScope(signal, 60000);
+    let dispatched = false;
+    try {
+        await waitForDatacatCooldown({ signal: scope.signal });
+        scope.signal.throwIfAborted();
+        dispatched = true;
+        const resp = await withSignal(_apiRequest(`${CL_HELPER_PLUGIN_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract }, { signal: scope.signal }), scope.signal);
+        responseScopes.set(resp, scope);
+        return await readDcJson(resp);
+    } catch (error) {
+        if (dispatched && (scope.signal.aborted || error.name === 'AbortError' || !error.status || error.status >= 500)) {
+            error.unknownOutcome = true;
+            if (error.name !== 'AbortError') error.message = `${error.message}. Check DataCat before retrying; the remote job may still finish.`;
+        }
+        throw error;
+    } finally { scope.cleanup(); }
 }
 
 /**
@@ -929,9 +1073,45 @@ export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysRe
  * @returns {Promise<{inProgress: Object|null, queueLength: number, queue: Array, history: Array}|null>}
  */
 export async function fetchExtractionStatus(options = {}) {
-    let data = await readDcJson(await dcFetch('/api/retrieval/status-projection', options), { allow404: true });
-    if (data === null) data = await readDcJson(await dcFetch('/api/retrieval/status', options));
+    const opts = { timeoutMs: 15000, ...options };
+    let data = await readDcJson(await dcFetch('/api/retrieval/status-projection', opts), { allow404: true });
+    if (data === null) data = await readDcJson(await dcFetch('/api/retrieval/status', opts));
     return normalizeRetrievalStatus(data);
+}
+
+/** One bounded status loop for browse retrieval and update re-extraction. No job is submitted here. */
+export async function pollDatacatRetrieval({ requestId, characterId, submittedAt = Date.now(), signal, onProgress } = {}) {
+    const scope = requestScope(signal, 180000);
+    let failures = 0;
+    let delay = 3000;
+    try {
+        for (;;) {
+            await wait(delay, scope.signal);
+            await waitForDatacatCooldown({ signal: scope.signal });
+            try {
+                const status = await fetchExtractionStatus({ signal: scope.signal });
+                scope.signal.throwIfAborted();
+                const completed = matchRetrievalStatus(status, { requestId, characterId, submittedAt });
+                if (completed) return completed;
+                failures = 0;
+                delay = 3000;
+                const active = status?.inProgress;
+                const matches = active && (requestId && active.requestId ? active.requestId === requestId
+                    : getDatacatCharacterId(active) === getDatacatCharacterId(characterId));
+                onProgress?.(matches ? String(active.status || 'Retrieving').replace(/_/g, ' ') : 'Waiting for retrieval');
+            } catch (error) {
+                scope.signal.throwIfAborted();
+                if (error.name === 'AbortError') throw error;
+                if (!['rate_limited', 'service_unavailable', 'request_failed', 'timeout'].includes(error.code) && error.status) throw error;
+                delay = error.code === 'rate_limited' ? Math.max(3000, error.retryAfterMs ?? 30000)
+                    : Math.min(30000, 3000 * 2 ** failures++);
+                onProgress?.(`Could not refresh retrieval status: ${error.message}`);
+            }
+        }
+    } catch (error) {
+        if (scope.signal.aborted && error.code === 'timeout') error.message = 'Retrieval timed out. Check DataCat before retrying; the remote job may still finish.';
+        throw error;
+    } finally { scope.cleanup(); }
 }
 
 // ========================================
@@ -975,6 +1155,7 @@ export async function searchMeiliJanny(opts = {}) {
         filters,
         facets: ['isNsfw', 'tagIds'],
         sort: MEILI_SORT_MAP[sort] || MEILI_SORT_MAP.janny_newest,
+        signal: opts.signal,
     });
     const result = data?.results?.[0] || {};
     const hits = result.hits || [];
@@ -1007,6 +1188,9 @@ const HAMPTER_API_BASE = 'https://janitorai.com/hampter/characters';
  * @returns {Promise<{characters: Object[], total: number, page: number, pageSize: number}>}
  */
 export async function fetchHampterCharacters(opts = {}) {
+    const scope = requestScope(opts.signal);
+    opts = { ...opts, signal: scope.signal };
+    try {
     const { sort = 'trending', page = 1, search = '', nsfw = true, authToken = '', allowClearance = false } = opts;
     const params = new URLSearchParams({ sort, page: String(page) });
     if (search) params.set('search', search);
@@ -1022,8 +1206,8 @@ export async function fetchHampterCharacters(opts = {}) {
     if (isJanitorBridgeAvailable()) {
         let res = null;
         try {
-            res = await janitorBridgeFetch(url, authToken, { allowClearance });
-        } catch { res = null; }
+            res = await janitorBridgeFetch(url, authToken, { allowClearance, signal: opts.signal });
+        } catch (error) { opts.signal?.throwIfAborted(); if (error.name === 'AbortError') throw error; res = null; }
         if (res) {
             if (res.status === 401) {
                 const gated = new Error(authToken ? 'JanitorAI session expired' : 'JanitorAI requires signing in for this request');
@@ -1053,8 +1237,8 @@ export async function fetchHampterCharacters(opts = {}) {
         if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
         let response = null;
         try {
-            response = await fetch(url, { headers });
-        } catch { response = null; }
+            response = await fetch(url, { headers, signal: opts.signal });
+        } catch (error) { opts.signal?.throwIfAborted(); if (error.name === 'AbortError') throw error; response = null; }
         if (!response || !response.ok) {
             const status = response?.status ?? 0;
             if (status === 401) {
@@ -1072,12 +1256,15 @@ export async function fetchHampterCharacters(opts = {}) {
         data = await response.json();
     }
 
+    opts.signal?.throwIfAborted();
+
     return {
         characters: (data.data || []).map(normalizeHampterHit),
         total: data.total || 0,
         page: data.page || page,
         pageSize: data.size || 34,
     };
+    } finally { scope.cleanup(); }
 }
 
 function normalizeHampterHit(hit) {

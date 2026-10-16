@@ -12,6 +12,19 @@ The suite requires no frontend build system, npm installation, credentials, or r
 
 Final 7.3.4 result: **296 tests passed**, including **164 Datacat tests** and **132 tests for other extension behavior**. The second Datacat audit added 31 regressions to the 7.3.3 suite. Current live-service and browser results are in the [Datacat validation record](datacat/README.md). All **73 non-vendor JavaScript files** passed syntax checks; `git diff --check` passed. The optional integration harness also passed syntax checking during the 7.3.3 pass.
 
+## 7.3.5 reliability validation — 2026-10-16
+
+**388/388 tests pass**, including the new replacement, snapshot, Following, request-lifecycle, transport, and canvas regressions. All **76 non-vendor production JavaScript files** pass syntax checks, and `git diff --check` passes. Existing non-DataCat provider, persistence, authoring, and media tests remain included in the full suite.
+
+The DataCat fixtures run against the independent SillyTavern **1.19.0** profile on loopback port **8001**, with production extension **7.3.5** and bundled helper **1.13.2**. External service responses are controlled; local character writes, snapshots, chats, galleries, and reloads use the real server. The running installation is not used for these tests. See the [DataCat validation record](datacat/README.md) for coverage and limits.
+
+Two reusable browser harnesses are included:
+
+- `node tests/integration/datacat-replacement.mjs` exercises selected-target replacement, mandatory backups, write/acknowledgement failures, preview closure, stale targets, and lorebook merge edge cases. It requires the disposable instance at `http://127.0.0.1:8001` and creates synthetic cards, chats, snapshots, and gallery images.
+- `node tests/integration/datacat-reliability.mjs` checks progressive Following, request cancellation, facets, modal focus, mobile controls, and a 107,884-tag fixture. Set `CL_QA_IMPORTS=1` to include real missing-artwork and valid-artwork imports across the browser matrix. It also refuses other ports.
+
+Both harnesses require an existing Playwright installation and browser binaries; neither installs dependencies. Set `CL_PLAYWRIGHT_MODULE` to the Playwright directory for the replacement harness or `PLAYWRIGHT_MODULE` to its ESM module URL for the reliability harness. Set `CL_TEST_OUTPUT` / `CL_QA_OUTPUT` to an artifact directory outside the repository. The workspace sibling Playwright installation is the default for this validation environment.
+
 ## 7.3.2 integration record — 2026-09-28
 
 Testing used a fresh clone of the official SillyTavern `release` branch: **1.19.0**, commit `06bde939fb1e9c4c8d8641d810f0a916b5bce127`, Node **26.2.0**, and Chromium. The temporary instance listened only on localhost, loaded this repository's production extension and bundled cl-helper **1.13.0**, and contained synthetic cards, chats, worlds, images, and settings. Existing SillyTavern installations were not modified.

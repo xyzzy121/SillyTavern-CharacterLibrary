@@ -232,12 +232,16 @@ export async function fetchWithProxy(url, opts = {}) {
         try {
             directResponse = await fetch(url, opts);
         } catch (e) {
+            opts.signal?.throwIfAborted();
             if (e?.name === 'AbortError') throw e; // caller intent, not a CORS signal - must not poison the cache
             // fetch() rejects on CORS/network errors - fall through to proxy
             _proxyOrigins.add(origin);
         }
         if (directResponse) {
-            if (!directResponse.ok) throw httpFailureError(directResponse.status, await directResponse.text().catch(() => ''));
+            if (!directResponse.ok) {
+                const text = await directResponse.text().catch(error => { opts.signal?.throwIfAborted(); if (error.name === 'AbortError') throw error; return ''; });
+                throw httpFailureError(directResponse.status, text);
+            }
             return directResponse;
         }
     }
@@ -245,12 +249,13 @@ export async function fetchWithProxy(url, opts = {}) {
     try {
         r = await fetch(`/proxy/${proxyEncode(url)}`, opts);
     } catch (e) {
+        opts.signal?.throwIfAborted();
         if (e?.name === 'AbortError') throw e;
         // Same-origin reject means ST itself is unreachable, not a provider problem
         throw classifiedError('Could not reach your SillyTavern server (connection dropped or ST is not running)', null, '');
     }
     if (!r.ok) {
-        const t = await r.text().catch(() => '');
+        const t = await r.text().catch(error => { opts.signal?.throwIfAborted(); if (error.name === 'AbortError') throw error; return ''; });
         // ST's corsProxy middleware answers a bare sendStatus(500) when its own server-side
         // fetch failed (no route, DNS, VPN down); upstream 500s carry real bodies.
         if (r.status === 500 && t.trim() === 'Internal Server Error') {
@@ -427,7 +432,10 @@ export function buildProviderNotice({ kind = 'info', layout = 'banner', icon, ti
  * @returns {Promise<any>}
  */
 export async function readJsonClassified(resp) {
-    const text = await resp.text().catch(() => '');
+    const text = await resp.text().catch(error => {
+        if (error?.name === 'AbortError' || error?.name === 'TimeoutError' || error?.code === 'timeout') throw error;
+        return '';
+    });
     if (resp.ok) {
         try { return JSON.parse(text); } catch { /* classified below */ }
     }
@@ -599,6 +607,45 @@ function avatarScale(width, height) {
  * @param {Object} [api] - CoreAPI reference for convertImageToPng fallback
  * @returns {Promise<ArrayBuffer|null>}
  */
+export async function renderPng(width, height, draw) {
+    // Some WebKit builds have no OffscreenCanvas, or expose it without a
+    // working 2D/PNG implementation. Try a fresh DOM canvas in either case.
+    let lastError;
+    for (const offscreen of [true, false]) {
+        try {
+            const canvas = offscreen
+                ? new OffscreenCanvas(width, height)
+                : Object.assign(document.createElement('canvas'), { width, height });
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('Canvas 2D rendering is unavailable.');
+            draw(ctx);
+            const blob = offscreen
+                ? await canvas.convertToBlob({ type: 'image/png' })
+                : await new Promise((resolve, reject) => canvas.toBlob(value => value
+                    ? resolve(value) : reject(new Error('Canvas PNG encoding failed.')), 'image/png'));
+            if (!blob || blob.type !== 'image/png') throw new Error('Canvas did not encode a PNG.');
+            return await blob.arrayBuffer();
+        } catch (error) { lastError = error; }
+    }
+    throw lastError;
+}
+
+async function decodeAvatar(blob) {
+    if (typeof createImageBitmap === 'function') {
+        try { return await createImageBitmap(blob); } catch { /* Fall back to Image. */ }
+    }
+    const url = URL.createObjectURL(blob);
+    try {
+        const image = new Image();
+        await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = () => reject(new Error('Avatar image could not be decoded.'));
+            image.src = url;
+        });
+        return image;
+    } finally { URL.revokeObjectURL(url); }
+}
+
 export async function ensurePng(imageBuffer, api) {
     // An empty or truncated body still resolves as a buffer, and the header read throws on it.
     if (!imageBuffer || imageBuffer.byteLength < 4) return null;
@@ -612,19 +659,14 @@ export async function ensurePng(imageBuffer, api) {
 
     try {
         const blob = new Blob([imageBuffer]);
-        const bitmap = await createImageBitmap(blob);
-        const scale = avatarScale(bitmap.width, bitmap.height);
-        const width = Math.max(1, Math.round(bitmap.width * scale));
-        const height = Math.max(1, Math.round(bitmap.height * scale));
-        if (scale < 1) {
-            CoreAPI.debugLog(`[ProviderUtils] avatar ${bitmap.width}x${bitmap.height} scaled to ${width}x${height}`);
-        }
-        const canvas = new OffscreenCanvas(width, height);
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(bitmap, 0, 0, width, height);
-        bitmap.close();
-        const pngBlob = await canvas.convertToBlob({ type: 'image/png' });
-        return await pngBlob.arrayBuffer();
+        const bitmap = await decodeAvatar(blob);
+        try {
+            const scale = avatarScale(bitmap.width, bitmap.height);
+            const width = Math.max(1, Math.round(bitmap.width * scale));
+            const height = Math.max(1, Math.round(bitmap.height * scale));
+            if (scale < 1) CoreAPI.debugLog(`[ProviderUtils] avatar ${bitmap.width}x${bitmap.height} scaled to ${width}x${height}`);
+            return await renderPng(width, height, ctx => ctx.drawImage(bitmap, 0, 0, width, height));
+        } finally { bitmap.close?.(); }
     } catch (e1) {
         try {
             if (api?.convertImageToPng) return await api.convertImageToPng(imageBuffer);
@@ -640,17 +682,15 @@ export async function ensurePng(imageBuffer, api) {
  * @returns {Promise<ArrayBuffer>}
  */
 export async function generatePlaceholder() {
-    const canvas = new OffscreenCanvas(256, 256);
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#333';
-    ctx.fillRect(0, 0, 256, 256);
-    ctx.fillStyle = '#666';
-    ctx.font = '100px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('?', 128, 128);
-    const blob = await canvas.convertToBlob({ type: 'image/png' });
-    return await blob.arrayBuffer();
+    return renderPng(256, 256, ctx => {
+        ctx.fillStyle = '#333';
+        ctx.fillRect(0, 0, 256, 256);
+        ctx.fillStyle = '#666';
+        ctx.font = '100px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('?', 128, 128);
+    });
 }
 
 // Post-import tail shared by every browse view: summary/preview choreography, success toast,

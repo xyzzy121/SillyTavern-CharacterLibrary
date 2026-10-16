@@ -31,6 +31,9 @@ import {
     hasUnfetchedLorebook,
     submitExtraction,
     fetchExtractionStatus,
+    pollDatacatRetrieval,
+    fetchDatacatFeatures,
+    getDatacatCapabilities,
     parseJanitoraiSession,
     janitoraiRefreshGrant,
     janitoraiVerifyToken,
@@ -51,9 +54,9 @@ class DatacatProvider extends ProviderBase {
     get icon() { return 'fa-solid fa-cat'; }
     get iconUrl() { return 'https://datacat.run/catgif.gif'; }
     get beta() { return true; }
-    get enableWarning() { return 'Datacat is experimental. Browsing requires cl-helper 1.13.1; some downloads require the optional Datacat companion userscript and human verification.'; }
+    get enableWarning() { return 'Datacat is experimental. Browsing requires cl-helper 1.13.2; some downloads require the optional Datacat companion userscript and human verification.'; }
     get disabledByDefault() { return true; }
-    get minClHelperVersion() { return '1.13.1'; }
+    get minClHelperVersion() { return '1.13.2'; }
     get browseView() { return datacatBrowseView; }
 
     get linkStatFields() {
@@ -218,7 +221,7 @@ class DatacatProvider extends ProviderBase {
         try {
             checkCancelled();
             report?.('Checking cl-helper plugin...');
-            const pluginOk = await checkDcPluginAvailable();
+            const pluginOk = await checkDcPluginAvailable({ signal });
             checkCancelled();
             if (!pluginOk) {
                 api?.debugLog?.('[DatacatProvider] refreshRemoteData: cl-helper not available, skipping re-extraction');
@@ -226,7 +229,7 @@ class DatacatProvider extends ProviderBase {
             }
 
             report?.('Validating DataCat session...');
-            const sessionOk = await validateDcSession();
+            const sessionOk = await validateDcSession({ signal });
             checkCancelled();
             if (!sessionOk.valid) {
                 api?.debugLog?.('[DatacatProvider] refreshRemoteData: no active DataCat session, skipping re-extraction');
@@ -241,6 +244,16 @@ class DatacatProvider extends ProviderBase {
                 sourceKind = getDatacatSourceKind(probe);
             }
             if (sourceKind === 'direct_upload') return;
+            const features = await fetchDatacatFeatures({ signal }).catch(error => {
+                checkCancelled();
+                api?.debugLog?.('[DatacatProvider] Capabilities unavailable:', error.message);
+                return null;
+            });
+            checkCancelled();
+            if (getDatacatCapabilities(features, sourceKind).retrievalDisabled) {
+                report('Retrieval is disabled for this source or viewer; using the available export');
+                return;
+            }
 
             const upstreamUrl = sourceKind === 'saucepan'
                 ? `https://saucepan.ai/companion/${linkInfo.id}`
@@ -276,40 +289,14 @@ class DatacatProvider extends ProviderBase {
                 report?.('Retrieval started...');
             }
 
-            const POLL_INTERVAL = 3000;
-            const MAX_POLLS = 60;
-            for (let i = 0; i < MAX_POLLS; i++) {
-                if (signal?.aborted) return;
-                await new Promise(r => setTimeout(r, POLL_INTERVAL));
-                if (signal?.aborted) return;
-                const status = await fetchExtractionStatus({ signal });
-                checkCancelled();
-                if (!status) continue;
-
-                const done = matchRetrievalStatus(status, { requestId: submitRequestId, characterId: linkInfo.id, submittedAt });
-                if (done) {
-                    report?.(done.success === false ? (done.message || done.error || 'Retrieval failed; using the available export') : 'Retrieval complete');
-                    api?.debugLog?.('[DatacatProvider] refreshRemoteData: re-extraction complete for', linkInfo.id);
-                    return;
-                }
-
-                if (status.inProgress && (submitRequestId ? status.inProgress.requestId === submitRequestId : getDatacatCharacterId(status.inProgress) === linkInfo.id)) {
-                    const phase = status.inProgress.status;
-                    const PHASE_LABELS = {
-                        opening_page: 'Opening page',
-                        preparing: 'Preparing',
-                        initiating: 'Initiating',
-                        pulling: 'Pulling data',
-                        post_extract: 'Finalizing',
-                        complete: 'Completing',
-                    };
-                    report?.(PHASE_LABELS[phase] || `Retrieving (${phase})...`);
-                }
-            }
-            report?.('Retrieval timed out, using the available export');
-            api?.debugLog?.('[DatacatProvider] refreshRemoteData: re-extraction timed out after', MAX_POLLS * POLL_INTERVAL / 1000, 'seconds');
+            const done = await pollDatacatRetrieval({
+                requestId: submitRequestId, characterId: linkInfo.id, submittedAt, signal, onProgress: report,
+            });
+            checkCancelled();
+            report(done.success === false ? (done.message || done.error || 'Retrieval failed; using the available export') : 'Retrieval complete');
         } catch (err) {
             if (err.name === 'AbortError' || signal?.aborted) return;
+            report(`${err.message}; using the available export`);
             console.error('[DatacatProvider] refreshRemoteData failed, continuing with cached data:', err);
         }
     }
@@ -492,9 +479,11 @@ class DatacatProvider extends ProviderBase {
             let imageBuffer = exported.imageBuffer || null;
             if (!imageBuffer && avatarUrl) {
                 try {
-                    const response = await fetchWithProxy(avatarUrl);
+                    const response = await fetchWithProxy(avatarUrl, { signal: options.signal });
                     if (response.ok) imageBuffer = await response.arrayBuffer();
                 } catch (error) {
+                    options.signal?.throwIfAborted();
+                    if (error.name === 'AbortError') throw error;
                     console.warn('[DatacatProvider] Avatar download failed:', error.message);
                 }
             }

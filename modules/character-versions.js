@@ -205,7 +205,9 @@ function withCharFileWrite(versionUid, action) {
     });
 }
 
-// Deduplicates auto_backup snapshots and caps to configured max (default 10)
+const isAutomaticBackup = source => source === 'auto_backup' || source === 'replacement_backup';
+
+// Automatic edit and mandatory replacement backups share the configured cap.
 async function storageSaveSnapshot(avatar, charName, label, source, data, versionUid) {
     if (!versionUid) throw new Error('version_uid required');
     return withCharFileWrite(versionUid, async () => {
@@ -219,8 +221,8 @@ async function storageSaveSnapshot(avatar, charName, label, source, data, versio
         const dataCopy = JSON.parse(JSON.stringify(data));
 
         // Dedup: skip if the latest auto_backup for this character is identical
-        if (source === 'auto_backup') {
-            const existing = charFile.snapshots.filter(s => s.source === 'auto_backup');
+        if (isAutomaticBackup(source)) {
+            const existing = charFile.snapshots.filter(s => isAutomaticBackup(s.source));
             if (existing.length > 0) {
                 const latest = existing[existing.length - 1];
                 if (JSON.stringify(latest.data) === JSON.stringify(dataCopy)) {
@@ -241,10 +243,10 @@ async function storageSaveSnapshot(avatar, charName, label, source, data, versio
         });
 
         // Cap: prune oldest auto_backup snapshots beyond max
-        if (source === 'auto_backup') {
+        if (isAutomaticBackup(source)) {
             const maxBackups = CoreAPI.getSetting('maxAutoBackups') ?? 10;
             if (maxBackups > 0) {
-                const autoBackups = charFile.snapshots.filter(s => s.source === 'auto_backup');
+                const autoBackups = charFile.snapshots.filter(s => isAutomaticBackup(s.source));
                 if (autoBackups.length > maxBackups) {
                     const toRemove = autoBackups.slice(0, autoBackups.length - maxBackups);
                     const removeIds = new Set(toRemove.map(s => s.id));
@@ -497,6 +499,50 @@ export async function autoSnapshotBeforeChange(char, source = 'edit', opts = {})
     } catch (e) {
         console.error('[CharVersions] Auto-snapshot failed:', e);
     }
+}
+
+/**
+ * Mandatory backup for replacement operations. Unlike automatic edit history this
+ * does not depend on autoSnapshotOnEdit, does not swallow errors, and never writes
+ * a version_uid to the card before the caller commits its replacement.
+ */
+export async function createVerifiedSnapshot(char, { source = 'replace' } = {}) {
+    if (!char?.avatar || !char.data || char._slim) throw new Error('A fully loaded character is required for a replacement backup');
+    const response = await fetch(`/characters/${encodeURIComponent(char.avatar)}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Could not back up the existing character (HTTP ${response.status})`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+    if (bytes.length < 33 || !signature.every((value, index) => bytes[index] === value)) {
+        throw new Error('The existing character did not return a valid PNG backup');
+    }
+    const decoded = CoreAPI.extractCharacterDataFromPng(bytes.buffer);
+    if (!decoded?.data || decoded.data.name !== char.data.name) {
+        throw new Error('The existing PNG backup has no matching character metadata');
+    }
+    // The entire old PNG includes the original card metadata as well as artwork.
+    // Chunk the binary-to-string conversion so large avatars cannot overflow the stack.
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 32768) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+    }
+    const data = JSON.parse(JSON.stringify(char.data));
+    data._avatarUrl = `/characters/${encodeURIComponent(char.avatar)}`;
+    data._avatarImageData = `data:image/png;base64,${btoa(binary)}`;
+    const versionUid = getVersionUid(char) || await lookupUidByAvatar(char.avatar) || generateVersionUid();
+    const name = char.data.name || char.name || 'Unknown';
+    const snapshotId = await storageSaveSnapshot(char.avatar, name,
+        `${source.charAt(0).toUpperCase() + source.slice(1)} - ${new Date().toLocaleString()}`,
+        'replacement_backup', data, versionUid);
+    // Bypass both caches: an acknowledged upload alone is not durable-backup evidence.
+    const saved = await fileRead(charFileName(versionUid));
+    const index = await fileRead(INDEX_FILE);
+    const snapshot = saved?.snapshots?.find(item => item.id === snapshotId);
+    if (!snapshot || JSON.stringify(snapshot.data) !== JSON.stringify(data)
+        || index?.avatarMap?.[char.avatar] !== versionUid
+        || index?.characters?.[versionUid]?.avatar !== char.avatar) {
+        throw new Error('Could not verify the saved replacement backup; the character was not replaced');
+    }
+    return { versionUid, snapshotId };
 }
 
 // ========================================
@@ -816,7 +862,8 @@ function renderSnapshotList(snaps) {
         switch (s.source) {
             case 'chub_restore':  // legacy
             case 'remote_restore': icon = 'fa-cloud-arrow-down'; break;
-            case 'auto_backup': icon = 'fa-shield-halved'; break;
+            case 'auto_backup':
+            case 'replacement_backup': icon = 'fa-shield-halved'; break;
             default: icon = 'fa-bookmark';
         }
         return `
@@ -2104,5 +2151,6 @@ export default {
     openVersionHistory,
     renderVersionsPane,
     cleanupVersionsPane,
-    autoSnapshotBeforeChange
+    autoSnapshotBeforeChange,
+    createVerifiedSnapshot
 };

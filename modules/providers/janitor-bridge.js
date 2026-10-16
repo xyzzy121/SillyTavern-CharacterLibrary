@@ -61,6 +61,7 @@ function handleMessage(e) {
         const p = pending.get(msg.id);
         if (!p) return;
         clearTimeout(p.timer);
+        p.cleanup?.();
         pending.delete(msg.id);
         p.resolve({ ok: !!msg.ok, status: msg.status || 0, body: typeof msg.body === 'string' ? msg.body : '' });
     }
@@ -97,18 +98,30 @@ export async function warmJanitorClearance(url) {
 }
 
 // Rejects on transport failure (no bridge / timeout) so callers can fall back to a direct fetch.
-function bridgeFetchOnce(url, authToken) {
+function bridgeFetchOnce(url, authToken, signal) {
     return new Promise((resolve, reject) => {
         if (!bridgeReady) {
             reject(new Error('JanitorAI bridge not available'));
             return;
         }
+        if (signal?.aborted) { reject(signal.reason || new DOMException('JanitorAI request cancelled', 'AbortError')); return; }
         const id = `clj_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const cleanup = () => signal?.removeEventListener('abort', abort);
+        const abort = () => {
+            clearTimeout(timer);
+            pending.delete(id);
+            cleanup();
+            if (bridgeCaps.abort) window.postMessage({ source: PAGE_SRC, type: 'cancel', id }, window.location.origin);
+            reject(signal.reason || new DOMException('JanitorAI request cancelled', 'AbortError'));
+        };
         const timer = setTimeout(() => {
             pending.delete(id);
+            cleanup();
+            if (bridgeCaps.abort) window.postMessage({ source: PAGE_SRC, type: 'cancel', id }, window.location.origin);
             reject(new Error('JanitorAI bridge request timed out'));
         }, REQUEST_TIMEOUT_MS);
-        pending.set(id, { resolve, timer });
+        signal?.addEventListener('abort', abort, { once: true });
+        pending.set(id, { resolve, timer, cleanup });
         window.postMessage({ source: PAGE_SRC, type: 'fetch', id, url, authToken }, window.location.origin);
     });
 }
@@ -119,14 +132,30 @@ function bridgeFetchOnce(url, authToken) {
  * @param {{ allowClearance?: boolean }} [opts] - opts into the background-tab clearance refresh; leave off for batch/background work.
  */
 export async function janitorBridgeFetch(url, authToken = '', opts = {}) {
-    const res = await bridgeFetchOnce(url, authToken);
+    opts.signal?.throwIfAborted();
+    const res = await bridgeFetchOnce(url, authToken, opts.signal);
     // A 401 is an auth failure, not a clearance one: let it fall through so the coded errors still classify it.
     if (res.ok || res.status === 401 || !isCloudflareBlockPage(res.body)) return res;
     if (!opts.allowClearance) return res;
-    if (!(await requestClearance(hostOf(url)))) return res;
+    if (!(await waitForClearance(requestClearance(hostOf(url)), opts.signal))) return res;
+    opts.signal?.throwIfAborted();
     try {
-        return await bridgeFetchOnce(url, authToken);
-    } catch {
+        return await bridgeFetchOnce(url, authToken, opts.signal);
+    } catch (error) {
+        opts.signal?.throwIfAborted();
+        if (error.name === 'AbortError') throw error;
         return res;
     }
+}
+
+// Clearance is shared by multiple consumers; leaving one view only cancels its wait.
+function waitForClearance(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+        const cleanup = () => signal.removeEventListener('abort', abort);
+        const abort = () => { cleanup(); reject(signal.reason || new DOMException('JanitorAI request cancelled', 'AbortError')); };
+        signal.addEventListener('abort', abort, { once: true });
+        promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
 }

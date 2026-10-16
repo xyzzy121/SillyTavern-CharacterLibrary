@@ -34,19 +34,25 @@ export const TAG_MAP = {
 
 let _cachedToken = null;
 let _tokenFetchPromise = null;
+let _tokenFetchEntry = null;
 
 /**
  * Fetch the MeiliSearch API key from JannyAI's client config JS bundle.
  * Falls back to a known hardcoded key if scraping fails.
  * Token is cached across calls (shared between provider and browse view).
  */
-async function getSearchToken() {
+async function getSearchToken(signal) {
+    signal?.throwIfAborted();
     if (_cachedToken) return _cachedToken;
-    if (_tokenFetchPromise) return _tokenFetchPromise;
+    if (_tokenFetchEntry) return waitForToken(_tokenFetchEntry, signal);
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new DOMException('Search token request timed out', 'TimeoutError')), 30000);
+    const entry = { controller, consumers: 0, settled: false, promise: null };
+    _tokenFetchEntry = entry;
     _tokenFetchPromise = (async () => {
         try {
-            const pageResp = await fetchWithProxy(`${JANNY_SITE_BASE}/characters/search`);
+            const pageResp = await fetchWithProxy(`${JANNY_SITE_BASE}/characters/search`, { signal: controller.signal });
             const html = await pageResp.text();
 
             let configPath = null;
@@ -56,7 +62,7 @@ async function getSearchToken() {
             } else {
                 const spMatch = html.match(/SearchPage\.[a-zA-Z0-9_-]+\.js/);
                 if (spMatch) {
-                    const spResp = await fetchWithProxy(`${JANNY_SITE_BASE}/_astro/${spMatch[0]}`);
+                    const spResp = await fetchWithProxy(`${JANNY_SITE_BASE}/_astro/${spMatch[0]}`, { signal: controller.signal });
                     if (spResp.ok) {
                         const spJs = await spResp.text();
                         const impMatch = spJs.match(/client-config\.[a-zA-Z0-9_-]+\.js/);
@@ -66,7 +72,7 @@ async function getSearchToken() {
             }
 
             if (configPath) {
-                const cfgResp = await fetchWithProxy(`${JANNY_SITE_BASE}${configPath}`);
+                const cfgResp = await fetchWithProxy(`${JANNY_SITE_BASE}${configPath}`, { signal: controller.signal });
                 if (cfgResp.ok) {
                     const cfgJs = await cfgResp.text();
                     const tokenMatch = cfgJs.match(/"([a-f0-9]{64})"/);
@@ -79,15 +85,37 @@ async function getSearchToken() {
 
             throw new Error('Could not extract MeiliSearch token');
         } catch (e) {
+            if (controller.signal.aborted) throw controller.signal.reason;
             console.warn('[JannyAPI] Token fetch failed, using fallback:', e.message);
             _cachedToken = JANNY_FALLBACK_TOKEN;
             return _cachedToken;
         } finally {
-            _tokenFetchPromise = null;
+            clearTimeout(timeout);
+            entry.settled = true;
+            if (_tokenFetchEntry === entry) { _tokenFetchEntry = null; _tokenFetchPromise = null; }
         }
     })();
+    entry.promise = _tokenFetchPromise;
+    entry.promise.catch(() => {});
+    return waitForToken(entry, signal);
+}
 
-    return _tokenFetchPromise;
+function waitForToken(entry, signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    entry.consumers++;
+    const consumer = !signal ? entry.promise : new Promise((resolve, reject) => {
+        const abort = () => { cleanup(); reject(signal.reason || new DOMException('Search cancelled', 'AbortError')); };
+        const cleanup = () => signal.removeEventListener('abort', abort);
+        signal.addEventListener('abort', abort, { once: true });
+        entry.promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
+    return consumer.finally(() => {
+        entry.consumers--;
+        if (!entry.settled && entry.consumers === 0) {
+            entry.controller.abort(new DOMException('No active search consumers', 'AbortError'));
+            if (_tokenFetchEntry === entry) { _tokenFetchEntry = null; _tokenFetchPromise = null; }
+        }
+    });
 }
 
 // ========================================
@@ -113,7 +141,14 @@ export { slugify, stripHtml } from '../provider-utils.js';
  * @param {boolean} [opts.highlight] - add the crop/highlight attributes the browse grids render
  * @returns {Promise<Object>} raw multi-search response ({ results: [...] })
  */
-export async function meiliMultiSearch({ search = '', page = 1, limit = 80, filters = [], facets = [], sort = [], highlight = false } = {}) {
+export async function meiliMultiSearch({ search = '', page = 1, limit = 80, filters = [], facets = [], sort = [], highlight = false, signal } = {}) {
+    signal?.throwIfAborted();
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    const timeout = setTimeout(() => controller.abort(new DOMException('Search request timed out', 'TimeoutError')), 30000);
+    const requestSignal = controller.signal;
+    try {
     const query = {
         indexUid: 'janny-characters',
         q: search,
@@ -131,7 +166,7 @@ export async function meiliMultiSearch({ search = '', page = 1, limit = 80, filt
     }
     if (sort.length) query.sort = sort;
 
-    const token = await getSearchToken();
+    const token = await getSearchToken(requestSignal);
     const headers = {
         'Accept': '*/*',
         'Content-Type': 'application/json',
@@ -144,11 +179,19 @@ export async function meiliMultiSearch({ search = '', page = 1, limit = 80, filt
     const body = JSON.stringify({ queries: [query] });
     let response;
     try {
-        response = await fetch(JANNY_SEARCH_URL, { method: 'POST', headers, body });
-    } catch (_) {
-        response = await fetchWithProxy(JANNY_SEARCH_URL, { method: 'POST', headers, body });
+        response = await fetch(JANNY_SEARCH_URL, { method: 'POST', headers, body, signal: requestSignal });
+    } catch (error) {
+        requestSignal.throwIfAborted();
+        if (error.name === 'AbortError') throw error;
+        response = await fetchWithProxy(JANNY_SEARCH_URL, { method: 'POST', headers, body, signal: requestSignal });
     }
-    return readJsonClassified(response);
+    const result = await readJsonClassified(response);
+    requestSignal.throwIfAborted();
+    return result;
+    } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', abort);
+    }
 }
 
 export function resolveTagNames(tagIds) {

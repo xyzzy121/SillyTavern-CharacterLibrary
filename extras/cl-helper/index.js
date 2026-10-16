@@ -940,6 +940,108 @@ const DATACAT_BASE = 'https://datacat.run';
 const DATACAT_ORIGIN = 'https://datacat.run';
 
 let dcSessionToken = null;
+let dcSessionEpoch = 0;
+let dcActiveRequests = 0;
+let dcNextStart = 0;
+let dcCooldownUntil = 0;
+let dcGateTimer = null;
+const dcQueue = [];
+
+function dcAbortError(signal) { return signal.reason || new DOMException('DataCat request cancelled', 'AbortError'); }
+
+function dcAbortable(promise, signal) {
+    if (signal.aborted) return Promise.reject(dcAbortError(signal));
+    return new Promise((resolve, reject) => {
+        const abort = () => { cleanup(); reject(dcAbortError(signal)); };
+        const cleanup = () => signal.removeEventListener('abort', abort);
+        signal.addEventListener('abort', abort, { once: true });
+        Promise.resolve(promise).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
+}
+
+function dcPumpQueue() {
+    clearTimeout(dcGateTimer);
+    dcGateTimer = null;
+    if (!dcQueue.length || dcActiveRequests >= 3) return;
+    const delay = Math.max(dcNextStart, dcCooldownUntil) - Date.now();
+    if (delay > 0) { dcGateTimer = setTimeout(dcPumpQueue, delay); return; }
+    const entry = dcQueue.shift();
+    entry.signal.removeEventListener('abort', entry.abort);
+    if (entry.signal.aborted) { entry.reject(dcAbortError(entry.signal)); dcPumpQueue(); return; }
+    dcActiveRequests++;
+    dcNextStart = Date.now() + 1000;
+    let released = false;
+    entry.resolve(() => { if (!released) { released = true; dcActiveRequests--; dcPumpQueue(); } });
+    dcPumpQueue();
+}
+
+function dcAcquire(signal) {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) return reject(dcAbortError(signal));
+        const entry = { signal, resolve, reject, abort: null };
+        entry.abort = () => {
+            const index = dcQueue.indexOf(entry);
+            if (index >= 0) dcQueue.splice(index, 1);
+            signal.removeEventListener('abort', entry.abort);
+            reject(dcAbortError(signal));
+            dcPumpQueue();
+        };
+        signal.addEventListener('abort', entry.abort, { once: true });
+        dcQueue.push(entry);
+        dcPumpQueue();
+    });
+}
+
+function dcRoute(handler, timeoutMs = 30000) {
+    return async (req, res) => {
+        const controller = new AbortController();
+        const releases = new Set();
+        let disconnected = false;
+        req.dcSignal = controller.signal;
+        req.dcReleases = releases;
+        const disconnect = () => { if (!res.writableEnded) { disconnected = true; controller.abort(new DOMException('Client disconnected', 'AbortError')); } };
+        const timeout = setTimeout(() => controller.abort(new DOMException('DataCat upstream timed out', 'TimeoutError')), timeoutMs);
+        req.once?.('aborted', disconnect);
+        res.once?.('close', disconnect);
+        try { await handler(req, res); }
+        catch (error) {
+            if (!disconnected && !res.writableEnded && !res.destroyed && !req.aborted) {
+                res.status(controller.signal.aborted ? 504 : 502).json({ error: controller.signal.aborted ? 'DataCat request interrupted; a submitted remote job may still finish' : 'Failed to reach DataCat', code: controller.signal.aborted ? 'REQUEST_TIMEOUT' : 'UPSTREAM_ERROR' });
+            }
+        } finally {
+            clearTimeout(timeout);
+            req.removeListener?.('aborted', disconnect);
+            res.removeListener?.('close', disconnect);
+            for (const release of releases) release();
+            releases.clear();
+        }
+    };
+}
+
+async function dcUpstreamFetch(url, options, req) {
+    const signal = req.dcSignal;
+    const release = await dcAcquire(signal);
+    req.dcReleases.add(release);
+    const finish = () => { release(); req.dcReleases.delete(release); };
+    try {
+        // Admission can resume after other microtasks; stamp the actual fetch start too.
+        dcNextStart = Date.now() + 1000;
+        dcPumpQueue();
+        const response = await dcAbortable(fetch(url, { ...options, signal }), signal);
+        if (response.status === 429) {
+            const raw = response.headers.get('retry-after');
+            const seconds = raw == null || !raw.trim() ? NaN : Number(raw);
+            const duration = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(raw) - Date.now();
+            dcCooldownUntil = Math.max(dcCooldownUntil, Date.now() + (Number.isFinite(duration) ? Math.max(0, duration) : 30000));
+            dcPumpQueue();
+        }
+        for (const name of ['json', 'text', 'arrayBuffer']) {
+            const read = response[name].bind(response);
+            response[name] = async () => { try { return await dcAbortable(read(), signal); } finally { finish(); } };
+        }
+        return response;
+    } catch (error) { finish(); throw error; }
+}
 
 function dcHeaders(token) {
     return {
@@ -951,10 +1053,10 @@ function dcHeaders(token) {
     };
 }
 
-async function testDcToken(token) {
-    const response = await fetch(`${DATACAT_BASE}/api/characters/recent-public?limit=1&offset=0&summary=1&minTotalTokens=889`, {
+async function testDcToken(token, req) {
+    const response = await dcUpstreamFetch(`${DATACAT_BASE}/api/characters/recent-public?limit=1&offset=0&summary=1&minTotalTokens=889`, {
         headers: dcHeaders(token),
-    });
+    }, req);
     return response;
 }
 
@@ -975,14 +1077,20 @@ const DC_ALLOWED_PATHS = [
 ];
 
 function registerDataCatRoutes(router) {
-    router.post('/dc-init', async (req, res) => {
+    const get = (path, handler) => router.get(path, dcRoute(handler));
+    const post = (path, handler, timeout) => router.post(path, dcRoute(handler, timeout));
+    post('/dc-init', async (req, res) => {
         const { force } = req.body ?? {};
+        if (force) dcSessionEpoch++;
+        const epoch = dcSessionEpoch;
 
         // If we already have a token and not forcing refresh, verify it still works
         if (dcSessionToken && !force) {
             try {
-                const check = await testDcToken(dcSessionToken);
+                const check = await testDcToken(dcSessionToken, req);
+                if (epoch !== dcSessionEpoch) return res.json({ ok: false, reason: 'Session changed while initializing' });
                 if (check.ok) {
+                    await check.text();
                     return res.json({ ok: true, cached: true, token: dcSessionToken });
                 }
                 // Restrictions and outages are not evidence that the token expired.
@@ -993,14 +1101,15 @@ function registerDataCatRoutes(router) {
                 if (!/(?:SESSION|TOKEN).*(?:INVALID|EXPIRED|REQUIRED|MISSING)|(?:INVALID|EXPIRED|MISSING|NO).*(?:SESSION|TOKEN)/i.test(sessionError)) {
                     return res.json({ ok: false, reason: 'Authentication failed; the existing session was preserved' });
                 }
-            } catch (error) { return res.json({ ok: false, reason: 'Could not validate the existing DataCat session' }); }
+            } catch (error) { if (req.dcSignal.aborted) throw error; return res.json({ ok: false, reason: 'Could not validate the existing DataCat session' }); }
+            if (epoch !== dcSessionEpoch) return res.json({ ok: false, reason: 'Session changed while initializing' });
             dcSessionToken = null;
         }
 
         // Create anonymous session via the Liberator identify endpoint
         const deviceToken = randomUUID();
         try {
-            const response = await fetch(`${DATACAT_BASE}/api/liberator/identify`, {
+            const response = await dcUpstreamFetch(`${DATACAT_BASE}/api/liberator/identify`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -1009,7 +1118,7 @@ function registerDataCatRoutes(router) {
                     'Referer': DATACAT_ORIGIN + '/',
                 },
                 body: JSON.stringify({ deviceToken }),
-            });
+            }, req);
 
             if (!response.ok) {
                 const text = await response.text();
@@ -1019,6 +1128,7 @@ function registerDataCatRoutes(router) {
 
             const data = await response.json();
             if (data?.success && data?.sessionToken) {
+                if (epoch !== dcSessionEpoch || req.dcSignal.aborted) return res.json({ ok: false, reason: 'Session changed while initializing' });
                 dcSessionToken = data.sessionToken;
                 console.log('[cl-helper] DC anonymous session initialized');
                 return res.json({ ok: true, token: dcSessionToken });
@@ -1027,12 +1137,13 @@ function registerDataCatRoutes(router) {
             console.warn('[cl-helper] DC identify returned unexpected shape:', JSON.stringify(data).slice(0, 300));
             res.json({ ok: false, reason: 'identify response missing sessionToken' });
         } catch (err) {
+            if (req.dcSignal.aborted) throw err;
             console.error('[cl-helper] DC auto-init error:', err.message);
             res.json({ ok: false, reason: err.message });
         }
     });
 
-    router.post('/dc-set-token', async (req, res) => {
+    post('/dc-set-token', async (req, res) => {
         const { token } = req.body ?? {};
 
         if (!token || typeof token !== 'string' || !token.trim()) {
@@ -1044,28 +1155,30 @@ function registerDataCatRoutes(router) {
             return res.status(400).json({ error: 'Token too long' });
         }
 
+        dcSessionEpoch++;
         dcSessionToken = value;
         console.log('[cl-helper] DC session token stored');
         res.json({ ok: true });
     });
 
-    router.post('/dc-clear-token', (_req, res) => {
+    post('/dc-clear-token', (_req, res) => {
+        dcSessionEpoch++;
         dcSessionToken = null;
         console.log('[cl-helper] DC session token cleared');
         res.json({ ok: true });
     });
 
-    router.get('/dc-session', (_req, res) => {
+    get('/dc-session', (_req, res) => {
         res.json({ active: !!dcSessionToken });
     });
 
-    router.get('/dc-validate', async (_req, res) => {
+    get('/dc-validate', async (req, res) => {
         if (!dcSessionToken) {
             return res.json({ valid: false, reason: 'no token stored' });
         }
 
         try {
-            const response = await testDcToken(dcSessionToken);
+            const response = await testDcToken(dcSessionToken, req);
 
             if (response.ok) {
                 const data = await response.json();
@@ -1078,13 +1191,14 @@ function registerDataCatRoutes(router) {
                 res.json({ valid: false, reason: `HTTP ${response.status}: ${text.slice(0, 200)}` });
             }
         } catch (err) {
+            if (req.dcSignal.aborted) throw err;
             console.error('[cl-helper] DC validate error:', err.message);
             res.json({ valid: false, reason: err.message });
         }
     });
 
     // POST-only: submit extraction request to DataCat
-    router.post('/dc-extract', async (req, res) => {
+    post('/dc-extract', async (req, res) => {
         if (!dcSessionToken) {
             return res.status(401).json({ error: 'No DataCat session token configured' });
         }
@@ -1158,7 +1272,7 @@ function registerDataCatRoutes(router) {
                 };
             }
 
-            const response = await fetch(endpoint, {
+            const response = await dcUpstreamFetch(endpoint, {
                 method: 'POST',
                 headers: {
                     ...dcHeaders(dcSessionToken),
@@ -1166,7 +1280,9 @@ function registerDataCatRoutes(router) {
                     'X-Request-Id': requestId,
                 },
                 body: JSON.stringify(body),
-            });
+            }, req);
+            const retryAfter = response.headers.get('retry-after');
+            if (retryAfter) res.set('Retry-After', retryAfter);
 
             const responseText = await response.text();
             let data;
@@ -1188,12 +1304,13 @@ function registerDataCatRoutes(router) {
             // Preserve upstream classifications and request aliases before using our sent ID.
             res.status(response.status).json({ ...data, requestId: upstreamRequestId || requestId });
         } catch (err) {
+            if (req.dcSignal.aborted) throw err;
             console.error('[cl-helper] DC extract error:', err.message);
             res.status(502).json({ error: 'Failed to reach DataCat' });
         }
-    });
+    }, 60000);
 
-    router.get('/dc-proxy/*', async (req, res) => {
+    get('/dc-proxy/*', async (req, res) => {
         const targetPath = '/' + req.params[0];
 
         const normalizedPath = new URL(targetPath, DATACAT_BASE).pathname;
@@ -1210,11 +1327,11 @@ function registerDataCatRoutes(router) {
         }
 
         try {
-            const response = await fetch(targetUrl.toString(), {
+            const response = await dcUpstreamFetch(targetUrl.toString(), {
                 method: 'GET',
                 headers: dcSessionToken ? dcHeaders(dcSessionToken) : Object.fromEntries(Object.entries(dcHeaders('')).filter(([key]) => key !== 'X-Session-Token')),
                 redirect: 'manual',
-            });
+            }, req);
 
             const contentType = response.headers.get('content-type') || '';
             res.status(response.status);
@@ -1231,6 +1348,7 @@ function registerDataCatRoutes(router) {
                 res.send(buffer);
             }
         } catch (err) {
+            if (req.dcSignal.aborted) throw err;
             console.error('[cl-helper] DC proxy error:', err.message);
             res.status(502).json({ error: 'Failed to reach DataCat' });
         }
@@ -1926,12 +2044,12 @@ function registerSaucepanRoutes(router) {
         if (saucepanToken && !isCdn) headers['Authorization'] = `Bearer ${saucepanToken}`;
 
         try {
-            const response = await fetch(targetUrl.toString(), {
+            const response = await dcAbortable(fetch(targetUrl.toString(), {
                 method: req.method,
                 headers,
                 body: bodyStr ?? undefined,
-                redirect: 'follow',
-            });
+                redirect: 'follow', signal: req.dcSignal,
+            }), req.dcSignal);
 
             // CDN images: return binary bytes straight back; do not run through
             // the zstd/text reader used for API responses.
@@ -1940,7 +2058,7 @@ function registerSaucepanRoutes(router) {
                 if (contentLength > SAUCEPAN_MAX_BYTES) {
                     return res.status(413).json({ error: 'Saucepan image too large' });
                 }
-                const buf = Buffer.from(await response.arrayBuffer());
+                const buf = Buffer.from(await dcAbortable(response.arrayBuffer(), req.dcSignal));
                 if (buf.length > SAUCEPAN_MAX_BYTES) {
                     return res.status(413).json({ error: 'Saucepan image too large' });
                 }
@@ -1953,18 +2071,19 @@ function registerSaucepanRoutes(router) {
                 return res.send(buf);
             }
 
-            const text = await readSaucepanBody(response);
+            const text = await dcAbortable(readSaucepanBody(response), req.dcSignal);
             res.status(response.status);
             res.set('Content-Type', response.headers.get('content-type') || 'application/json');
             res.send(text);
         } catch (err) {
+            if (req.dcSignal.aborted) throw err;
             console.error('[cl-helper] Saucepan proxy error:', err.message);
             res.status(502).json({ error: `Failed to reach Saucepan: ${err.message}` });
         }
     };
 
-    router.get('/saucepan-proxy/*', handleProxy);
-    router.post('/saucepan-proxy/*', handleProxy);
+    router.get('/saucepan-proxy/*', dcRoute(handleProxy));
+    router.post('/saucepan-proxy/*', dcRoute(handleProxy));
 }
 
 // =============================================================================
@@ -4315,6 +4434,7 @@ export async function init(router) {
         res.json({
             ok: true,
             version: _runningVersion,
+            capabilities: { datacatCancellation: true, datacatRequestGate: true },
             thumbnails: _thumbsReady,
             linked: _isLinkedInstall,
             installPath: __dirname,

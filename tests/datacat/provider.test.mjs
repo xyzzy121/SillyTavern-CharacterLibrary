@@ -20,6 +20,8 @@ async function loadProvider(overrides = {}) {
         acquireDatacatExport: async (_id, options) => { calls.push(['acquire', _id, options]); return exportCard(options.sourceKind || 'janitor', options.definitionSource || 'source'); },
         closeDatacatExportPanel() { calls.push(['close']); },
         checkDcPluginAvailable: async () => true, validateDcSession: async () => ({ valid: true }),
+        fetchDatacatFeatures: async () => ({}), getDatacatCapabilities: () => ({ retrievalDisabled: false }),
+        pollDatacatRetrieval: async ({ requestId }) => { calls.push(['poll', requestId]); return { success: true }; },
         setTimeout: callback => queueMicrotask(callback),
         submitExtraction: async () => { calls.push(['retrieve']); return { success: true, collected: true, characterId: id }; },
         fetchDatacatCharacter: async () => ({ characterId: id, primary_content_source_kind: 'direct_upload' }),
@@ -235,16 +237,14 @@ test('retrieval updates follow a status-only submission and correlate its reques
     const { provider } = await loadProvider({
         CoreAPI: { getSetting: name => name === 'datacatReextractOnUpdate' },
         submitExtraction: async () => ({ status: 'queued', request_id: 'current' }),
-        fetchExtractionStatus: async () => {
+        pollDatacatRetrieval: async ({ requestId }) => {
+            assert.equal(requestId, 'current');
             polls++;
-            return { history: [
-                { request_id: 'stale', character_id: id, status: 'failed', timestamp: Date.now(), message: 'Stale job failed' },
-                ...(polls === 2 ? [{ request_id: 'current', character_id: id, status: 'completed' }] : []),
-            ] };
+            return { request_id: 'current', character_id: id, status: 'completed', success: true };
         },
     });
     await provider.refreshRemoteData({ id, sourceKind: 'janitor' }, { onStatus: text => statuses.push(text) });
-    assert.equal(polls, 2);
+    assert.equal(polls, 1, 'delegates to the shared bounded poller once');
     assert.equal(statuses.at(-1), 'Retrieval complete');
     assert.equal(statuses.includes('Stale job failed'), false);
 });

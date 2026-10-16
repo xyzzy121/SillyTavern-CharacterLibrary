@@ -7,7 +7,7 @@ const contract = await readFile(new URL('datacat-contract.js', root), 'utf8');
 const contractUrl = `data:text/javascript;base64,${Buffer.from(contract).toString('base64')}`;
 let source = await readFile(new URL('datacat-api.js', root), 'utf8');
 source = source.replace(/^import[\s\S]*?;\r?\n/gm, '').replace(/^export \* from .*;\r?\n/gm, '');
-const names = ['DatacatError', 'classifyDatacatError', 'normalizeDatacatCharacter', 'normalizeDatacatPage', 'normalizeDatacatSourceKind', 'getDatacatSourceKind', 'getDatacatCharacterId', 'normalizeDatacatAvatar', 'normalizeDefinitionSource', 'normalizeRetrievalStatus'];
+const names = ['DatacatError', 'classifyDatacatError', 'normalizeDatacatCharacter', 'normalizeDatacatPage', 'normalizeDatacatSourceKind', 'getDatacatSourceKind', 'getDatacatCharacterId', 'normalizeDatacatAvatar', 'normalizeDefinitionSource', 'normalizeRetrievalStatus', 'matchRetrievalStatus'];
 source = `import {${names.join(',')}} from '${contractUrl}';
 const CoreAPI = { isUrlSafeForDownload: () => ({ok:true}) };
 const CL_HELPER_PLUGIN_BASE = '/plugins/cl-helper';

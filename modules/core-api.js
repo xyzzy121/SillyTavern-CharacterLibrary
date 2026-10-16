@@ -943,10 +943,11 @@ export function checkCharacterForDuplicatesAsync(card) {
  * Show a pre-import duplicate warning modal
  * @param {Object} newCharInfo - Info about the character being imported
  * @param {Array} matches - Duplicate matches from checkCharacterForDuplicates
- * @returns {Promise<{choice: string}>} User's choice ('import' | 'replace' | 'skip')
+ * @param {Object} [options] - selectReplacementTarget: show an explicit DataCat target selector
+ * @returns {Promise<{choice: string, targetAvatar?: string}>} User's choice ('import' | 'replace' | 'skip')
  */
-export function showPreImportDuplicateWarning(newCharInfo, matches) {
-    return window.showPreImportDuplicateWarning?.(newCharInfo, matches) || Promise.resolve({ choice: 'skip' });
+export function showPreImportDuplicateWarning(newCharInfo, matches, options) {
+    return window.showPreImportDuplicateWarning?.(newCharInfo, matches, options) || Promise.resolve({ choice: 'skip' });
 }
 
 /**
@@ -1193,7 +1194,7 @@ export function extractCharacterDataFromPng(pngBuffer) {
  *
  * @param {string} avatar - Character avatar filename
  * @param {Object} fieldUpdates - Object with field paths as keys and new values
- * @param {Object} [opts] - awaitNotify: await the ST resync before returning, so a follow-on implicit card save cannot clobber this write. rootFields: payload-root key/values for fields ST keeps outside data (chat, fav, create_date).
+ * @param {Object} [opts] - awaitNotify: await the ST resync before returning. surgical: send only approved updates. extensionCleanupNamespaces: limit null-namespace preflight to these names. rootFields: payload-root key/values for fields ST keeps outside data (chat, fav, create_date).
  * @returns {Promise<boolean>} Success status
  */
 export function applyCardFieldUpdates(...args) {

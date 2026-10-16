@@ -147,17 +147,19 @@ export function normalizeDatacatCharacter(row) {
 }
 
 export class DatacatError extends Error {
-    constructor(message, { code = 'request_failed', status = 0, payload = null } = {}) {
+    constructor(message, { code = 'request_failed', status = 0, payload = null, retryAfterMs = null, retryAt = null } = {}) {
         super(message);
         this.name = 'DatacatError';
         this.code = code;
         this.status = status;
         this.payload = payload;
+        this.retryAfterMs = retryAfterMs;
+        this.retryAt = retryAt;
         if (payload?.redirectUrl) this.redirectUrl = payload.redirectUrl;
     }
 }
 
-export function classifyDatacatError(status, payload) {
+export function classifyDatacatError(status, payload, headers = null) {
     const upstream = String(payload?.code || payload?.errorCode || payload?.error?.code || (typeof payload?.error === 'string' ? payload.error : ''));
     const message = payload?.message || payload?.error?.message || (typeof payload?.error === 'string' ? payload.error : '');
     const text = message || `DataCat returned HTTP ${status}`;
@@ -171,7 +173,15 @@ export function classifyDatacatError(status, payload) {
     else if (status === 404 && (/^(?:CHARACTER_|RESOURCE_|ENDPOINT_)?NOT_FOUND$/i.test(upstream)
         || /^(?:character|resource|endpoint|route)?\s*not found[.!]?$/i.test(message))) code = 'not_found';
     else if (status === 403) code = 'forbidden';
-    return new DatacatError(text, { code, status, payload });
+    const raw = headers?.get?.('retry-after');
+    let retryAfterMs = null;
+    if (raw != null && String(raw).trim()) {
+        const seconds = Number(raw);
+        const duration = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(raw) - Date.now();
+        if (Number.isFinite(duration)) retryAfterMs = Math.max(0, duration);
+    }
+    return new DatacatError(text, { code, status, payload, retryAfterMs,
+        retryAt: retryAfterMs == null ? null : Date.now() + retryAfterMs });
 }
 
 export function getDatacatPageState(pageInfo, offset, rowCount, total = null) {

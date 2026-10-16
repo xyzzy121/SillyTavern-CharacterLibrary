@@ -10,6 +10,29 @@ These use Node's built-in test runner, with no build system or package installat
 
 Coverage includes current helper routes and visibility fields, explicit export parameters, source and UUID normalization, source-qualified links, native media, nested pagination metadata, clamped and duplicate pages, retrieval correlation and terminal failures, structured errors, authoritative exports, definition persistence, cancellation, and the companion message/PNG contract. Browser and provider tests exercise the actual source modules with their external dependencies replaced.
 
+## 7.3.5 reliability fixes — 2026-10-16
+
+The whole-extension suite passes **388 tests**; all **76 non-vendor production JavaScript files** pass syntax checks. DataCat requires helper **1.13.2**, the optional Janitor bridge is **1.3.2**, and the separate export companion remains **1.0.2**.
+
+Regression coverage now includes:
+
+- In-place replacement of an explicitly selected duplicate, frozen export selection, mandatory verified original-PNG/card/index snapshots, stale/pending-edit checks, same-merge DataCat cleanup, exact readback, and reconciliation of lost acknowledgements without retry. Existing avatar identity, name, artwork, chats, favorites, settings, unrelated namespaces, linked World Info, playlists, and name preferences are preserved.
+- Lorebook replacement removes obsolete object keys in the main merge. A root empty `null` book or owned null namespace can be prepared only after its verified backup, with strict readback. Unsafe nested null-to-object conversions stop before mutation with a repair message. A failed main write after empty-null preparation can leave that empty marker absent; populated data and protected state remain intact and the snapshot preserves the exact original PNG.
+- Mandatory snapshots share `maxAutoBackups` retention and deduplication, including repeated failed first replacements before a UID reaches the card. Zero retains the existing unlimited setting.
+- Bounded Following pages, fair continuation, request budgets, source-qualified identities, cache-only local sorts/filters/scrolling, incomplete/error states and targeted retries, cache age, refresh/unfollow/navigation cancellation, and scroll/focus preservation.
+- Consumer-aware bootstrap/features/Meili/Saucepan token sharing, session epochs, transport/body/queue deadlines, actual helper disconnect propagation, at least one second between upstream starts, three active slots through body consumption, shared cooldowns, numeric/date Retry-After, correlated hard-deadline polling, and no automatic submission retries.
+- Canvas fallback without OffscreenCanvas/createImageBitmap, failed encoding cleanup, modal focus/inert ownership, visible-opener restoration, trusted mobile input focus, Escape/Back dismissal, and 44-pixel DataCat touch targets.
+
+Final-source real-server replacement checks passed **12 desktop Chromium scenarios** and **four mobile WebKit lorebook edge scenarios**, with zero uncaught page errors. The earlier eight replacement workflows also passed in mobile WebKit. Failures are injected at network/storage boundaries; snapshots and persistence themselves use real local files.
+
+The final browser matrix passed **27/27 checks**, with **zero uncaught page errors**: desktop Chromium at 1440×1000; mobile Chromium at 320×568, 390×844 and 844×390; and Windows WebKit at 390×844 and 844×390. Twelve missing/valid-artwork imports persisted and survived reloads across those six profiles with OffscreenCanvas forced unavailable. Mobile tag/export keyboard boundaries, Escape/Back/manual close, visible focus restoration, and 44-pixel targets passed. Serial iframe exports used the actual bundled companion with a synthetic native export service; the harness waits for the new iframe document and uses touch input on mobile. Earlier mouse/readiness harness failures remain in separate artifacts and were not fixed by changing production behavior.
+
+For a 10,000-card creator, initial Following uses **two requests**, rather than the reproduced 200-page drain, and displays the first 50 cards while its second response is pending. Excluded results stop at **12 requests per explicit action**; scrolling and local sorts/filters do not admit another batch. The realistic 107,884-tag/six-group fixture initially mounts **286 rows**. Tag timing records have three repetitions per query; Chromium mobile uses four-times CPU throttling. Those timings are observations, not a matched before/after benchmark.
+
+The final source-hash audit matched all **115 production files** against the independent runtime and matched the installed test helper to the bundled helper. An independent static review found no unresolved actionable issues. Generated reports, screenshots, runtime data and logs remain outside this repository.
+
+All external DataCat responses in this implementation's browser validation are fixtures. No live extraction jobs, verified exports, or service load tests are submitted. Chromium mobile emulation and Windows WebKit do not establish physical Android/iOS behavior. The extension can abort browser requests to SillyTavern's generic proxy, but upstream cancellation inside that core proxy is outside its control; the DataCat/Saucepan helper routes and updated Janitor bridge do propagate it.
+
 ## 7.3.4 second audit — 2026-09-28
 
 Added **31 regressions**: **164 Datacat tests** and **296 tests across the extension** pass. All 73 non-vendor JavaScript files pass syntax checks, and the diff passes whitespace checks. Helper remains **1.13.1**; companion is **1.0.2**.

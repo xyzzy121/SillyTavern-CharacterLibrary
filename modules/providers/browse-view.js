@@ -6,7 +6,7 @@ import { CHUB_API_BASE, getChubHeaders, extractNodes } from './chub/chub-api.js'
 import { BOTBOORU_BASE, fetchBotbooruUser } from './botbooru/botbooru-api.js';
 import { fetchCharactersByOwner, getCharacterPageUrl } from './pygmalion/pygmalion-api.js';
 import { WYVERN_API_BASE, WYVERN_SITE_BASE, getWyvernHeaders, getWyvernCharName } from './wyvern/wyvern-api.js';
-import { fetchDatacatCreatorCharacters, fetchDatacatCharacter, submitExtraction, fetchExtractionStatus } from './datacat/datacat-api.js';
+import { fetchDatacatCreatorCharacters, fetchDatacatCharacter, submitExtraction, pollDatacatRetrieval, fetchDatacatFeatures, getDatacatCapabilities } from './datacat/datacat-api.js';
 import { getDatacatCharacterId, getDatacatSourceKind, getDatacatPageState, buildDatacatUrl, normalizeRetrievalStatus, matchRetrievalStatus, normalizeRetrievalSubmission } from './datacat/datacat-contract.js';
 import { closeDatacatExportPanel } from './datacat/datacat-export-bridge.js';
 import { fetchSaucepanCompanionsOfUser } from './saucepan/saucepan-api.js';
@@ -130,6 +130,10 @@ const cdSourceKind = getDatacatSourceKind;
 async function cdDatacatExtract(view, charId, sourceKind) {
     if (sourceKind === 'direct_upload' || view._cdCancelled) return null;
     const signal = view._cdAbortController?.signal;
+    const features = await fetchDatacatFeatures({ signal }).catch(error => { signal?.throwIfAborted(); return null; });
+    signal?.throwIfAborted();
+    if (view._cdCancelled) return null;
+    if (getDatacatCapabilities(features, sourceKind).retrievalDisabled) throw new Error('DataCat retrieval is disabled for this source or viewer');
     const urlBase = sourceKind === 'saucepan' ? 'https://saucepan.ai/companion/' : 'https://janitorai.com/characters/';
     const submittedAt = Date.now();
     let submission;
@@ -149,25 +153,22 @@ async function cdDatacatExtract(view, charId, sourceKind) {
         if (view._cdCancelled) return null;
         let character = await fetchDatacatCharacter(charId, sourceKind, { signal });
         if (!character) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            await new Promise((resolve, reject) => {
+                const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(signal.reason); };
+                const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, 2000);
+                signal?.addEventListener('abort', abort, { once: true });
+                if (signal?.aborted) abort();
+            });
             if (view._cdCancelled) return null;
             character = await fetchDatacatCharacter(charId, sourceKind, { signal });
         }
         return character;
     };
     if (result.state === 'existing' || result.state === 'completed') return fetchResult();
-    const deadline = Date.now() + 180000;
-    while (Date.now() < deadline) {
-        if (view._cdCancelled) return null;
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        if (view._cdCancelled) return null;
-        const status = normalizeRetrievalStatus(await fetchExtractionStatus({ signal }));
-        const entry = matchRetrievalStatus(status, { requestId, characterId: charId, submittedAt });
-        if (!entry) continue;
-        if (entry.success === false) throw new Error(entry.error || entry.message || 'Retrieval ' + entry.status);
-        return fetchResult();
-    }
-    throw new Error('Retrieval timed out; the remote job may still finish.');
+    const entry = await pollDatacatRetrieval({ requestId, characterId: charId, submittedAt, signal });
+    if (view._cdCancelled || signal?.aborted) return null;
+    if (entry.success === false) throw new Error(entry.error || entry.message || 'Retrieval ' + entry.status);
+    return fetchResult();
 }
 
 const CD_ADAPTERS = {
@@ -374,24 +375,25 @@ const CD_ADAPTERS = {
                 results.push({ key, name: hit.name || '', creator: hit.creator_name || hit.creatorName || ref.name || '', raw: hit });
             };
             if (ref.source === 'saucepan') {
-                const data = await fetchSaucepanCompanionsOfUser(ref.handle);
+                const data = await fetchSaucepanCompanionsOfUser(ref.handle, { signal: view._cdAbortController?.signal });
                 for (const hit of (data?.characters || [])) push(hit);
             } else {
                 const PAGE = 80;
+                let complete = false;
                 for (let offset = 0, pageNumber = 0; pageNumber < 200; pageNumber++) {
-                    // Tolerant on purpose: a mid-pagination failure keeps the partial list (only
-                    // a first-page failure aborts below); the fetcher itself throws classified now
-                    const data = await fetchDatacatCreatorCharacters(ref.creatorId, { limit: PAGE, offset, sortBy: 'chat_count', sourceKind: ref.source === 'direct_upload' ? 'direct_upload' : undefined }).catch(() => null);
+                    if (view._cdCancelled) throw new DOMException('Creator download cancelled', 'AbortError');
+                    view._cdAbortController?.signal.throwIfAborted();
+                    const data = await fetchDatacatCreatorCharacters(ref.creatorId, { limit: PAGE, offset, sortBy: 'chat_count', sourceKind: ref.source === 'direct_upload' ? 'direct_upload' : undefined, signal: view._cdAbortController?.signal });
                     if (!data) {
-                        if (offset === 0) throw new Error('DataCat creator fetch failed');
-                        break;
+                        throw new Error('DataCat creator catalog could not be completed');
                     }
                     const list = data?.list || [];
                     for (const hit of list) push(hit);
                     const page = getDatacatPageState(data.pagination || data, offset, list.length, data.total);
-                    if (!page.hasMore) break;
+                    if (!page.hasMore) { complete = true; break; }
                     offset = page.nextOffset;
                 }
+                if (!complete) throw new Error('DataCat creator catalog exceeded the 200-page safety limit; download was not started');
             }
             return results;
         },
@@ -1415,8 +1417,9 @@ export class BrowseView {
      */
     closeDropdowns() {
         if (this._dropdownDismissPairs) {
-            for (const { dropdownId } of this._dropdownDismissPairs) {
-                document.getElementById(dropdownId)?.classList.add('hidden');
+            for (const { dropdownId, close } of this._dropdownDismissPairs) {
+                if (close) close();
+                else document.getElementById(dropdownId)?.classList.add('hidden');
             }
         }
     }
@@ -1430,12 +1433,13 @@ export class BrowseView {
         this._removeDropdownDismiss();
         this._dropdownDismissPairs = pairs;
         this._dropdownCloseHandler = (e) => {
-            for (const { dropdownId, buttonId } of pairs) {
+            for (const { dropdownId, buttonId, close } of pairs) {
                 const dropdown = document.getElementById(dropdownId);
                 const btn = document.getElementById(buttonId);
                 if (dropdown && !dropdown.classList.contains('hidden')) {
                     if (!dropdown.contains(e.target) && e.target !== btn && !btn?.contains(e.target)) {
-                        dropdown.classList.add('hidden');
+                        if (close) close();
+                        else dropdown.classList.add('hidden');
                     }
                 }
             }

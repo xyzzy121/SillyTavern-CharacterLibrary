@@ -7,6 +7,7 @@ const root = new URL('../../modules/providers/datacat/', import.meta.url);
 const source = (await readFile(new URL('datacat-browse.js', root), 'utf8'))
     .replace(/^import[\s\S]*?;\r?\n/gm, '').replace('export default datacatBrowseView;', '');
 const contract = await import(`data:text/javascript;base64,${Buffer.from(await readFile(new URL('datacat-contract.js', root), 'utf8')).toString('base64')}`);
+const { createDatacatFollowingController } = await import(`data:text/javascript;base64,${Buffer.from(await readFile(new URL('datacat-following.js', root), 'utf8')).toString('base64')}`);
 const id = '11111111-2222-3333-4444-555555555555';
 const id2 = '11111111-2222-3333-4444-666666666666';
 const full = { character_id: id, name: 'Character', primary_content_source_kind: 'janitor', has_datacat_reimagination: true };
@@ -34,8 +35,9 @@ function harness(overrides = {}) {
     const core = new Proxy({
         onElement: (id, event, listener) => (elements.get(id) || make(id)).addEventListener(event, listener),
         getSetting: () => false, getProvider: () => ({ importCharacter: async (_id, _character, options) => { calls.push(['import', options]); return { success: true, characterName: 'Character' }; } }),
-        checkCharacterForDuplicatesAsync: async () => [{ char: { name: 'Previous' } }],
-        showPreImportDuplicateWarning: async () => ({ choice: 'replace' }),
+        checkCharacterForDuplicatesAsync: async () => [{ char: { avatar: 'Previous.png', name: 'Previous', data: { name: 'Previous' } } }],
+        hydrateCharacter: async char => char,
+        showPreImportDuplicateWarning: async () => ({ choice: 'replace', targetAvatar: 'Previous.png' }),
         deleteCharacter: async () => { calls.push(['delete']); return true; },
         getCharacterGalleryId: () => 'gallery', getProviderExcludeTags: () => [],
         escapeHtml: value => String(value), showToast: (...args) => calls.push(['toast', ...args]),
@@ -52,8 +54,10 @@ function harness(overrides = {}) {
         deactivate() {}
         disconnectImageObserver() {}
         _registerDropdownDismiss() {}
+        buildLocalLibraryLookup() {}
+        refreshInLibraryBadges() {}
     }
-    const context = vm.createContext({ ...contract, CoreAPI: core, BrowseView, document, window: {},
+    const context = vm.createContext({ ...contract, createDatacatFollowingController, CoreAPI: core, BrowseView, document, window: {},
         JANNY_TAG_MAP: {}, IMG_PLACEHOLDER: '', BROWSE_PURIFY_CONFIG: {},
         console: { error: noop, warn: noop }, setTimeout, clearTimeout, URL, Date, Set, AbortController,
         formatNumber: String, formatRichText: String, safePurify: String,
@@ -61,6 +65,11 @@ function harness(overrides = {}) {
         renderBrowseError: (_element, options) => calls.push(['error', options]),
         renderSkeletonGrid: noop, finishBrowseImport: async () => calls.push(['finished']),
         acquireDatacatExport: async (_id, options) => { calls.push(['acquire', options]); return acquired(options.definitionSource, options.variantId); },
+        createFocusScope: () => () => {}, closeDatacatExportPanel: noop,
+        captureDatacatReplacementTarget: char => JSON.stringify(char),
+        replaceDatacatCharacter: async options => { options.onCommitStart?.(); calls.push(['replace', options]); return { success: true }; },
+        fetchDatacatFeatures: async () => ({}), getDatacatCapabilities: () => ({ retrievalDisabled: false }),
+        pollRemoteRetrieval: ({ signal }) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('Cancelled'), { name: 'AbortError' })), { once: true })),
         fetchDatacatCharacter: async () => full, fetchSaucepanCompanion: async () => null,
         fetchRecentPublic: async () => ({ characters: [], total: 0 }),
         fetchFreshCharacters: async () => ({ last24h: [], thisWeek: [] }),
@@ -86,12 +95,16 @@ function harness(overrides = {}) {
             follow: query => view.followCreator(query),
             unfollow: unfollowCreator,
             loadFollowing: loadFollowingCharacters,
+            switchMode: switchDatacatViewMode,
             followingIds: () => datacatFollowingCharacters.map(getCharId),
             creatorReference: parseDatacatCreatorReference, creatorCatalogSource: getCreatorCatalogSource,
             followed: () => datacatFollowedCreators,
             setPreviewToken(value) { datacatDetailFetchToken = value; },
             previewToken: () => datacatDetailFetchToken,
             load: loadCharacters, advance: advanceDatacatPage,
+            bootstrap: () => view._bootstrapDatacat(),
+            facets: () => loadFacetedTags(true),
+            facetRows: () => datacatTags,
             configure(options = {}) {
                 delegatesInitialized = true; datacatViewMode = options.view || 'following';
                 datacatSortMode = options.sort || 'recent'; datacatBrowseMode = options.creator ? 'creator' : 'recent';
@@ -112,10 +125,10 @@ test('preview and import use the same chosen definition and preserve a source va
     assert.equal(hit.variantId, 'janitor_core:source');
     assert.equal(h.elements.get('datacatCharDescription').rendered, 'source body');
     await h.api.import(hit);
-    assert.deepEqual(h.calls.filter(call => ['acquire', 'delete', 'import'].includes(call[0])).map(call => call[0]), ['acquire', 'delete', 'import']);
-    assert.equal(h.calls.find(call => call[0] === 'import')[1].acquiredExport.card.data.first_mes, 'source greeting');
+    assert.deepEqual(h.calls.filter(call => ['acquire', 'delete', 'import', 'replace'].includes(call[0])).map(call => call[0]), ['acquire', 'replace']);
+    assert.equal(h.calls.find(call => call[0] === 'replace')[1].acquiredExport.card.data.first_mes, 'source greeting');
     hit.definitionSource = 'reimagination'; delete hit._acquiredExport; delete hit.variantId;
-    await h.api.preview(hit, 0);
+    await h.api.preview(hit, h.api.previewToken());
     assert.equal(h.elements.get('datacatCharDescription').rendered, 'reimagination body');
     assert.equal(h.calls.filter(call => call[0] === 'acquire').at(-1)[1].interactive, false);
 });
@@ -137,6 +150,87 @@ test('verification and cancellation cannot delete an existing local card', async
         await h.api.import({ ...full, _fullCharacter: full });
         assert.equal(h.calls.some(call => call[0] === 'delete' || call[0] === 'import'), false);
     }
+});
+
+test('delayed helper health cannot initialize or fetch after provider deactivation', async () => {
+    let resolveHealth, initialized = 0, saved = 0;
+    const h = harness({ core: { setSetting: () => saved++ }, dependencies: {
+        checkDcPluginAvailable: () => new Promise(resolve => { resolveHealth = resolve; }),
+        initDcSession: async () => { initialized++; return 'late-token'; },
+    } });
+    const pending = h.api.bootstrap();
+    h.api.deactivate(); resolveHealth(true); await pending;
+    assert.equal(initialized, 0); assert.equal(saved, 0);
+});
+
+test('delayed session initialization cannot save a token after provider deactivation', async () => {
+    let resolveSession, saved = 0, featureReads = 0;
+    const h = harness({ core: { setSetting: () => saved++ }, dependencies: {
+        checkDcPluginAvailable: async () => true,
+        initDcSession: () => new Promise(resolve => { resolveSession = resolve; }),
+        fetchDatacatFeatures: async () => { featureReads++; return {}; },
+    } });
+    const pending = h.api.bootstrap();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    h.api.deactivate(); resolveSession('late-token'); await pending;
+    assert.equal(saved, 0); assert.equal(featureReads, 0);
+});
+
+test('reversed facet responses cannot overwrite current tags, even if transport ignores abort', async () => {
+    const pending = [];
+    const h = harness({ dependencies: { fetchFacetedTags: options => new Promise(resolve => pending.push({ ...options, resolve })) } });
+    const first = h.api.facets();
+    const second = h.api.facets();
+    assert.equal(pending[0].signal.aborted, true);
+    pending[1].resolve({ tags: [{ id: 2, name: 'Current' }] }); await second;
+    pending[0].resolve({ tags: [{ id: 1, name: 'Obsolete' }] }); await first;
+    assert.equal(h.api.facetRows()[0].name, 'Current');
+});
+
+test('refreshing facet counts preserves interactive existing tag rows while pending', async () => {
+    let resolveRefresh, reads = 0;
+    const h = harness({ dependencies: { fetchFacetedTags: () => ++reads === 1
+        ? Promise.resolve({ tags: [{ id: 1, name: 'Existing', count: 3 }] })
+        : new Promise(resolve => { resolveRefresh = resolve; }) } });
+    const container = h.elements.get('datacatGrid');
+    h.elements.set('datacatTagsList', container);
+    await h.api.facets();
+    const existing = container.innerHTML;
+    const pending = h.api.facets();
+    assert.equal(container.innerHTML, existing);
+    resolveRefresh({ tags: [{ id: 1, name: 'Existing', count: 9 }] }); await pending;
+    assert.match(container.innerHTML, /\(9\)/);
+});
+
+test('switching Following to Browse aborts catalog work and prevents later page admission', async () => {
+    let resolvePage, entered, signal, calls = 0;
+    const admitted = new Promise(resolve => { entered = resolve; });
+    const h = harness({ core: { getSetting: name => name === 'datacatFollowedCreators' ? [{ id, name: 'Creator' }] : false },
+        dependencies: { fetchDatacatCreatorCharacters: (_id, options) => {
+            calls++; signal = options.signal; entered();
+            return new Promise(resolve => { resolvePage = resolve; });
+        } } });
+    h.api.configure({ view: 'following' });
+    const loading = h.api.loadFollowing(); await admitted;
+    await h.api.switchMode('browse');
+    assert.equal(signal.aborted, true);
+    resolvePage({ list: [full], total: 100, hasMore: true, nextOffset: 1 }); await loading;
+    assert.equal(calls, 1); assert.equal(h.api.followingIds().length, 0);
+});
+
+test('provider deactivation aborts actual page and preview request signals', async () => {
+    let resolvePage, resolvePreview, pageSignal, previewSignal;
+    const h = harness({ dependencies: {
+        fetchRecentPublic: options => { pageSignal = options.signal; return new Promise(resolve => { resolvePage = resolve; }); },
+        fetchDatacatCharacter: (_id, _source, options) => { previewSignal = options.signal; return new Promise(resolve => { resolvePreview = resolve; }); },
+    } });
+    h.api.configure({ view: 'browse' });
+    const loading = h.api.load(); const previewing = h.api.preview(full, 0);
+    h.api.deactivate();
+    assert.equal(pageSignal.aborted, true); assert.equal(previewSignal.aborted, true);
+    resolvePage({ characters: [full] }); resolvePreview(full);
+    await Promise.all([loading, previewing]);
+    assert.equal(h.api.state().ids.length, 0);
 });
 
 test('closing a preview while its export is pending prevents replacement', async () => {
@@ -168,22 +262,24 @@ test('closing a preview while duplicate confirmation is pending prevents replace
 });
 
 test('a replacement already being written finishes without closing or repainting a newer preview', async () => {
-    let resolveDelete;
-    let completion;
+    let resolveWrite;
     const h = harness({
-        core: { deleteCharacter: () => new Promise(resolve => { resolveDelete = resolve; }) },
-        dependencies: { finishBrowseImport: async options => { completion = options; options.closePreview(); } },
+        dependencies: { replaceDatacatCharacter: options => {
+            options.onCommitStart();
+            h.calls.push(['replace', options]);
+            return new Promise(resolve => { resolveWrite = resolve; });
+        } },
     });
     const importing = h.api.import({ ...full, _fullCharacter: full, _acquiredExport: acquired() });
     await new Promise(resolve => setTimeout(resolve, 0));
     h.api.close();
     h.api.setPreviewToken(2);
     h.elements.get('datacatImportBtn').innerHTML = 'New preview import';
-    resolveDelete(true);
+    resolveWrite({ success: true });
     await importing;
-    assert.equal(h.calls.filter(call => call[0] === 'import').length, 1);
-    assert.equal(h.calls.find(call => call[0] === 'import')[1].signal.aborted, false);
-    assert.equal(completion.importBtn, null);
+    assert.equal(h.calls.filter(call => call[0] === 'import').length, 0);
+    assert.equal(h.calls.find(call => call[0] === 'replace')[1].signal.aborted, false);
+    assert.equal(h.calls.some(call => call[0] === 'finished'), false);
     assert.equal(h.api.previewToken(), 2);
     assert.equal(h.elements.get('datacatImportBtn').innerHTML, 'New preview import');
 });
@@ -305,6 +401,8 @@ function bulkHarness(overrides = {}) {
         },
         fetchDatacatCharacter: async (_id, _source, options) => { calls.push(['detail', options]); return full; },
         submitExtraction: async () => { calls.push(['retrieve']); return {}; },
+        fetchDatacatFeatures: async () => ({}), getDatacatCapabilities: () => ({ retrievalDisabled: false }),
+        pollDatacatRetrieval: async () => ({ success: true }),
         ...overrides,
     });
     vm.runInContext(baseSource + '\nglobalThis.adapter = CD_ADAPTERS.datacat; globalThis.retrieve = cdDatacatExtract;', context);
@@ -380,12 +478,15 @@ test('submitting a text search leaves the creator catalog and clears its downloa
 test('unfollowing during a timeline load cannot restore the removed creator characters', async () => {
     let follows = [{ id, name: 'Creator', source: 'datacat' }];
     let resolvePage;
+    let pageEntered;
+    const entered = new Promise(resolve => { pageEntered = resolve; });
     const h = harness({ core: {
         getSetting: name => name === 'datacatFollowedCreators' ? follows : false,
         setSetting: (name, value) => { if (name === 'datacatFollowedCreators') follows = value; },
-    }, dependencies: { fetchDatacatCreatorCharacters: () => new Promise(resolve => { resolvePage = resolve; }) } });
+    }, dependencies: { fetchDatacatCreatorCharacters: () => new Promise(resolve => { resolvePage = resolve; pageEntered(); }) } });
     h.api.configure();
     const loading = h.api.loadFollowing();
+    await entered;
     h.api.unfollow(id);
     resolvePage({ list: [full], total: 1 }); await loading;
     assert.equal(follows.length, 0);
@@ -394,13 +495,16 @@ test('unfollowing during a timeline load cannot restore the removed creator char
 
 test('refreshing Following supersedes a pending load and retains only the fresh response', async () => {
     let resolveOld;
+    let pageEntered;
+    const entered = new Promise(resolve => { pageEntered = resolve; });
     let calls = 0;
     const h = harness({ core: { getSetting: name => name === 'datacatFollowedCreators' ? [{ id, name: 'Creator', source: 'datacat' }] : false },
         dependencies: { fetchDatacatCreatorCharacters: async () => ++calls === 1
-            ? new Promise(resolve => { resolveOld = resolve; })
+            ? new Promise(resolve => { resolveOld = resolve; pageEntered(); })
             : { list: [{ ...full, character_id: id2 }], total: 1 } },
     });
     const old = h.api.loadFollowing();
+    await entered;
     await h.api.loadFollowing(true);
     assert.equal(calls, 2);
     resolveOld({ list: [full], total: 1 }); await old;
@@ -410,14 +514,17 @@ test('refreshing Following supersedes a pending load and retains only the fresh 
 test('deactivating stops a pending Following page and permits a clean reload', async () => {
     const requests = [];
     let resolveOld;
+    let pageEntered;
+    const entered = new Promise(resolve => { pageEntered = resolve; });
     const h = harness({ core: { getSetting: name => name === 'datacatFollowedCreators' ? [{ id, name: 'Creator', source: 'datacat' }] : false },
         dependencies: { fetchDatacatCreatorCharacters: async (_id, options) => {
             requests.push(options.offset);
-            if (requests.length === 1) return new Promise(resolve => { resolveOld = resolve; });
+            if (requests.length === 1) return new Promise(resolve => { resolveOld = resolve; pageEntered(); });
             return { list: [{ ...full, character_id: id2 }], total: 1 };
         } },
     });
     const old = h.api.loadFollowing();
+    await entered;
     h.api.deactivate();
     resolveOld({ list: [full], total: 100, nextOffset: 1, hasMore: true }); await old;
     assert.deepEqual(requests, [0]);
@@ -629,6 +736,24 @@ test('retrieval submission completion and existing-card shortcuts load directly 
     }
 });
 
+test('closing a completed retrieval preview aborts its pending metadata request', async () => {
+    let resolveMetadata, metadataSignal;
+    const h = harness({ dependencies: {
+        submitExtraction: async () => ({ status: 'completed', requestId: 'done' }),
+        fetchDatacatCharacter: (_id, _source, { signal }) => {
+            metadataSignal = signal;
+            return new Promise(resolve => { resolveMetadata = resolve; });
+        },
+    } });
+    h.api.watchSelection();
+    const pending = h.api.modalExtract(id);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    h.api.close();
+    assert.equal(metadataSignal.aborted, true);
+    resolveMetadata(full); await pending;
+    assert.equal(h.context.changedHit, undefined);
+});
+
 test('a superseded submission cannot reset a newer retrieval even with identical timestamps', async () => {
     let resolveFirst;
     let count = 0;
@@ -636,28 +761,32 @@ test('a superseded submission cannot reset a newer retrieval even with identical
     const h = harness({ dependencies: { ...clock, submitExtraction: () => ++count === 1
         ? new Promise(resolve => { resolveFirst = resolve; }) : Promise.resolve({ run: { status: 'queued', request_id: 'second-job' } }) } });
     const first = h.api.modalExtract(id);
+    await new Promise(resolve => setTimeout(resolve, 0));
     await h.api.modalExtract(id2);
     resolveFirst({ requestId: 'first-job', status: 'failed' }); await first;
     assert.equal(h.api.retrievalRequestId(), 'second-job');
     assert.equal(h.elements.get('datacatImportBtn').disabled, true);
     assert.match(h.elements.get('datacatImportBtn').innerHTML, /Retrieving/);
-    assert.equal(clock.pending(), 1);
+    assert.equal(clock.pending(), 0); // The shared API poller owns its deadlines.
     h.api.close(); assert.equal(clock.pending(), 0);
 });
 
-test('preview retrieval polling ignores stale/unrelated history and reports each terminal outcome', async () => {
+test('preview delegates correlated retrieval to the shared poller and reports each terminal outcome', async () => {
     for (const status of ['completed', 'failed', 'cancelled', 'timed_out']) {
         const clock = retrievalClock();
         const events = [];
-        let polls = 0;
-        const h = harness({ dependencies: { ...clock, fetchExtractionStatus: async () => ({ history: ++polls === 1 ? [
-            { requestId: 'old-job', characterId: id, status: 'completed' },
-            { requestId: 'other-job', characterId: id2, status: 'completed' },
-        ] : [{ requestId: 'current-job', characterId: id, status }] }) } });
+        let options;
+        const h = harness({ dependencies: { ...clock, pollRemoteRetrieval: async value => {
+            options = value; value.onProgress('Waiting');
+            return { status, success: status === 'completed' };
+        } } });
         h.api.setupRetrieval('current-job', clock.Date.now());
-        h.api.pollRetrieval(id, { progress: message => events.push(['progress', message]), complete: () => events.push(['complete']), failed: message => events.push(['failed', message]) });
-        await clock.tick(); assert.deepEqual(events.map(row => row[0]), ['progress']);
-        await clock.tick(); assert.equal(events.at(-1)[0], status === 'completed' ? 'complete' : 'failed');
+        await h.api.pollRetrieval(id, { progress: message => events.push(['progress', message]), complete: () => events.push(['complete']), failed: message => events.push(['failed', message]) });
+        assert.equal(options.requestId, 'current-job');
+        assert.equal(options.characterId, id);
+        assert.equal(options.submittedAt, clock.Date.now());
+        assert.equal(events[0][0], 'progress');
+        assert.equal(events.at(-1)[0], status === 'completed' ? 'complete' : 'failed');
         assert.equal(clock.pending(), 0);
     }
 });
@@ -665,19 +794,23 @@ test('preview retrieval polling ignores stale/unrelated history and reports each
 test('preview retrieval polling times out and cancellation ignores an in-flight status response', async () => {
     const clock = retrievalClock();
     const events = [];
-    const h = harness({ dependencies: { ...clock, fetchExtractionStatus: async () => ({ history: [] }) } });
+    const h = harness({ dependencies: { ...clock, pollRemoteRetrieval: async () => { throw new Error('Retrieval timed out'); } } });
     h.api.setupRetrieval('job', clock.Date.now());
-    h.api.pollRetrieval(id, { progress() {}, complete: () => events.push('complete'), failed: message => events.push(message) });
-    while (clock.pending()) await clock.tick();
+    await h.api.pollRetrieval(id, { progress() {}, complete: () => events.push('complete'), failed: message => events.push(message) });
     assert.equal(events.length, 1); assert.match(events[0], /timed out/);
 
     let resolveStatus;
+    let transportSignal;
     const cancelledClock = retrievalClock();
-    const cancelled = harness({ dependencies: { ...cancelledClock, fetchExtractionStatus: () => new Promise(resolve => { resolveStatus = resolve; }) } });
+    const cancelled = harness({ dependencies: { ...cancelledClock, pollRemoteRetrieval: ({ signal }) => {
+        transportSignal = signal;
+        return new Promise(resolve => { resolveStatus = resolve; });
+    } } });
     cancelled.api.setupRetrieval('job', cancelledClock.Date.now());
-    cancelled.api.pollRetrieval(id, { progress: () => assert.fail('cancelled'), complete: () => assert.fail('cancelled'), failed: () => assert.fail('cancelled') });
-    const pending = cancelledClock.tick(); cancelled.api.close();
-    resolveStatus({ history: [{ requestId: 'job', status: 'completed' }] }); await pending;
+    const pending = cancelled.api.pollRetrieval(id, { progress: () => assert.fail('cancelled'), complete: () => assert.fail('cancelled'), failed: () => assert.fail('cancelled') });
+    cancelled.api.close();
+    assert.equal(transportSignal.aborted, true);
+    resolveStatus({ success: true }); await pending;
     assert.equal(cancelledClock.pending(), 0);
 });
 
@@ -690,15 +823,16 @@ test('creator downloads reject terminal or malformed submissions without waiting
     }
 });
 
-test('creator downloads match nested submission IDs and ignore stale completed jobs', async () => {
+test('creator downloads pass the nested submission ID to the shared correlated poller', async () => {
     let polls = 0;
     const h = bulkHarness({ submitExtraction: async () => ({ run: { status: 'queued', request_id: 'current-job' } }),
         setTimeout: fn => { fn(); return 1; },
-        fetchExtractionStatus: async () => ({ history: ++polls === 1
-            ? [{ requestId: 'old-job', characterId: id, status: 'completed', completedAt: Date.now() + 5000 }]
-            : [{ requestId: 'current-job', characterId: id, status: 'completed' }] }),
+        pollDatacatRetrieval: async options => {
+            polls++; assert.equal(options.requestId, 'current-job'); assert.equal(options.characterId, id);
+            return { success: true };
+        },
     });
     const result = await h.retrieve({ _cdCancelled: false }, id, 'janitor');
-    assert.equal(polls, 2);
+    assert.equal(polls, 1);
     assert.equal(result.character_id, id);
 });

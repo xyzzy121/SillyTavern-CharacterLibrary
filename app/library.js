@@ -27831,14 +27831,18 @@ on('closeCharDuplicatesModalBtn', 'click', () => closeCharDuplicatesModal());
 let preImportPendingChar = null; // Character data waiting to be imported
 let preImportMatches = []; // Matching existing characters
 let preImportResolveCallback = null; // Promise resolver
+let preImportDialogGeneration = 0;
 
 /**
  * Show the pre-import duplicate warning modal
  * Returns a promise that resolves with the user's choice
  */
-async function showPreImportDuplicateWarning(newCharInfo, matches) {
+async function showPreImportDuplicateWarning(newCharInfo, matches, options = {}) {
+    resolvePreImportChoice('skip');
+    const generation = ++preImportDialogGeneration;
     // Hydrate slim characters so estimateTokens can read heavy fields
     await Promise.all(matches.map(m => hydrateCharacter(m.char)));
+    if (generation !== preImportDialogGeneration) return { choice: 'skip' };
 
     return new Promise((resolve) => {
         preImportPendingChar = newCharInfo;
@@ -27865,6 +27869,12 @@ async function showPreImportDuplicateWarning(newCharInfo, matches) {
                 <p>by ${escapeHtml(creator)} &bull; ${headerSubtext}</p>
             </div>
         `;
+        if (options.selectReplacementTarget) {
+            const notice = document.createElement('p');
+            notice.textContent = 'Replacement updates the definition and DataCat link. Your local name, artwork, chats, and settings are kept. A verified backup is required.';
+            notice.className = 'pre-import-replacement-note';
+            infoEl.querySelector('.pre-import-info-text').appendChild(notice);
+        }
         
         // Render existing matches
         let matchesHtml = `<div class="pre-import-matches-header">Found ${matches.length} potential match${matches.length === 1 ? '' : 'es'}:</div>`;
@@ -27880,6 +27890,7 @@ async function showPreImportDuplicateWarning(newCharInfo, matches) {
             
             matchesHtml += `
                 <div class="char-dup-card pre-import-match-card" data-avatar="${escapeHtml(existingChar.avatar)}" style="margin-bottom: 10px; border-color: var(--glass-border);">
+                    ${options.selectReplacementTarget ? `<label class="pre-import-replace-choice"><input type="radio" name="preImportReplacementTarget" value="${escapeHtml(existingChar.avatar)}" ${idx === 0 ? 'checked' : ''}> Replace ${escapeHtml(existingName)} (${escapeHtml(existingChar.avatar)})</label>` : ''}
                     <div class="char-dup-card-header">
                         <img class="char-dup-card-avatar" src="${existingAvatar}" alt="${escapeHtml(existingName)}" loading="lazy">
                         <div class="char-dup-card-title">
@@ -27912,6 +27923,7 @@ function resolvePreImportChoice(choice) {
     if (preImportResolveCallback) {
         preImportResolveCallback({
             choice,
+            targetAvatar: document.querySelector('input[name="preImportReplacementTarget"]:checked')?.value || preImportMatches[0]?.char?.avatar || null,
             pendingChar: preImportPendingChar,
             matches: preImportMatches
         });
@@ -27932,6 +27944,7 @@ on('preImportAnyway', 'click', () => resolvePreImportChoice('import'));
 on('preImportReplaceBtn', 'click', () => resolvePreImportChoice('replace'));
 
 document.getElementById('preImportDuplicateMatches')?.addEventListener('click', (e) => {
+    if (e.target.closest('.pre-import-replace-choice')) return;
     const card = e.target.closest('.pre-import-match-card[data-avatar]');
     if (!card) return;
     const avatar = card.dataset.avatar;
@@ -29308,7 +29321,7 @@ window.registerOverlay?.({ id: 'bulkLocalizeModal',         tier: 7, close: _hid
 window.registerOverlay?.({ id: 'bulkLocalizeSummaryModal',  tier: 7, close: _hideClModalVisible('bulkLocalizeSummaryModal') });
 window.registerOverlay?.({ id: 'bulkAutoLinkModal',         tier: 7, close: _hideClModalVisible('bulkAutoLinkModal') });
 window.registerOverlay?.({ id: 'charDuplicatesModal',       tier: 7, close: () => closeCharDuplicatesModal() });
-window.registerOverlay?.({ id: 'preImportDuplicateModal',   tier: 7, close: _hideClModalVisible('preImportDuplicateModal') });
+window.registerOverlay?.({ id: 'preImportDuplicateModal',   tier: 7, close: () => resolvePreImportChoice('skip') });
 window.registerOverlay?.({ id: 'providerLinkModal',         tier: 7, close: _hideClModalVisible('providerLinkModal') });
 
 // Static .confirm-modal in HTML (uses .hidden toggle, not .visible).
@@ -30049,9 +30062,12 @@ async function writeCardFields(char, fieldUpdates, opts = {}) {
         // PRE-FLIGHT: sentinel-delete null-valued extension keys before the main write; ST otherwise drops object writes aimed at a null namespace. No-op on older ST.
         // A surgical payload that never touches extensions cant hit the null landmine; skip.
         const existingExtRaw = char.data?.extensions || char.extensions || {};
+        const cleanupNamespaces = Array.isArray(opts.extensionCleanupNamespaces)
+            ? new Set(opts.extensionCleanupNamespaces) : null;
         const polluted = (surgical && !writesExtensions)
             ? []
-            : Object.keys(existingExtRaw).filter(k => existingExtRaw[k] === null);
+            : Object.keys(existingExtRaw).filter(k => existingExtRaw[k] === null
+                && (!cleanupNamespaces || cleanupNamespaces.has(k)));
         if (polluted.length > 0) {
             const deleteValue = await getExtensionDeleteValue();
             if (deleteValue !== null) {

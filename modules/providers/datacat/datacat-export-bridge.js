@@ -1,5 +1,6 @@
 // Interactive Datacat export. Verification and account credentials stay on Datacat.
 // The optional companion script only exports after a visible click in the frame.
+import { createFocusScope } from '../focus-scope.js';
 
 export const DATACAT_EXPORT_ORIGIN = 'https://datacat.run';
 export const DATACAT_EXPORT_MAX_BYTES = 32 * 1024 * 1024;
@@ -101,6 +102,7 @@ function abortError(panelClosed = false) {
 }
 
 function removePanel() {
+    panel?.releaseFocus?.();
     panel?.root.remove();
     panel = null;
 }
@@ -124,7 +126,7 @@ function ensurePanel() {
             #${PANEL_ID} iframe{width:100%;flex:1;min-height:0;border:0;background:#111}
             #${PANEL_ID} .dc-export-help{padding:0 14px 10px;margin:0;font-size:.85rem}
             #${PANEL_ID} .dc-export-help a{color:var(--accent,#b7a7ff)}
-            @media(max-width:600px){#${PANEL_ID}{padding:0}#${PANEL_ID} .dc-export-content{height:100dvh;border-radius:0}}
+            @media(max-width:600px){#${PANEL_ID}{padding:0}#${PANEL_ID} .dc-export-content{height:100dvh;border-radius:0}#${PANEL_ID} button{min-width:44px;min-height:44px}}
         `;
         document.head.append(style);
     }
@@ -149,7 +151,11 @@ function ensurePanel() {
     window.registerOverlay?.({ id: PANEL_ID, tier: 1, close: closeDatacatExportPanel, visible: el => el.classList.contains('visible') });
     // This dynamically inserted panel is already visible when the mobile observer sees it.
     window.pushOverlayGuard?.();
-    root.querySelector('.dc-export-close').focus();
+    panel.releaseFocus = createFocusScope(root, {
+        initialFocus: root.querySelector('.dc-export-close'),
+        fallbackFocus: () => ['datacatImportBtn', 'datacatTagsBtn', 'mobileNavFiltersBtn', 'searchInput']
+            .map(id => document.getElementById(id)).find(element => element?.getClientRects().length),
+    });
     return panel;
 }
 

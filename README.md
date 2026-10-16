@@ -4,7 +4,13 @@ A powerful SillyTavern extension for discovering, organizing, and managing your 
 
 > **Note:** This is a hobby project but things mostly work. Expect bugs, use at your own risk.
 
-**7.3.4 Datacat update:** fixes lorebook preservation and variant enrichment, search/NSFW filter changes, Following refresh races, and avatar restore checks. Malformed detail/feed responses are rejected, and retrieval history requires evidence of completion. Live API checks and desktop/mobile browser fixtures passed; human verification remains a live-test limitation. The bundled helper remains **1.13.1**; update and restart SillyTavern if running an older helper. Update the optional Datacat companion to **1.0.2** for its PNG memory-limit fix. See the [Datacat validation record](tests/datacat/README.md) and [whole-extension regression record](tests/README.md).
+**7.3.5 DataCat reliability:** replacement now updates the chosen local character in place after saving and verifying a recovery snapshot, including its original PNG. Local name, artwork, chats, favorites, settings, and unrelated extension data are retained. Replacement stops if its backup cannot be verified. Following loads progressively and sorts only loaded cards; use **Load more from creators** or **Retry failed pages** for additional results. Sort/filter changes and scrolling do not fetch more creator catalogs.
+
+DataCat requests now cancel with their views, have bounded response deadlines, and honor shared rate-limit cooldowns. The bundled helper spaces upstream request starts by at least one second with at most three in flight. Retrieval submissions are never automatically repeated after an uncertain response; check DataCat before retrying. Viewer-specific retrieval restrictions preserve browsing and export access. Mobile tag/export focus and missing-artwork canvas fallbacks are also fixed.
+
+For DataCat, update the bundled **cl-helper to 1.13.2** and **restart SillyTavern**; replacing plugin files alone does not reload the running helper. Update the optional **JanitorAI Bridge to 1.3.2** for transport cancellation. Older bridge versions still suppress obsolete results, but cannot stop an already issued request. The separate **DataCat Export Companion remains 1.0.2**. Validation uses the independent instance with synthetic remote responses; physical-device and verified live extraction coverage remain separate limitations.
+
+See the [DataCat validation record](tests/datacat/README.md) and [whole-extension regression record](tests/README.md) for test coverage and limits.
 
 ## Screenshots
 
@@ -692,7 +698,7 @@ CharacterTavern requires a session cookie for NSFW content. To set it up:
 <details>
 <summary><h3>DataCat (Experimental)</h3></summary>
 
-**Auth:** Browsing uses an anonymous session created by **cl-helper 1.13.1 or newer**. Datacat can require human verification before exporting a card; that happens in your browser on Datacat.
+**Auth:** Browsing uses an anonymous session created by **cl-helper 1.13.2 or newer**. Datacat can require human verification before exporting a card; that happens in your browser on Datacat.
 
 > **Experimental and disabled by default.** Enable it in Settings > Online > Providers. Existing provider preferences and card links are preserved when updating.
 
@@ -704,7 +710,7 @@ CharacterTavern requires a session cookie for NSFW content. To set it up:
 
 #### Setup and upgrading
 
-1. Install or update the bundled **cl-helper to 1.13.1**, then **restart SillyTavern**. Updating the extension alone does not reload a running server plugin. Settings > Info shows the helper's running version and update controls.
+1. Install or update the bundled **cl-helper to 1.13.2**, then **restart SillyTavern**. Updating the extension alone does not reload a running server plugin. Settings > Info shows the helper's running version and update controls.
 2. Enable DataCat in Settings > Online > Providers. Its browsing session initializes automatically.
 3. For downloads that request verification, install or update [the Datacat Export Companion to 1.0.2](extras/cl-datacat-bridge.user.js) in Tampermonkey or Violentmonkey on the browser where you use CharacterLibrary. Allow it on datacat.run, including frames. It needs page-context execution to call Datacat's export tools.
 4. Click Import or check a single linked card for updates. When the Datacat panel opens, click **Export to Character Library** inside it and complete Datacat's verification. The companion passes your selected Source/Reimagination choice to Datacat's own export function and returns the PNG card. Datacat account credentials stay on Datacat.

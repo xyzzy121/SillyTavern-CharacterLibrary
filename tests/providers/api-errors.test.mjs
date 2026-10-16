@@ -17,7 +17,7 @@ async function network(fetch) {
 
 async function loadApi(id, fetch) {
     const net = await network(fetch);
-    const context = vm.createContext({ console: quiet, CoreAPI: {}, URL, URLSearchParams, fetch,
+    const context = vm.createContext({ console: quiet, CoreAPI: {}, URL, URLSearchParams, fetch, AbortController, DOMException, setTimeout, clearTimeout,
         readJsonClassified: net.readJsonClassified, proxyEncode: encodeURIComponent,
         fetchMetadataWithProxy: net.fetchWithProxy, _rawFetchWithProxy: net.fetchWithProxy,
         CL_HELPER_PLUGIN_BASE: '/plugins/cl-helper',
